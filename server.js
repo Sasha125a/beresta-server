@@ -5,13 +5,13 @@ const bodyParser = require('body-parser');
 const sqlite3 = require('sqlite3').verbose();
 
 const app = express();
-const PORT = 3000;
+const PORT = process.env.PORT || 3000;
 
 app.use(cors());
 app.use(bodyParser.json());
 
 // Инициализация базы данных
-const db = new sqlite3.Database('./beresta.db');
+const db = new sqlite3.Database(process.env.DB_PATH || './beresta.db');
 
 db.serialize(() => {
     db.run("CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY AUTOINCREMENT, email TEXT UNIQUE, first_name TEXT, last_name TEXT)");
@@ -143,6 +143,8 @@ app.get('/messages/:userEmail/:friendEmail', (req, res) => {
     );
 });
 
-app.listen(PORT, () => {
-    console.log(`Server running on port ${PORT}`);
+// Важно: слушать на 0.0.0.0
+app.listen(PORT, '0.0.0.0', () => {
+    console.log(`🚀 Server running on port ${PORT}`);
+    console.log(`🌐 Available at: http://0.0.0.0:${PORT}`);
 });
