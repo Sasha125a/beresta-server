@@ -1,0 +1,19 @@
+# render.yaml
+services:
+  - type: web
+    name: beresta-server
+    env: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: 3000
+      - key: DB_PATH
+        value: /tmp/beresta.db
+    disk:
+      name: beresta-data
+      mountPath: /tmp
+      sizeGB: 1
