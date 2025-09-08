@@ -110,19 +110,45 @@ app.post('/send-message', async (req, res) => {
     try {
         // Сохраняем сообщение в БД
         db.run("INSERT INTO messages (sender_email, receiver_email, message) VALUES (?, ?, ?)", 
-            [senderEmail, receiverEmail, message]);
+            [senderEmail, receiverEmail, message], function(err) {
+                if (err) {
+                    return res.json({ success: false, error: err.message });
+                }
+            });
         
-        // Отправляем email
-        const mailOptions = {
-            from: 'your-email@gmail.com',
-            to: receiverEmail,
-            subject: `Новое сообщение в Бересте от ${senderEmail}`,
-            text: `Сообщение: ${message}\n\nОтветьте на это письмо, чтобы отправить ответ в Бересту.`
-        };
+        // Пытаемся отправить email, но не блокируем ответ из-за ошибок email
+        try {
+            const mailOptions = {
+                from: 'pushkatank2@gmail.com', // ✅ Правильный email
+                to: receiverEmail,
+                subject: `💌 Новое сообщение в Бересте от ${senderEmail}`,
+                html: `
+                    <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
+                        <h2 style="color: #2c3e50;">Береста - Новое сообщение</h2>
+                        <div style="background: #f8f9fa; padding: 20px; border-radius: 8px; border-left: 4px solid #3498db;">
+                            <p style="margin: 0; color: #2c3e50; font-size: 16px;">
+                                <strong>От:</strong> ${senderEmail}<br>
+                                <strong>Сообщение:</strong> ${message}
+                            </p>
+                        </div>
+                        <p style="color: #7f8c8d; font-size: 14px; margin-top: 20px;">
+                            Ответьте на это письмо, чтобы отправить ответ в мессенджер Береста.
+                        </p>
+                    </div>
+                `
+            };
+            
+            await transporter.sendMail(mailOptions);
+            console.log("Email отправлен успешно");
+        } catch (emailError) {
+            console.log("Ошибка отправки email:", emailError.message);
+            // Не прерываем выполнение, только логируем ошибку
+        }
         
-        await transporter.sendMail(mailOptions);
-        res.json({ success: true });
+        res.json({ success: true }); // ✅ Всегда возвращаем успех, т.к. сообщение сохранено
+        
     } catch (error) {
+        console.log("Общая ошибка:", error.message);
         res.json({ success: false, error: error.message });
     }
 });
