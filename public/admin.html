@@ -1,0 +1,299 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Админ-панель Береста</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            padding: 20px;
+            color: #333;
+        }
+
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            background: white;
+            border-radius: 15px;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.2);
+            overflow: hidden;
+        }
+
+        header {
+            background: linear-gradient(135deg, #2c3e50 0%, #34495e 100%);
+            color: white;
+            padding: 20px;
+            text-align: center;
+        }
+
+        header h1 {
+            margin-bottom: 10px;
+            font-size: 2em;
+        }
+
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+            gap: 20px;
+            padding: 20px;
+            background: #f8f9fa;
+        }
+
+        .stat-card {
+            background: white;
+            padding: 20px;
+            border-radius: 10px;
+            text-align: center;
+            box-shadow: 0 5px 15px rgba(0,0,0,0.1);
+            transition: transform 0.3s ease;
+        }
+
+        .stat-card:hover {
+            transform: translateY(-5px);
+        }
+
+        .stat-number {
+            font-size: 2.5em;
+            font-weight: bold;
+            color: #3498db;
+            margin-bottom: 10px;
+        }
+
+        .stat-label {
+            font-size: 1.1em;
+            color: #7f8c8d;
+        }
+
+        .users-section {
+            padding: 20px;
+        }
+
+        .section-title {
+            font-size: 1.5em;
+            margin-bottom: 20px;
+            color: #2c3e50;
+            border-bottom: 2px solid #3498db;
+            padding-bottom: 10px;
+        }
+
+        .users-table {
+            width: 100%;
+            border-collapse: collapse;
+            background: white;
+            border-radius: 10px;
+            overflow: hidden;
+            box-shadow: 0 5px 15px rgba(0,0,0,0.1);
+        }
+
+        .users-table th,
+        .users-table td {
+            padding: 15px;
+            text-align: left;
+            border-bottom: 1px solid #ecf0f1;
+        }
+
+        .users-table th {
+            background: #34495e;
+            color: white;
+            font-weight: 600;
+        }
+
+        .users-table tr:hover {
+            background: #f8f9fa;
+        }
+
+        .pagination {
+            display: flex;
+            justify-content: center;
+            margin-top: 20px;
+            gap: 10px;
+        }
+
+        .pagination button {
+            padding: 10px 20px;
+            border: none;
+            background: #3498db;
+            color: white;
+            border-radius: 5px;
+            cursor: pointer;
+            transition: background 0.3s ease;
+        }
+
+        .pagination button:hover:not(:disabled) {
+            background: #2980b9;
+        }
+
+        .pagination button:disabled {
+            background: #bdc3c7;
+            cursor: not-allowed;
+        }
+
+        .loading {
+            text-align: center;
+            padding: 40px;
+            font-size: 1.2em;
+            color: #7f8c8d;
+        }
+
+        .error {
+            background: #e74c3c;
+            color: white;
+            padding: 10px;
+            border-radius: 5px;
+            margin: 10px 0;
+            text-align: center;
+        }
+
+        @media (max-width: 768px) {
+            .stats-grid {
+                grid-template-columns: 1fr;
+            }
+            
+            .users-table {
+                font-size: 0.9em;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>📊 Админ-панель Береста</h1>
+            <p>Мониторинг пользователей и статистика</p>
+        </header>
+
+        <div class="stats-grid" id="statsGrid">
+            <div class="loading">Загрузка статистики...</div>
+        </div>
+
+        <div class="users-section">
+            <h2 class="section-title">👥 Зарегистрированные пользователи</h2>
+            <div id="usersTable">
+                <div class="loading">Загрузка пользователей...</div>
+            </div>
+            <div class="pagination" id="pagination"></div>
+        </div>
+    </div>
+
+    <script>
+        let currentPage = 1;
+        const limit = 10;
+
+        // Загрузка статистики
+        async function loadStats() {
+            try {
+                const response = await fetch('/admin/stats');
+                const data = await response.json();
+                
+                if (data.success) {
+                    const stats = data.stats;
+                    document.getElementById('statsGrid').innerHTML = `
+                        <div class="stat-card">
+                            <div class="stat-number">${stats.total_users}</div>
+                            <div class="stat-label">Всего пользователей</div>
+                        </div>
+                        <div class="stat-card">
+                            <div class="stat-number">${stats.total_messages}</div>
+                            <div class="stat-label">Всего сообщений</div>
+                        </div>
+                        <div class="stat-card">
+                            <div class="stat-number">${stats.total_friends}</div>
+                            <div class="stat-label">Дружеских связей</div>
+                        </div>
+                        <div class="stat-card">
+                            <div class="stat-number">${stats.online_users}</div>
+                            <div class="stat-label">Онлайн сейчас</div>
+                        </div>
+                    `;
+                }
+            } catch (error) {
+                document.getElementById('statsGrid').innerHTML = `
+                    <div class="error">Ошибка загрузки статистики: ${error.message}</div>
+                `;
+            }
+        }
+
+        // Загрузка пользователей
+        async function loadUsers(page = 1) {
+            try {
+                currentPage = page;
+                const response = await fetch(`/admin/users?page=${page}&limit=${limit}`);
+                const data = await response.json();
+                
+                if (data.success) {
+                    const users = data.users;
+                    const pagination = data.pagination;
+                    
+                    let tableHTML = `
+                        <table class="users-table">
+                            <thead>
+                                <tr>
+                                    <th>ID</th>
+                                    <th>Email</th>
+                                    <th>Имя</th>
+                                    <th>Фамилия</th>
+                                    <th>Дата регистрации</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                    `;
+                    
+                    users.forEach(user => {
+                        tableHTML += `
+                            <tr>
+                                <td>${user.id}</td>
+                                <td>${user.email}</td>
+                                <td>${user.first_name}</td>
+                                <td>${user.last_name}</td>
+                                <td>${new Date(user.created_at).toLocaleString('ru-RU')}</td>
+                            </tr>
+                        `;
+                    });
+                    
+                    tableHTML += '</tbody></table>';
+                    document.getElementById('usersTable').innerHTML = tableHTML;
+                    
+                    // Пагинация
+                    let paginationHTML = '';
+                    if (pagination.total_pages > 1) {
+                        paginationHTML = `
+                            <button ${currentPage === 1 ? 'disabled' : ''} onclick="loadUsers(${currentPage - 1})">← Назад</button>
+                            <span>Страница ${currentPage} из ${pagination.total_pages}</span>
+                            <button ${currentPage === pagination.total_pages ? 'disabled' : ''} onclick="loadUsers(${currentPage + 1})">Вперед →</button>
+                        `;
+                    }
+                    document.getElementById('pagination').innerHTML = paginationHTML;
+                }
+            } catch (error) {
+                document.getElementById('usersTable').innerHTML = `
+                    <div class="error">Ошибка загрузки пользователей: ${error.message}</div>
+                `;
+            }
+        }
+
+        // Автообновление каждые 30 секунд
+        function startAutoRefresh() {
+            setInterval(() => {
+                loadStats();
+                loadUsers(currentPage);
+            }, 30000);
+        }
+
+        // Инициализация
+        document.addEventListener('DOMContentLoaded', () => {
+            loadStats();
+            loadUsers();
+            startAutoRefresh();
+        });
+    </script>
+</body>
+</html>
