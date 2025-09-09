@@ -96,6 +96,68 @@ function handleDatabaseError(err, res) {
     });
 }
 
+// Функция для автоматического добавления в чаты при отправке сообщения
+function autoAddToChats(senderEmail, receiverEmail) {
+    // Проверяем, существует ли получатель
+    db.get("SELECT email FROM users WHERE email = ?", [receiverEmail], (err, receiver) => {
+        if (err) {
+            console.error('Ошибка проверки получателя:', err.message);
+            return;
+        }
+
+        if (!receiver) {
+            console.log('Получатель не существует, пропускаем добавление в чаты');
+            return;
+        }
+
+        // Проверяем, есть ли уже чат между пользователями (в любую сторону)
+        db.get(
+            `SELECT 1 FROM messages 
+             WHERE (sender_email = ? AND receiver_email = ?) 
+                OR (sender_email = ? AND receiver_email = ?) 
+             LIMIT 1`,
+            [senderEmail, receiverEmail, receiverEmail, senderEmail],
+            (err, existingChat) => {
+                if (err) {
+                    console.error('Ошибка проверки чата:', err.message);
+                    return;
+                }
+
+                // Если чата еще нет, добавляем обоюдную связь
+                if (!existingChat) {
+                    console.log(`Создаем автоматический чат между ${senderEmail} и ${receiverEmail}`);
+                    
+                    // Добавляем отправителя в чаты получателя
+                    db.run(
+                        "INSERT OR IGNORE INTO friends (user_email, friend_email) VALUES (?, ?)",
+                        [receiverEmail, senderEmail],
+                        function(err) {
+                            if (err) {
+                                console.error('Ошибка добавления в друзья (получатель):', err.message);
+                            } else if (this.changes > 0) {
+                                console.log(`Автоматически добавлен чат для ${receiverEmail} с ${senderEmail}`);
+                            }
+                        }
+                    );
+
+                    // Добавляем получателя в чаты отправителя
+                    db.run(
+                        "INSERT OR IGNORE INTO friends (user_email, friend_email) VALUES (?, ?)",
+                        [senderEmail, receiverEmail],
+                        function(err) {
+                            if (err) {
+                                console.error('Ошибка добавления в друзья (отправитель):', err.message);
+                            } else if (this.changes > 0) {
+                                console.log(`Автоматически добавлен чат для ${senderEmail} с ${receiverEmail}`);
+                            }
+                        }
+                    );
+                }
+            }
+        );
+    });
+}
+
 // Проверка подключения к БД
 app.get('/health', (req, res) => {
     db.get("SELECT 1 as test", [], (err) => {
@@ -322,6 +384,9 @@ app.post('/send-message', (req, res) => {
                 return handleDatabaseError(err, res);
             }
 
+            // Автоматически добавляем пользователей в чаты друг друга
+            autoAddToChats(senderEmail.toLowerCase(), receiverEmail.toLowerCase());
+
             // Пытаемся отправить email (не блокируем основной поток)
             if (transporter) {
                 try {
@@ -450,36 +515,58 @@ app.get('/user/:email', (req, res) => {
     );
 });
 
-// Получение последних сообщений пользователя
-app.get('/recent-chats/:email', (req, res) => {
+// Получение всех чатов пользователя (друзья + люди, с которыми есть сообщения)
+app.get('/chats/:email', (req, res) => {
     const userEmail = req.params.email.toLowerCase();
     
     db.all(
-        `SELECT DISTINCT 
+        `-- Друзья
+        SELECT f.friend_email as contact_email, u.first_name, u.last_name, 
+               'friend' as type, MAX(m.timestamp) as last_message_time
+        FROM friends f 
+        JOIN users u ON f.friend_email = u.email 
+        LEFT JOIN messages m ON (m.sender_email = ? AND m.receiver_email = f.friend_email) 
+                             OR (m.sender_email = f.friend_email AND m.receiver_email = ?)
+        WHERE f.user_email = ? 
+        GROUP BY f.friend_email
+        
+        UNION
+        
+        -- Люди, с которыми есть сообщения, но нет в друзьях
+        SELECT 
             CASE 
                 WHEN sender_email = ? THEN receiver_email 
                 ELSE sender_email 
             END as contact_email,
             u.first_name,
             u.last_name,
+            'chat' as type,
             MAX(m.timestamp) as last_message_time
-         FROM messages m
-         JOIN users u ON u.email = CASE 
+        FROM messages m
+        JOIN users u ON u.email = CASE 
                 WHEN m.sender_email = ? THEN m.receiver_email 
                 ELSE m.sender_email 
             END
-         WHERE sender_email = ? OR receiver_email = ?
-         GROUP BY contact_email
-         ORDER BY last_message_time DESC
-         LIMIT 20`,
-        [userEmail, userEmail, userEmail, userEmail],
+        WHERE (sender_email = ? OR receiver_email = ?)
+          AND NOT EXISTS (
+              SELECT 1 FROM friends f 
+              WHERE f.user_email = ? 
+              AND f.friend_email = CASE 
+                  WHEN m.sender_email = ? THEN m.receiver_email 
+                  ELSE m.sender_email 
+              END
+          )
+        GROUP BY contact_email
+        
+        ORDER BY last_message_time DESC NULLS LAST, first_name, last_name`,
+        [userEmail, userEmail, userEmail, userEmail, userEmail, userEmail, userEmail, userEmail, userEmail],
         (err, rows) => {
             if (err) {
                 handleDatabaseError(err, res);
             } else {
                 res.json({ 
                     success: true, 
-                    recentChats: rows,
+                    chats: rows,
                     count: rows.length 
                 });
             }
@@ -520,11 +607,11 @@ app.use('*', (req, res) => {
             'POST /add-friend',
             'POST /remove-friend',
             'GET /friends/:email',
+            'GET /chats/:email',
             'POST /send-message',
             'GET /messages/:userEmail/:friendEmail',
             'POST /clear-chat',
             'GET /user/:email',
-            'GET /recent-chats/:email',
             'GET /stats',
             'GET /health'
         ]
@@ -571,5 +658,7 @@ process.on('SIGTERM', () => {
             console.log('✅ Подключение к БД закрыто');
         }
         process.exit(0);
+    });
+});
     });
 });
