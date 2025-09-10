@@ -4,6 +4,8 @@ const nodemailer = require('nodemailer');
 const bodyParser = require('body-parser');
 const sqlite3 = require('sqlite3').verbose();
 const path = require('path');
+const fs = require('fs');
+const multer = require('multer');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -11,11 +13,41 @@ const PORT = process.env.PORT || 3000;
 // Middleware
 app.use(cors({
     origin: '*',
-    methods: ['GET', 'POST', 'DELETE'],
+    methods: ['GET', 'POST', 'DELETE', 'PUT'],
     allowedHeaders: ['Content-Type', 'Authorization']
 }));
-app.use(bodyParser.json());
+app.use(bodyParser.json({ limit: '50mb' }));
+app.use(bodyParser.urlencoded({ extended: true, limit: '50mb' }));
 app.use(express.static('public'));
+
+// Настройка загрузки файлов
+const storage = multer.diskStorage({
+    destination: (req, file, cb) => {
+        const uploadDir = 'uploads';
+        if (!fs.existsSync(uploadDir)) {
+            fs.mkdirSync(uploadDir, { recursive: true });
+        }
+        cb(null, uploadDir);
+    },
+    filename: (req, file, cb) => {
+        const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
+        cb(null, uniqueSuffix + '-' + file.originalname);
+    }
+});
+
+const upload = multer({
+    storage: storage,
+    limits: {
+        fileSize: 10 * 1024 * 1024 // 10MB limit
+    },
+    fileFilter: (req, file, cb) => {
+        if (file.mimetype.startsWith('image/') || file.mimetype.startsWith('video/')) {
+            cb(null, true);
+        } else {
+            cb(new Error('Only images and videos are allowed'), false);
+        }
+    }
+});
 
 // Инициализация базы данных
 const dbPath = process.env.DB_PATH || './beresta.db';
@@ -56,6 +88,9 @@ db.serialize(() => {
         sender_email TEXT NOT NULL,
         receiver_email TEXT NOT NULL,
         message TEXT NOT NULL,
+        attachment_type TEXT DEFAULT '',
+        attachment_filename TEXT DEFAULT '',
+        attachment_original_name TEXT DEFAULT '',
         timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
         FOREIGN KEY (sender_email) REFERENCES users (email) ON DELETE CASCADE,
         FOREIGN KEY (receiver_email) REFERENCES users (email) ON DELETE CASCADE
@@ -221,6 +256,67 @@ app.post('/register', (req, res) => {
     );
 });
 
+// Удаление аккаунта
+app.delete('/delete-account/:email', (req, res) => {
+    const email = req.params.email.toLowerCase();
+    
+    if (!email) {
+        return res.status(400).json({ 
+            success: false, 
+            error: 'Email обязателен' 
+        });
+    }
+
+    // Проверяем, существует ли пользователь
+    db.get("SELECT email FROM users WHERE email = ?", [email], (err, user) => {
+        if (err) {
+            return handleDatabaseError(err, res);
+        }
+
+        if (!user) {
+            return res.status(404).json({ 
+                success: false, 
+                error: 'Пользователь не найден' 
+            });
+        }
+
+        // Удаляем пользователя (каскадное удаление сработает благодаря FOREIGN KEY)
+        db.run("DELETE FROM users WHERE email = ?", [email], function(err) {
+            if (err) {
+                handleDatabaseError(err, res);
+            } else if (this.changes === 0) {
+                res.status(404).json({ 
+                    success: false, 
+                    error: 'Пользователь не найден' 
+                });
+            } else {
+                // Удаляем файлы вложений пользователя
+                db.all(
+                    "SELECT attachment_filename FROM messages WHERE sender_email = ? AND attachment_filename != ''",
+                    [email],
+                    (err, attachments) => {
+                        if (err) {
+                            console.error('Ошибка получения списка вложений:', err.message);
+                        } else {
+                            attachments.forEach(attachment => {
+                                const filePath = path.join('uploads', attachment.attachment_filename);
+                                if (fs.existsSync(filePath)) {
+                                    fs.unlinkSync(filePath);
+                                }
+                            });
+                        }
+                    }
+                );
+
+                res.json({ 
+                    success: true, 
+                    message: 'Аккаунт и все связанные данные удалены' 
+                });
+            }
+        });
+    });
+});
+
 // Получение списка всех пользователей
 app.get('/users', (req, res) => {
     db.all("SELECT email, first_name, last_name FROM users ORDER BY first_name, last_name", [], (err, rows) => {
@@ -349,7 +445,7 @@ app.get('/friends/:email', (req, res) => {
     );
 });
 
-// Отправка сообщения
+// Отправка текстового сообщения
 app.post('/send-message', (req, res) => {
     const { senderEmail, receiverEmail, message } = req.body;
     
@@ -432,6 +528,79 @@ app.post('/send-message', (req, res) => {
     );
 });
 
+// Отправка сообщения с вложением
+app.post('/send-message-attachment', upload.single('attachment'), (req, res) => {
+    const { senderEmail, receiverEmail, message } = req.body;
+    
+    if (!senderEmail || !receiverEmail) {
+        return res.status(400).json({ 
+            success: false, 
+            error: 'Email отправителя и получателя обязательны' 
+        });
+    }
+
+    if (!req.file) {
+        return res.status(400).json({ 
+            success: false, 
+            error: 'Файл не загружен' 
+        });
+    }
+
+    const trimmedMessage = message ? message.trim() : '';
+    const attachmentType = req.file.mimetype.startsWith('image/') ? 'image' : 'video';
+
+    // Сохраняем сообщение с вложением в БД
+    db.run(
+        "INSERT INTO messages (sender_email, receiver_email, message, attachment_type, attachment_filename, attachment_original_name) VALUES (?, ?, ?, ?, ?, ?)", 
+        [
+            senderEmail.toLowerCase(), 
+            receiverEmail.toLowerCase(), 
+            trimmedMessage,
+            attachmentType,
+            req.file.filename,
+            req.file.originalname
+        ], 
+        function(err) {
+            if (err) {
+                // Удаляем загруженный файл в случае ошибки
+                fs.unlinkSync(req.file.path);
+                return handleDatabaseError(err, res);
+            }
+
+            // Автоматически добавляем пользователей в чаты друг друга
+            autoAddToChats(senderEmail.toLowerCase(), receiverEmail.toLowerCase());
+
+            res.json({ 
+                success: true, 
+                message: 'Сообщение с вложением отправлено',
+                messageId: this.lastID,
+                timestamp: new Date().toISOString(),
+                attachment: {
+                    filename: req.file.filename,
+                    originalName: req.file.originalname,
+                    type: attachmentType,
+                    url: `/uploads/${req.file.filename}`
+                }
+            });
+        }
+    );
+});
+
+// Получение файла вложения
+app.get('/uploads/:filename', (req, res) => {
+    const filename = req.params.filename;
+    const filePath = path.join('uploads', filename);
+    
+    if (fs.existsSync(filePath)) {
+        res.sendFile(path.resolve(filePath));
+    } else {
+        res.status(404).json({ 
+            success: false, 
+            error: 'Файл не найден' 
+        });
+    }
+});
+
 // Получение истории сообщений
 app.get('/messages/:userEmail/:friendEmail', (req, res) => {
     const userEmail = req.params.userEmail.toLowerCase();
@@ -439,6 +608,7 @@ app.get('/messages/:userEmail/:friendEmail', (req, res) => {
     
     db.all(
         `SELECT sender_email, receiver_email, message, 
+                attachment_type, attachment_filename, attachment_original_name,
                 datetime(timestamp, 'localtime') as timestamp 
          FROM messages 
          WHERE (sender_email = ? AND receiver_email = ?) 
@@ -449,10 +619,18 @@ app.get('/messages/:userEmail/:friendEmail', (req, res) => {
             if (err) {
                 handleDatabaseError(err, res);
             } else {
+                // Добавляем URL для вложений
+                const messagesWithAttachments = rows.map(row => {
+                    if (row.attachment_filename) {
+                        row.attachment_url = `/uploads/${row.attachment_filename}`;
+                    }
+                    return row;
+                });
+                
                 res.json({ 
                     success: true, 
-                    messages: rows,
-                    count: rows.length 
+                    messages: messagesWithAttachments,
+                    count: messagesWithAttachments.length 
                 });
             }
         }
@@ -470,22 +648,46 @@ app.post('/clear-chat', (req, res) => {
         });
     }
 
-    db.run(
-        `DELETE FROM messages 
-         WHERE (sender_email = ? AND receiver_email = ?) 
-            OR (sender_email = ? AND receiver_email = ?)`, 
+    // Сначала получаем список файлов вложений для удаления
+    db.all(
+        `SELECT attachment_filename FROM messages 
+         WHERE ((sender_email = ? AND receiver_email = ?) 
+            OR (sender_email = ? AND receiver_email = ?))
+         AND attachment_filename != ''`,
         [userEmail.toLowerCase(), friendEmail.toLowerCase(), 
-         friendEmail.toLowerCase(), userEmail.toLowerCase()], 
-        function(err) {
+         friendEmail.toLowerCase(), userEmail.toLowerCase()],
+        (err, attachments) => {
             if (err) {
-                handleDatabaseError(err, res);
-            } else {
-                res.json({ 
-                    success: true, 
-                    message: 'История чата очищена',
-                    deletedCount: this.changes
-                });
+                return handleDatabaseError(err, res);
             }
+
+            // Удаляем файлы вложений
+            attachments.forEach(attachment => {
+                const filePath = path.join('uploads', attachment.attachment_filename);
+                if (fs.existsSync(filePath)) {
+                    fs.unlinkSync(filePath);
+                }
+            });
+
+            // Теперь удаляем сообщения из БД
+            db.run(
+                `DELETE FROM messages 
+                 WHERE (sender_email = ? AND receiver_email = ?) 
+                    OR (sender_email = ? AND receiver_email = ?)`, 
+                [userEmail.toLowerCase(), friendEmail.toLowerCase(), 
+                 friendEmail.toLowerCase(), userEmail.toLowerCase()], 
+                function(err) {
+                    if (err) {
+                        handleDatabaseError(err, res);
+                    } else {
+                        res.json({ 
+                            success: true, 
+                            message: 'История чата очищена',
+                            deletedCount: this.changes
+                        });
+                    }
+                }
+            );
         }
     );
 });
@@ -581,7 +783,8 @@ app.get('/stats', (req, res) => {
             (SELECT COUNT(*) FROM users) as users_count,
             (SELECT COUNT(*) FROM friends) as friendships_count,
             (SELECT COUNT(*) FROM messages) as messages_count,
-            (SELECT COUNT(*) FROM messages WHERE date(timestamp) = date('now')) as messages_today`,
+            (SELECT COUNT(*) FROM messages WHERE date(timestamp) = date('now')) as messages_today,
+            (SELECT COUNT(*) FROM messages WHERE attachment_type != '') as attachments_count`,
         [],
         (err, rows) => {
             if (err) {
@@ -603,17 +806,20 @@ app.use('*', (req, res) => {
         error: 'Endpoint не найден',
         availableEndpoints: [
             'POST /register',
+            'DELETE /delete-account/:email',
             'GET /users',
             'POST /add-friend',
             'POST /remove-friend',
             'GET /friends/:email',
             'GET /chats/:email',
             'POST /send-message',
+            'POST /send-message-attachment',
             'GET /messages/:userEmail/:friendEmail',
             'POST /clear-chat',
             'GET /user/:email',
             'GET /stats',
-            'GET /health'
+            'GET /health',
+            'GET /uploads/:filename'
         ]
     });
 });
@@ -634,6 +840,7 @@ app.listen(PORT, () => {
     console.log(`📍 Health check: http://localhost:${PORT}/health`);
     console.log(`📧 Режим email: ${transporter ? 'Настроен' : 'Отключен'}`);
     console.log(`🗄️  База данных: ${dbPath}`);
+    console.log(`📁 Папка загрузок: uploads/`);
 });
 
 // Graceful shutdown
