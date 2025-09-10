@@ -33,7 +33,6 @@ const storage = multer.diskStorage({
     filename: (req, file, cb) => {
         const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
         const extension = path.extname(file.originalname);
-        // Сохраняем оригинальное расширение
         cb(null, 'file_' + uniqueSuffix + extension);
     }
 });
@@ -41,11 +40,10 @@ const storage = multer.diskStorage({
 const upload = multer({
     storage: storage,
     limits: {
-        fileSize: 100 * 1024 * 1024, // 100MB limit
+        fileSize: 100 * 1024 * 1024,
         fieldSize: 50 * 1024 * 1024
     },
     fileFilter: (req, file, cb) => {
-        // Разрешаем все типы файлов
         cb(null, true);
     }
 });
@@ -137,6 +135,256 @@ app.get('/health', (req, res) => {
     });
 });
 
+// Регистрация пользователя
+app.post('/register', (req, res) => {
+    try {
+        const { email, firstName, lastName } = req.body;
+
+        if (!email || !firstName || !lastName) {
+            return res.status(400).json({ 
+                success: false, 
+                error: 'Все поля обязательны: email, firstName, lastName' 
+            });
+        }
+
+        // Проверяем, существует ли пользователь
+        db.get("SELECT id FROM users WHERE email = ?", [email.toLowerCase()], (err, row) => {
+            if (err) {
+                console.error('❌ Ошибка БД при проверке пользователя:', err);
+                return res.status(500).json({ success: false, error: 'Database error' });
+            }
+
+            if (row) {
+                return res.status(409).json({ 
+                    success: false, 
+                    error: 'Пользователь с таким email уже существует' 
+                });
+            }
+
+            // Создаем нового пользователя
+            db.run(
+                "INSERT INTO users (email, first_name, last_name) VALUES (?, ?, ?)",
+                [email.toLowerCase(), firstName, lastName],
+                function(err) {
+                    if (err) {
+                        console.error('❌ Ошибка БД при регистрации:', err);
+                        return res.status(500).json({ success: false, error: 'Database error' });
+                    }
+
+                    res.json({
+                        success: true,
+                        message: 'Пользователь успешно зарегистрирован',
+                        userId: this.lastID
+                    });
+                }
+            );
+        });
+    } catch (error) {
+        console.error('❌ Ошибка регистрации:', error);
+        res.status(500).json({ success: false, error: 'Internal server error' });
+    }
+});
+
+// Получение списка пользователей
+app.get('/users', (req, res) => {
+    try {
+        db.all("SELECT email, first_name as firstName, last_name as lastName FROM users ORDER BY first_name, last_name", 
+        [], 
+        (err, rows) => {
+            if (err) {
+                console.error('❌ Ошибка БД при получении пользователей:', err);
+                return res.status(500).json({ success: false, error: 'Database error' });
+            }
+
+            res.json({
+                success: true,
+                users: rows
+            });
+        });
+    } catch (error) {
+        console.error('❌ Ошибка получения пользователей:', error);
+        res.status(500).json({ success: false, error: 'Internal server error' });
+    }
+});
+
+// Добавление в друзья
+app.post('/add-friend', (req, res) => {
+    try {
+        const { userEmail, friendEmail } = req.body;
+
+        if (!userEmail || !friendEmail) {
+            return res.status(400).json({ success: false, error: 'Email обязательны' });
+        }
+
+        // Проверяем, существуют ли оба пользователя
+        db.get("SELECT COUNT(*) as count FROM users WHERE email IN (?, ?)", 
+        [userEmail.toLowerCase(), friendEmail.toLowerCase()], 
+        (err, row) => {
+            if (err) {
+                console.error('❌ Ошибка БД:', err);
+                return res.status(500).json({ success: false, error: 'Database error' });
+            }
+
+            if (row.count !== 2) {
+                return res.status(404).json({ 
+                    success: false, 
+                    error: 'Один или оба пользователя не найдены' 
+                });
+            }
+
+            // Добавляем в друзья
+            db.run(
+                "INSERT OR IGNORE INTO friends (user_email, friend_email) VALUES (?, ?)",
+                [userEmail.toLowerCase(), friendEmail.toLowerCase()],
+                function(err) {
+                    if (err) {
+                        console.error('❌ Ошибка БД:', err);
+                        return res.status(500).json({ success: false, error: 'Database error' });
+                    }
+
+                    res.json({
+                        success: true,
+                        message: 'Друг добавлен',
+                        changes: this.changes
+                    });
+                }
+            );
+        });
+    } catch (error) {
+        console.error('❌ Ошибка добавления друга:', error);
+        res.status(500).json({ success: false, error: 'Internal server error' });
+    }
+});
+
+// Удаление из друзей
+app.post('/remove-friend', (req, res) => {
+    try {
+        const { userEmail, friendEmail } = req.body;
+
+        if (!userEmail || !friendEmail) {
+            return res.status(400).json({ success: false, error: 'Email обязательны' });
+        }
+
+        db.run(
+            "DELETE FROM friends WHERE user_email = ? AND friend_email = ?",
+            [userEmail.toLowerCase(), friendEmail.toLowerCase()],
+            function(err) {
+                if (err) {
+                    console.error('❌ Ошибка БД:', err);
+                    return res.status(500).json({ success: false, error: 'Database error' });
+                }
+
+                res.json({
+                    success: true,
+                    message: 'Друг удален',
+                    changes: this.changes
+                });
+            }
+        );
+    } catch (error) {
+        console.error('❌ Ошибка удаления друга:', error);
+        res.status(500).json({ success: false, error: 'Internal server error' });
+    }
+});
+
+// Получение чатов пользователя
+app.get('/chats/:userEmail', (req, res) => {
+    try {
+        const userEmail = req.params.userEmail.toLowerCase();
+
+        db.all(`
+            SELECT 
+                u.email as contactEmail,
+                u.first_name as firstName,
+                u.last_name as lastName,
+                'friend' as type,
+                MAX(m.timestamp) as lastMessageTime
+            FROM friends f
+            JOIN users u ON u.email = f.friend_email
+            LEFT JOIN messages m ON 
+                (m.sender_email = f.user_email AND m.receiver_email = f.friend_email) OR
+                (m.sender_email = f.friend_email AND m.receiver_email = f.user_email)
+            WHERE f.user_email = ?
+            GROUP BY u.email, u.first_name, u.last_name
+            ORDER BY lastMessageTime DESC, u.first_name, u.last_name
+        `, [userEmail], (err, rows) => {
+            if (err) {
+                console.error('❌ Ошибка БД:', err);
+                return res.status(500).json({ success: false, error: 'Database error' });
+            }
+
+            res.json({
+                success: true,
+                chats: rows
+            });
+        });
+    } catch (error) {
+        console.error('❌ Ошибка получения чатов:', error);
+        res.status(500).json({ success: false, error: 'Internal server error' });
+    }
+});
+
+// Удаление аккаунта
+app.delete('/delete-account/:userEmail', (req, res) => {
+    try {
+        const userEmail = req.params.userEmail.toLowerCase();
+
+        db.run(
+            "DELETE FROM users WHERE email = ?",
+            [userEmail],
+            function(err) {
+                if (err) {
+                    console.error('❌ Ошибка БД:', err);
+                    return res.status(500).json({ success: false, error: 'Database error' });
+                }
+
+                res.json({
+                    success: true,
+                    message: 'Аккаунт удален',
+                    changes: this.changes
+                });
+            }
+        );
+    } catch (error) {
+        console.error('❌ Ошибка удаления аккаунта:', error);
+        res.status(500).json({ success: false, error: 'Internal server error' });
+    }
+});
+
+// Очистка истории чата
+app.post('/clear-chat', (req, res) => {
+    try {
+        const { userEmail, friendEmail } = req.body;
+
+        if (!userEmail || !friendEmail) {
+            return res.status(400).json({ success: false, error: 'Email обязательны' });
+        }
+
+        db.run(
+            `DELETE FROM messages 
+             WHERE (sender_email = ? AND receiver_email = ?) 
+                OR (sender_email = ? AND receiver_email = ?)`,
+            [userEmail.toLowerCase(), friendEmail.toLowerCase(), 
+             friendEmail.toLowerCase(), userEmail.toLowerCase()],
+            function(err) {
+                if (err) {
+                    console.error('❌ Ошибка БД:', err);
+                    return res.status(500).json({ success: false, error: 'Database error' });
+                }
+
+                res.json({
+                    success: true,
+                    message: 'История чата очищена',
+                    changes: this.changes
+                });
+            }
+        );
+    } catch (error) {
+        console.error('❌ Ошибка очистки чата:', error);
+        res.status(500).json({ success: false, error: 'Internal server error' });
+    }
+});
+
 // Загрузка файла
 app.post('/upload-file', upload.single('file'), (req, res) => {
     try {
@@ -208,7 +456,6 @@ app.post('/send-message', upload.single('attachment'), (req, res) => {
             function(err) {
                 if (err) {
                     console.error('❌ Ошибка БД:', err);
-                    // Удаляем файл в случае ошибки
                     if (req.file && fs.existsSync(req.file.path)) {
                         fs.unlinkSync(req.file.path);
                     }
@@ -312,20 +559,6 @@ app.get('/download/:filename', (req, res) => {
     res.download(filePath, originalName);
 });
 
-// Статические файлы
-app.use('/uploads', express.static(uploadDir, {
-    setHeaders: (res, filePath) => {
-        const ext = path.extname(filePath).toLowerCase();
-        const mimeType = mime.lookup(ext) || 'application/octet-stream';
-        res.setHeader('Content-Type', mimeType);
-        
-        // Кэширование для медиа файлов
-        if (['.mp4', '.mov', '.avi', '.mkv', '.mp3', '.wav', '.ogg'].includes(ext)) {
-            res.setHeader('Cache-Control', 'public, max-age=31536000'); // 1 год
-        }
-    }
-}));
-
 // Обновление статуса сообщения
 app.post('/update-message-status', (req, res) => {
     const { messageId, status } = req.body;
@@ -346,6 +579,19 @@ app.post('/update-message-status', (req, res) => {
     );
 });
 
+// Статические файлы
+app.use('/uploads', express.static(uploadDir, {
+    setHeaders: (res, filePath) => {
+        const ext = path.extname(filePath).toLowerCase();
+        const mimeType = mime.lookup(ext) || 'application/octet-stream';
+        res.setHeader('Content-Type', mimeType);
+        
+        if (['.mp4', '.mov', '.avi', '.mkv', '.mp3', '.wav', '.ogg'].includes(ext)) {
+            res.setHeader('Cache-Control', 'public, max-age=31536000');
+        }
+    }
+}));
+
 // Обработка ошибок
 app.use((error, req, res, next) => {
     console.error('❌ Необработанная ошибка:', error);
@@ -356,6 +602,11 @@ app.use((error, req, res, next) => {
     });
 });
 
+// 404 handler
+app.use((req, res) => {
+    res.status(404).json({ success: false, error: 'Endpoint not found' });
+});
+
 // Запуск сервера
 app.listen(PORT, () => {
     console.log(`🚀 Сервер Береста запущен на порту ${PORT}`);
@@ -363,6 +614,20 @@ app.listen(PORT, () => {
     console.log(`📁 Папка загрузок: ${uploadDir}`);
     console.log(`📊 База данных: ${dbPath}`);
     console.log(`📦 Поддержка файлов: все форматы до 100MB`);
+    console.log('\n📋 Доступные endpointы:');
+    console.log('  POST   /register - Регистрация пользователя');
+    console.log('  GET    /users - Получение списка пользователей');
+    console.log('  POST   /add-friend - Добавление в друзья');
+    console.log('  POST   /remove-friend - Удаление из друзей');
+    console.log('  GET    /chats/:email - Получение чатов пользователя');
+    console.log('  DELETE /delete-account/:email - Удаление аккаунта');
+    console.log('  POST   /clear-chat - Очистка истории чата');
+    console.log('  POST   /upload-file - Загрузка файла');
+    console.log('  POST   /send-message - Отправка сообщения');
+    console.log('  GET    /messages/:user/:friend - Получение сообщений');
+    console.log('  GET    /file-info/:filename - Информация о файле');
+    console.log('  GET    /download/:filename - Скачивание файла');
+    console.log('  POST   /update-message-status - Обновление статуса сообщения');
 });
 
 // Graceful shutdown
