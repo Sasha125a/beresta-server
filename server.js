@@ -114,10 +114,59 @@ function getFileType(mimetype, filename) {
         return 'document';
     }
     if (mimetype.includes('zip') || mimetype.includes('rar') || mimetype.includes('tar') || 
-        mimetype.includes('7z') || mimetype.includes('compressed')) {
+        mimeType.includes('7z') || mimetype.includes('compressed')) {
         return 'archive';
     }
     return 'file';
+}
+
+// Функция автоматического добавления в чаты
+function addToChatsAutomatically(user1, user2, callback) {
+    // Проверяем, существуют ли оба пользователя
+    db.get("SELECT COUNT(*) as count FROM users WHERE email IN (?, ?)", 
+    [user1.toLowerCase(), user2.toLowerCase()], 
+    (err, row) => {
+        if (err) {
+            console.error('❌ Ошибка проверки пользователей:', err);
+            return callback();
+        }
+
+        if (row.count !== 2) {
+            console.log('⚠️  Один или оба пользователя не найдены, пропускаем добавление в чаты');
+            return callback();
+        }
+
+        // Добавляем взаимно в чаты (игнорируем если уже есть)
+        const queries = [
+            "INSERT OR IGNORE INTO friends (user_email, friend_email) VALUES (?, ?)",
+            "INSERT OR IGNORE INTO friends (user_email, friend_email) VALUES (?, ?)"
+        ];
+
+        const values = [
+            [user1.toLowerCase(), user2.toLowerCase()],
+            [user2.toLowerCase(), user1.toLowerCase()]
+        ];
+
+        let completed = 0;
+        const total = queries.length;
+
+        function checkCompletion() {
+            completed++;
+            if (completed === total) {
+                console.log(`✅ Автоматически добавлены чаты: ${user1} ↔️ ${user2}`);
+                callback();
+            }
+        }
+
+        queries.forEach((query, index) => {
+            db.run(query, values[index], function(err) {
+                if (err) {
+                    console.error('❌ Ошибка автоматического добавления в чаты:', err);
+                }
+                checkCompletion();
+            });
+        });
+    });
 }
 
 // Health check
@@ -207,6 +256,23 @@ app.get('/users', (req, res) => {
     }
 });
 
+// Проверка существования пользователя
+app.get('/check-user/:email', (req, res) => {
+    const email = req.params.email.toLowerCase();
+    
+    db.get("SELECT email, first_name as firstName, last_name as lastName FROM users WHERE email = ?", [email], (err, row) => {
+        if (err) {
+            return res.status(500).json({ success: false, error: 'Database error' });
+        }
+        
+        res.json({
+            success: true,
+            exists: !!row,
+            user: row
+        });
+    });
+});
+
 // Добавление в друзья
 app.post('/add-friend', (req, res) => {
     try {
@@ -293,6 +359,7 @@ app.get('/chats/:userEmail', (req, res) => {
         const userEmail = req.params.userEmail.toLowerCase();
 
         db.all(`
+            -- Чаты из друзей
             SELECT 
                 u.email as contactEmail,
                 u.first_name as firstName,
@@ -306,10 +373,40 @@ app.get('/chats/:userEmail', (req, res) => {
                 (m.sender_email = f.friend_email AND m.receiver_email = f.user_email)
             WHERE f.user_email = ?
             GROUP BY u.email, u.first_name, u.last_name
-            ORDER BY lastMessageTime DESC, u.first_name, u.last_name
-        `, [userEmail], (err, rows) => {
+            
+            UNION
+            
+            -- Чаты из переписки (даже если не в друзьях)
+            SELECT 
+                CASE 
+                    WHEN m.sender_email = ? THEN m.receiver_email
+                    ELSE m.sender_email
+                END as contactEmail,
+                u.first_name as firstName,
+                u.last_name as lastName,
+                'chat' as type,
+                MAX(m.timestamp) as lastMessageTime
+            FROM messages m
+            JOIN users u ON u.email = CASE 
+                WHEN m.sender_email = ? THEN m.receiver_email
+                ELSE m.sender_email
+            END
+            WHERE (m.sender_email = ? OR m.receiver_email = ?)
+            AND NOT EXISTS (
+                SELECT 1 FROM friends f 
+                WHERE f.user_email = ? 
+                AND f.friend_email = CASE 
+                    WHEN m.sender_email = ? THEN m.receiver_email
+                    ELSE m.sender_email
+                END
+            )
+            GROUP BY contactEmail, u.first_name, u.last_name
+            
+            ORDER BY lastMessageTime DESC, firstName, lastName
+        `, [userEmail, userEmail, userEmail, userEmail, userEmail, userEmail, userEmail], 
+        (err, rows) => {
             if (err) {
-                console.error('❌ Ошибка БД:', err);
+                console.error('❌ Ошибка БД при получении чатов:', err);
                 return res.status(500).json({ success: false, error: 'Database error' });
             }
 
@@ -462,12 +559,15 @@ app.post('/send-message', upload.single('attachment'), (req, res) => {
                     return res.status(500).json({ success: false, error: 'Database error' });
                 }
 
-                res.json({
-                    success: true,
-                    message: 'Сообщение отправлено',
-                    messageId: this.lastID,
-                    timestamp: new Date().toISOString(),
-                    attachment: attachmentData
+                // АВТОМАТИЧЕСКИ ДОБАВЛЯЕМ ПОЛЬЗОВАТЕЛЕЙ В ЧАТЫ ДРУГ ДРУГА
+                addToChatsAutomatically(senderEmail, receiverEmail, function() {
+                    res.json({
+                        success: true,
+                        message: 'Сообщение отправлено',
+                        messageId: this.lastID,
+                        timestamp: new Date().toISOString(),
+                        attachment: attachmentData
+                    });
                 });
             }
         );
@@ -617,6 +717,7 @@ app.listen(PORT, () => {
     console.log('\n📋 Доступные endpointы:');
     console.log('  POST   /register - Регистрация пользователя');
     console.log('  GET    /users - Получение списка пользователей');
+    console.log('  GET    /check-user/:email - Проверка пользователя');
     console.log('  POST   /add-friend - Добавление в друзья');
     console.log('  POST   /remove-friend - Удаление из друзей');
     console.log('  GET    /chats/:email - Получение чатов пользователя');
