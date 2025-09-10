@@ -1,6 +1,5 @@
 const express = require('express');
 const cors = require('cors');
-const nodemailer = require('nodemailer');
 const bodyParser = require('body-parser');
 const sqlite3 = require('sqlite3').verbose();
 const path = require('path');
@@ -17,15 +16,8 @@ app.use(cors({
     methods: ['GET', 'POST', 'DELETE', 'PUT', 'OPTIONS'],
     allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With']
 }));
-app.use(bodyParser.json({ limit: '50mb' }));
-app.use(bodyParser.urlencoded({ extended: true, limit: '50mb' }));
-app.use('/uploads', express.static('uploads', {
-    setHeaders: (res, path) => {
-        if (path.endsWith('.mp4') || path.endsWith('.mov') || path.endsWith('.avi')) {
-            res.setHeader('Content-Type', 'video/mp4');
-        }
-    }
-}));
+app.use(bodyParser.json({ limit: '100mb' }));
+app.use(bodyParser.urlencoded({ extended: true, limit: '100mb' }));
 
 // Настройка загрузки файлов
 const uploadDir = process.env.UPLOAD_DIR || '/tmp/uploads';
@@ -41,7 +33,8 @@ const storage = multer.diskStorage({
     filename: (req, file, cb) => {
         const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
         const extension = path.extname(file.originalname);
-        cb(null, uniqueSuffix + extension);
+        // Сохраняем оригинальное расширение
+        cb(null, 'file_' + uniqueSuffix + extension);
     }
 });
 
@@ -49,7 +42,7 @@ const upload = multer({
     storage: storage,
     limits: {
         fileSize: 100 * 1024 * 1024, // 100MB limit
-        fieldSize: 50 * 1024 * 1024  // 50MB для полей
+        fieldSize: 50 * 1024 * 1024
     },
     fileFilter: (req, file, cb) => {
         // Разрешаем все типы файлов
@@ -67,7 +60,6 @@ const db = new sqlite3.Database(dbPath, (err) => {
     }
 });
 
-// Включаем поддержку внешних ключей
 db.run("PRAGMA foreign_keys = ON");
 
 // Создание таблиц
@@ -94,7 +86,7 @@ db.serialize(() => {
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         sender_email TEXT NOT NULL,
         receiver_email TEXT NOT NULL,
-        message TEXT NOT NULL,
+        message TEXT DEFAULT '',
         attachment_type TEXT DEFAULT '',
         attachment_filename TEXT DEFAULT '',
         attachment_original_name TEXT DEFAULT '',
@@ -103,18 +95,14 @@ db.serialize(() => {
         duration INTEGER DEFAULT 0,
         thumbnail TEXT DEFAULT '',
         timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+        status TEXT DEFAULT 'sent',
         FOREIGN KEY (sender_email) REFERENCES users (email) ON DELETE CASCADE,
         FOREIGN KEY (receiver_email) REFERENCES users (email) ON DELETE CASCADE
     )`);
 
     // Индексы
-    const indexes = [
-        "CREATE INDEX IF NOT EXISTS idx_messages_conversation ON messages(sender_email, receiver_email)",
-        "CREATE INDEX IF NOT EXISTS idx_messages_timestamp ON messages(timestamp)",
-        "CREATE INDEX IF NOT EXISTS idx_messages_attachments ON messages(attachment_type)"
-    ];
-
-    indexes.forEach(sql => db.run(sql));
+    db.run("CREATE INDEX IF NOT EXISTS idx_messages_conversation ON messages(sender_email, receiver_email)");
+    db.run("CREATE INDEX IF NOT EXISTS idx_messages_timestamp ON messages(timestamp)");
 });
 
 // Функция для определения типа файла
@@ -122,19 +110,30 @@ function getFileType(mimetype, filename) {
     if (mimetype.startsWith('image/')) return 'image';
     if (mimetype.startsWith('video/')) return 'video';
     if (mimetype.startsWith('audio/')) return 'audio';
-    if (mimetype.startsWith('application/pdf')) return 'document';
-    if (mimetype.includes('word') || mimetype.includes('excel') || mimetype.includes('powerpoint')) return 'document';
-    if (mimetype.includes('zip') || mimetype.includes('rar')) return 'archive';
+    if (mimetype === 'application/pdf') return 'document';
+    if (mimetype.includes('word') || mimetype.includes('excel') || mimetype.includes('powerpoint') || 
+        mimetype.includes('document') || mimetype.includes('presentation') || mimetype.includes('sheet')) {
+        return 'document';
+    }
+    if (mimetype.includes('zip') || mimetype.includes('rar') || mimetype.includes('tar') || 
+        mimetype.includes('7z') || mimetype.includes('compressed')) {
+        return 'archive';
+    }
     return 'file';
 }
 
-// Эндпоинт для проверки сервера
+// Health check
 app.get('/health', (req, res) => {
-    res.json({ 
-        success: true, 
-        status: 'Server is running',
-        timestamp: new Date().toISOString(),
-        maxFileSize: '100MB'
+    db.get("SELECT 1 as test", [], (err) => {
+        if (err) {
+            return res.status(500).json({ success: false, error: 'Database error' });
+        }
+        res.json({ 
+            success: true, 
+            status: 'Server is running',
+            timestamp: new Date().toISOString(),
+            maxFileSize: '100MB'
+        });
     });
 });
 
@@ -164,7 +163,7 @@ app.post('/upload-file', upload.single('file'), (req, res) => {
     }
 });
 
-// Отправка сообщения с файлом
+// Отправка сообщения
 app.post('/send-message', upload.single('attachment'), (req, res) => {
     try {
         const { senderEmail, receiverEmail, message, duration, thumbnail } = req.body;
@@ -191,8 +190,8 @@ app.post('/send-message', upload.single('attachment'), (req, res) => {
             `INSERT INTO messages 
              (sender_email, receiver_email, message, attachment_type, 
               attachment_filename, attachment_original_name, attachment_mime_type, 
-              attachment_size, duration, thumbnail) 
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, 
+              attachment_size, duration, thumbnail, status) 
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, 
             [
                 senderEmail.toLowerCase(),
                 receiverEmail.toLowerCase(),
@@ -203,16 +202,22 @@ app.post('/send-message', upload.single('attachment'), (req, res) => {
                 attachmentData?.mimeType || '',
                 attachmentData?.size || 0,
                 attachmentData?.duration || 0,
-                attachmentData?.thumbnail || ''
+                attachmentData?.thumbnail || '',
+                'sent'
             ],
             function(err) {
                 if (err) {
                     console.error('❌ Ошибка БД:', err);
+                    // Удаляем файл в случае ошибки
+                    if (req.file && fs.existsSync(req.file.path)) {
+                        fs.unlinkSync(req.file.path);
+                    }
                     return res.status(500).json({ success: false, error: 'Database error' });
                 }
 
                 res.json({
                     success: true,
+                    message: 'Сообщение отправлено',
                     messageId: this.lastID,
                     timestamp: new Date().toISOString(),
                     attachment: attachmentData
@@ -227,22 +232,39 @@ app.post('/send-message', upload.single('attachment'), (req, res) => {
 
 // Получение сообщений
 app.get('/messages/:userEmail/:friendEmail', (req, res) => {
-    const { userEmail, friendEmail } = req.params;
+    const userEmail = req.params.userEmail.toLowerCase();
+    const friendEmail = req.params.friendEmail.toLowerCase();
     
     db.all(
-        `SELECT * FROM messages 
+        `SELECT id, sender_email, receiver_email, message, 
+                attachment_type, attachment_filename, attachment_original_name,
+                attachment_mime_type, attachment_size, duration, thumbnail,
+                datetime(timestamp, 'localtime') as timestamp, status
+         FROM messages 
          WHERE (sender_email = ? AND receiver_email = ?) 
             OR (sender_email = ? AND receiver_email = ?) 
          ORDER BY timestamp ASC`,
         [userEmail, friendEmail, friendEmail, userEmail],
         (err, rows) => {
             if (err) {
+                console.error('❌ Ошибка БД:', err);
                 return res.status(500).json({ success: false, error: 'Database error' });
             }
 
             const messages = rows.map(row => ({
-                ...row,
-                attachment_url: row.attachment_filename ? `/uploads/${row.attachment_filename}` : null
+                id: row.id,
+                senderEmail: row.sender_email,
+                receiverEmail: row.receiver_email,
+                message: row.message,
+                timestamp: row.timestamp,
+                attachmentType: row.attachment_type,
+                attachmentUrl: row.attachment_filename ? `/uploads/${row.attachment_filename}` : '',
+                attachmentName: row.attachment_original_name,
+                attachmentMimeType: row.attachment_mime_type,
+                attachmentSize: row.attachment_size,
+                duration: row.duration,
+                thumbnail: row.thumbnail,
+                status: row.status
             }));
 
             res.json({ success: true, messages });
@@ -261,13 +283,16 @@ app.get('/file-info/:filename', (req, res) => {
 
     const stats = fs.statSync(filePath);
     const mimeType = mime.lookup(filename) || 'application/octet-stream';
+    const fileType = getFileType(mimeType, filename);
 
     res.json({
         success: true,
         file: {
             filename,
-            size: stats.size,
+            originalName: filename,
+            type: fileType,
             mimeType,
+            size: stats.size,
             created: stats.birthtime,
             modified: stats.mtime
         }
@@ -283,26 +308,72 @@ app.get('/download/:filename', (req, res) => {
         return res.status(404).json({ success: false, error: 'File not found' });
     }
 
-    res.download(filePath, req.query.originalname || filename, (err) => {
-        if (err) {
-            console.error('❌ Ошибка скачивания:', err);
-        }
-    });
+    const originalName = req.query.originalname || filename;
+    res.download(filePath, originalName);
 });
 
 // Статические файлы
 app.use('/uploads', express.static(uploadDir, {
     setHeaders: (res, filePath) => {
         const ext = path.extname(filePath).toLowerCase();
-        if (['.mp4', '.mov', '.avi', '.mkv'].includes(ext)) {
-            res.setHeader('Content-Type', 'video/mp4');
+        const mimeType = mime.lookup(ext) || 'application/octet-stream';
+        res.setHeader('Content-Type', mimeType);
+        
+        // Кэширование для медиа файлов
+        if (['.mp4', '.mov', '.avi', '.mkv', '.mp3', '.wav', '.ogg'].includes(ext)) {
+            res.setHeader('Cache-Control', 'public, max-age=31536000'); // 1 год
         }
     }
 }));
 
+// Обновление статуса сообщения
+app.post('/update-message-status', (req, res) => {
+    const { messageId, status } = req.body;
+    
+    if (!messageId || !status) {
+        return res.status(400).json({ success: false, error: 'Message ID and status required' });
+    }
+
+    db.run(
+        "UPDATE messages SET status = ? WHERE id = ?",
+        [status, messageId],
+        function(err) {
+            if (err) {
+                return res.status(500).json({ success: false, error: 'Database error' });
+            }
+            res.json({ success: true, updated: this.changes });
+        }
+    );
+});
+
+// Обработка ошибок
+app.use((error, req, res, next) => {
+    console.error('❌ Необработанная ошибка:', error);
+    res.status(500).json({ 
+        success: false, 
+        error: 'Внутренняя ошибка сервера',
+        details: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
+});
+
 // Запуск сервера
 app.listen(PORT, () => {
-    console.log(`🚀 Сервер запущен на порту ${PORT}`);
+    console.log(`🚀 Сервер Береста запущен на порту ${PORT}`);
+    console.log(`📍 Health check: http://localhost:${PORT}/health`);
     console.log(`📁 Папка загрузок: ${uploadDir}`);
     console.log(`📊 База данных: ${dbPath}`);
+    console.log(`📦 Поддержка файлов: все форматы до 100MB`);
+});
+
+// Graceful shutdown
+process.on('SIGINT', () => {
+    console.log('\n🛑 Остановка сервера...');
+    db.close((err) => {
+        if (err) {
+            console.error('❌ Ошибка закрытия БД:', err.message);
+        } else {
+            console.log('✅ Подключение к БД закрыто');
+        }
+        process.exit(0);
+    });
 });
