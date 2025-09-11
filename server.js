@@ -6,15 +6,9 @@ const path = require('path');
 const fs = require('fs');
 const multer = require('multer');
 const mime = require('mime-types');
-const ffmpeg = require('fluent-ffmpeg');
-const ffmpegPath = require('ffmpeg-static');
-const { createThumbnail } = require('./thumbnailGenerator');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
-
-// Указываем путь к ffmpeg
-ffmpeg.setFfmpegPath(ffmpegPath);
 
 // Middleware
 app.use(cors({
@@ -29,10 +23,9 @@ app.use(bodyParser.urlencoded({ extended: true, limit: '100mb' }));
 const uploadDir = process.env.UPLOAD_DIR || '/tmp/uploads';
 const tempDir = path.join(uploadDir, 'temp');
 const permanentDir = path.join(uploadDir, 'permanent');
-const thumbnailsDir = path.join(uploadDir, 'thumbnails');
 
 // Создаем необходимые директории
-[uploadDir, tempDir, permanentDir, thumbnailsDir].forEach(dir => {
+[uploadDir, tempDir, permanentDir].forEach(dir => {
     if (!fs.existsSync(dir)) {
         fs.mkdirSync(dir, { recursive: true });
         console.log('📁 Создана папка:', dir);
@@ -136,21 +129,6 @@ function getFileType(mimetype, filename) {
     return 'file';
 }
 
-// Функция создания превью для видео
-function createVideoThumbnail(videoPath, outputPath) {
-    return new Promise((resolve, reject) => {
-        ffmpeg(videoPath)
-            .screenshots({
-                count: 1,
-                folder: path.dirname(outputPath),
-                filename: path.basename(outputPath),
-                size: '320x240'
-            })
-            .on('end', () => resolve())
-            .on('error', (err) => reject(err));
-    });
-}
-
 // Функция перемещения файла
 function moveFileToPermanent(filename) {
     const tempPath = path.join(tempDir, filename);
@@ -177,12 +155,6 @@ function checkAndDeleteFile(messageId, filename) {
             if (fs.existsSync(filePath)) {
                 fs.unlinkSync(filePath);
                 console.log(`🗑️  Файл удален: ${filename}`);
-                
-                // Удаляем thumbnail если есть
-                const thumbPath = path.join(thumbnailsDir, filename);
-                if (fs.existsSync(thumbPath)) {
-                    fs.unlinkSync(thumbPath);
-                }
             }
         }
     });
@@ -501,7 +473,6 @@ app.get('/messages/:userEmail/:friendEmail', (req, res) => {
                 timestamp: row.timestamp,
                 attachmentType: row.attachment_type,
                 attachmentUrl: row.attachment_filename ? `/uploads/${row.attachment_filename}` : '',
-                attachmentThumbnail: row.thumbnail ? `/thumbnails/${row.thumbnail}` : '',
                 attachmentName: row.attachment_original_name,
                 attachmentMimeType: row.attachment_mime_type,
                 attachmentSize: row.attachment_size,
@@ -517,8 +488,8 @@ app.get('/messages/:userEmail/:friendEmail', (req, res) => {
     );
 });
 
-// Отправка сообщения с улучшенной обработкой медиа
-app.post('/send-message', upload.single('attachment'), async (req, res) => {
+// Отправка сообщения
+app.post('/send-message', upload.single('attachment'), (req, res) => {
     try {
         const { senderEmail, receiverEmail, message } = req.body;
 
@@ -528,7 +499,6 @@ app.post('/send-message', upload.single('attachment'), async (req, res) => {
         }
 
         let attachmentData = null;
-        let thumbnailFilename = '';
 
         if (req.file) {
             const fileType = getFileType(req.file.mimetype, req.file.originalname);
@@ -538,35 +508,16 @@ app.post('/send-message', upload.single('attachment'), async (req, res) => {
                 type: fileType,
                 mimeType: req.file.mimetype,
                 size: req.file.size,
-                duration: 0,
-                thumbnail: ''
+                duration: 0
             };
-
-            // Создаем превью для видео
-            if (fileType === 'video') {
-                try {
-                    const thumbName = `thumb_${path.parse(req.file.filename).name}.jpg`;
-                    const thumbPath = path.join(thumbnailsDir, thumbName);
-                    
-                    await createVideoThumbnail(req.file.path, thumbPath);
-                    thumbnailFilename = thumbName;
-                    console.log(`✅ Создано превью для видео: ${thumbName}`);
-                } catch (thumbError) {
-                    console.error('❌ Ошибка создания превью:', thumbError);
-                }
-            }
-            // Для изображений используем оригинал как превью
-            else if (fileType === 'image') {
-                thumbnailFilename = req.file.filename;
-            }
         }
 
         db.run(
             `INSERT INTO messages 
              (sender_email, receiver_email, message, attachment_type, 
               attachment_filename, attachment_original_name, attachment_mime_type, 
-              attachment_size, duration, thumbnail, status, downloaded_by_sender) 
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, 
+              attachment_size, duration, status, downloaded_by_sender) 
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, 
             [
                 senderEmail.toLowerCase(),
                 receiverEmail.toLowerCase(),
@@ -577,11 +528,10 @@ app.post('/send-message', upload.single('attachment'), async (req, res) => {
                 attachmentData?.mimeType || '',
                 attachmentData?.size || 0,
                 attachmentData?.duration || 0,
-                thumbnailFilename,
                 'sent',
                 1
             ],
-            async function(err) {
+            function(err) {
                 if (err) {
                     console.error('❌ Ошибка БД:', err);
                     if (req.file) fs.unlinkSync(req.file.path);
@@ -601,10 +551,7 @@ app.post('/send-message', upload.single('attachment'), async (req, res) => {
                         message: 'Сообщение отправлено',
                         messageId: this.lastID,
                         timestamp: new Date().toISOString(),
-                        attachment: {
-                            ...attachmentData,
-                            thumbnail: thumbnailFilename
-                        }
+                        attachment: attachmentData
                     });
                 });
             }
@@ -645,48 +592,138 @@ app.get('/download/:filename', (req, res) => {
     res.download(filePath, originalName);
 });
 
-// Получение превью
-app.get('/thumbnails/:filename', (req, res) => {
-    const filename = req.params.filename;
-    const filePath = path.join(thumbnailsDir, filename);
+// Удаление аккаунта
+app.delete('/delete-account/:userEmail', (req, res) => {
+    try {
+        const userEmail = req.params.userEmail.toLowerCase();
 
-    if (!fs.existsSync(filePath)) {
-        // Если превью нет, пробуем найти оригинальный файл
-        const originalPath = path.join(permanentDir, filename);
-        if (fs.existsSync(originalPath)) {
-            return res.sendFile(originalPath);
-        }
-        return res.status(404).json({ success: false, error: 'Thumbnail not found' });
+        db.serialize(() => {
+            // Удаляем все связанные данные пользователя
+            db.run("DELETE FROM friends WHERE user_email = ? OR friend_email = ?", [userEmail, userEmail]);
+            db.run("DELETE FROM messages WHERE sender_email = ? OR receiver_email = ?", [userEmail, userEmail]);
+            db.run("DELETE FROM users WHERE email = ?", [userEmail], function(err) {
+                if (err) {
+                    return res.status(500).json({ success: false, error: 'Database error' });
+                }
+
+                if (this.changes === 0) {
+                    return res.status(404).json({ success: false, error: 'Пользователь не найден' });
+                }
+
+                res.json({
+                    success: true,
+                    message: 'Аккаунт успешно удален'
+                });
+            });
+        });
+    } catch (error) {
+        console.error('❌ Ошибка удаления аккаунта:', error);
+        res.status(500).json({ success: false, error: 'Internal server error' });
     }
+});
 
-    res.sendFile(filePath);
+// Очистка истории чата
+app.post('/clear-chat', (req, res) => {
+    try {
+        const { userEmail, friendEmail } = req.body;
+
+        if (!userEmail || !friendEmail) {
+            return res.status(400).json({ success: false, error: 'Email обязательны' });
+        }
+
+        db.run(
+            `DELETE FROM messages 
+             WHERE (sender_email = ? AND receiver_email = ?) 
+                OR (sender_email = ? AND receiver_email = ?)`,
+            [userEmail.toLowerCase(), friendEmail.toLowerCase(), friendEmail.toLowerCase(), userEmail.toLowerCase()],
+            function(err) {
+                if (err) {
+                    return res.status(500).json({ success: false, error: 'Database error' });
+                }
+
+                res.json({
+                    success: true,
+                    message: 'История чата очищена',
+                    deletedCount: this.changes
+                });
+            }
+        );
+    } catch (error) {
+        console.error('❌ Ошибка очистки чата:', error);
+        res.status(500).json({ success: false, error: 'Internal server error' });
+    }
+});
+
+// Обновление статуса сообщения
+app.post('/update-message-status', (req, res) => {
+    try {
+        const { messageId, status } = req.body;
+
+        if (!messageId || !status) {
+            return res.status(400).json({ success: false, error: 'ID сообщения и статус обязательны' });
+        }
+
+        db.run(
+            "UPDATE messages SET status = ? WHERE id = ?",
+            [status, messageId],
+            function(err) {
+                if (err) {
+                    return res.status(500).json({ success: false, error: 'Database error' });
+                }
+
+                res.json({
+                    success: true,
+                    message: 'Статус сообщения обновлен',
+                    updatedCount: this.changes
+                });
+            }
+        );
+    } catch (error) {
+        console.error('❌ Ошибка обновления статуса:', error);
+        res.status(500).json({ success: false, error: 'Internal server error' });
+    }
+});
+
+// Получение информации о файле
+app.get('/file-info/:filename', (req, res) => {
+    try {
+        const filename = req.params.filename;
+        const filePath = path.join(permanentDir, filename);
+
+        if (!fs.existsSync(filePath)) {
+            return res.status(404).json({ success: false, error: 'File not found' });
+        }
+
+        const stats = fs.statSync(filePath);
+        const mimeType = mime.lookup(filename) || 'application/octet-stream';
+
+        db.get(
+            "SELECT attachment_original_name, attachment_size, attachment_mime_type FROM messages WHERE attachment_filename = ?",
+            [filename],
+            (err, row) => {
+                if (err) {
+                    return res.status(500).json({ success: false, error: 'Database error' });
+                }
+
+                res.json({
+                    success: true,
+                    filename: filename,
+                    originalName: row?.attachment_original_name || filename,
+                    size: row?.attachment_size || stats.size,
+                    mimeType: row?.attachment_mime_type || mimeType,
+                    created: stats.birthtime,
+                    modified: stats.mtime
+                });
+            }
+        );
+    } catch (error) {
+        console.error('❌ Ошибка получения информации о файле:', error);
+        res.status(500).json({ success: false, error: 'Internal server error' });
+    }
 });
 
 // Статические файлы
 app.use('/uploads', express.static(permanentDir));
-app.use('/thumbnails', express.static(thumbnailsDir));
-
-// Очистка старых временных файлов
-function cleanupTempFiles() {
-    const now = Date.now();
-    const maxAge = 24 * 60 * 60 * 1000;
-    
-    fs.readdir(tempDir, (err, files) => {
-        if (err) return;
-
-        files.forEach(file => {
-            const filePath = path.join(tempDir, file);
-            fs.stat(filePath, (err, stats) => {
-                if (!err && (now - stats.mtimeMs) > maxAge) {
-                    fs.unlinkSync(filePath);
-                }
-            });
-        });
-    });
-}
-
-setInterval(cleanupTempFiles, 6 * 60 * 60 * 1000);
-cleanupTempFiles();
 
 // Запуск сервера
 app.listen(PORT, () => {
