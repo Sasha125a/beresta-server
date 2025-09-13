@@ -6,6 +6,7 @@ const path = require('path');
 const fs = require('fs');
 const multer = require('multer');
 const mime = require('mime-types');
+const { v4: uuidv4 } = require('uuid');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -20,7 +21,7 @@ app.use(bodyParser.json({ limit: '100mb' }));
 app.use(bodyParser.urlencoded({ extended: true, limit: '100mb' }));
 
 // Настройка загрузки файлов
-const uploadDir = process.env.UPLOAD_DIR || '/tmp/uploads';
+const uploadDir = process.env.UPLOAD_DIR || path.join(__dirname, 'uploads');
 const tempDir = path.join(uploadDir, 'temp');
 const permanentDir = path.join(uploadDir, 'permanent');
 
@@ -55,7 +56,7 @@ const upload = multer({
 });
 
 // Инициализация базы данных
-const dbPath = process.env.DB_PATH || '/tmp/beresta.db';
+const dbPath = process.env.DB_PATH || path.join(__dirname, 'beresta.db');
 const db = new sqlite3.Database(dbPath, (err) => {
     if (err) {
         console.error('❌ Ошибка подключения к БД:', err.message);
@@ -68,6 +69,7 @@ db.run("PRAGMA foreign_keys = ON");
 
 // Создание таблиц
 db.serialize(() => {
+    // Таблица пользователей
     db.run(`CREATE TABLE IF NOT EXISTS users (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         email TEXT UNIQUE NOT NULL,
@@ -76,6 +78,7 @@ db.serialize(() => {
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP
     )`);
 
+    // Таблица друзей
     db.run(`CREATE TABLE IF NOT EXISTS friends (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         user_email TEXT NOT NULL,
@@ -86,6 +89,7 @@ db.serialize(() => {
         FOREIGN KEY (friend_email) REFERENCES users (email) ON DELETE CASCADE
     )`);
 
+    // Таблица сообщений
     db.run(`CREATE TABLE IF NOT EXISTS messages (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         sender_email TEXT NOT NULL,
@@ -106,10 +110,52 @@ db.serialize(() => {
         FOREIGN KEY (receiver_email) REFERENCES users (email) ON DELETE CASCADE
     )`);
 
+    // Таблица групп
+    db.run(`CREATE TABLE IF NOT EXISTS groups (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL,
+        description TEXT DEFAULT '',
+        created_by TEXT NOT NULL,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (created_by) REFERENCES users (email) ON DELETE CASCADE
+    )`);
+
+    // Таблица участников групп
+    db.run(`CREATE TABLE IF NOT EXISTS group_members (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        group_id INTEGER NOT NULL,
+        user_email TEXT NOT NULL,
+        role TEXT DEFAULT 'member',
+        joined_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(group_id, user_email),
+        FOREIGN KEY (group_id) REFERENCES groups (id) ON DELETE CASCADE,
+        FOREIGN KEY (user_email) REFERENCES users (email) ON DELETE CASCADE
+    )`);
+
+    // Таблица групповых сообщений
+    db.run(`CREATE TABLE IF NOT EXISTS group_messages (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        group_id INTEGER NOT NULL,
+        sender_email TEXT NOT NULL,
+        message TEXT DEFAULT '',
+        attachment_type TEXT DEFAULT '',
+        attachment_filename TEXT DEFAULT '',
+        attachment_original_name TEXT DEFAULT '',
+        attachment_mime_type TEXT DEFAULT '',
+        attachment_size INTEGER DEFAULT 0,
+        duration INTEGER DEFAULT 0,
+        thumbnail TEXT DEFAULT '',
+        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (group_id) REFERENCES groups (id) ON DELETE CASCADE,
+        FOREIGN KEY (sender_email) REFERENCES users (email) ON DELETE CASCADE
+    )`);
+
     // Индексы
     db.run("CREATE INDEX IF NOT EXISTS idx_messages_conversation ON messages(sender_email, receiver_email)");
     db.run("CREATE INDEX IF NOT EXISTS idx_messages_timestamp ON messages(timestamp)");
     db.run("CREATE INDEX IF NOT EXISTS idx_messages_downloads ON messages(downloaded_by_sender, downloaded_by_receiver)");
+    db.run("CREATE INDEX IF NOT EXISTS idx_group_messages ON group_messages(group_id, timestamp)");
+    db.run("CREATE INDEX IF NOT EXISTS idx_group_members ON group_members(group_id, user_email)");
 });
 
 // Функция для определения типа файла
@@ -234,7 +280,9 @@ app.get('/health', (req, res) => {
         res.json({ 
             success: true, 
             status: 'Server is running',
-            timestamp: new Date().toISOString()
+            timestamp: new Date().toISOString(),
+            upload_dir: uploadDir,
+            db_path: dbPath
         });
     });
 });
@@ -453,189 +501,328 @@ app.get('/messages/:userEmail/:friendEmail', (req, res) => {
         `SELECT id, sender_email, receiver_email, message, 
                 attachment_type, attachment_filename, attachment_original_name,
                 attachment_mime_type, attachment_size, duration, thumbnail,
-                datetime(timestamp, 'localtime') as timestamp, status,
-                downloaded_by_sender, downloaded_by_receiver
+                datetime(timestamp, 'localtime') as timestamp, status
          FROM messages 
          WHERE (sender_email = ? AND receiver_email = ?) 
-            OR (sender_email = ? AND receiver_email = ?) 
+            OR (sender_email = ? AND receiver_email = ?)
          ORDER BY timestamp ASC`,
         [userEmail, friendEmail, friendEmail, userEmail],
         (err, rows) => {
             if (err) {
+                console.error('❌ Ошибка получения сообщений:', err);
                 return res.status(500).json({ success: false, error: 'Database error' });
             }
 
-            const messages = rows.map(row => ({
-                id: row.id,
-                senderEmail: row.sender_email,
-                receiverEmail: row.receiver_email,
-                message: row.message,
-                timestamp: row.timestamp,
-                attachmentType: row.attachment_type,
-                attachmentUrl: row.attachment_filename ? `/uploads/${row.attachment_filename}` : '',
-                attachmentName: row.attachment_original_name,
-                attachmentMimeType: row.attachment_mime_type,
-                attachmentSize: row.attachment_size,
-                duration: row.duration,
-                thumbnail: row.thumbnail,
-                status: row.status,
-                downloadedBySender: !!row.downloaded_by_sender,
-                downloadedByReceiver: !!row.downloaded_by_receiver
-            }));
-
-            res.json({ success: true, messages });
+            res.json({
+                success: true,
+                messages: rows
+            });
         }
     );
 });
 
 // Отправка сообщения
-app.post('/send-message', upload.single('attachment'), (req, res) => {
+app.post('/send-message', (req, res) => {
     try {
-        const { senderEmail, receiverEmail, message } = req.body;
+        const { senderEmail, receiverEmail, message, duration } = req.body;
 
         if (!senderEmail || !receiverEmail) {
-            if (req.file) fs.unlinkSync(req.file.path);
             return res.status(400).json({ success: false, error: 'Email обязательны' });
         }
 
-        let attachmentData = null;
+        db.run(
+            `INSERT INTO messages (sender_email, receiver_email, message, duration) 
+             VALUES (?, ?, ?, ?)`,
+            [senderEmail.toLowerCase(), receiverEmail.toLowerCase(), message || '', duration || 0],
+            function(err) {
+                if (err) {
+                    return res.status(500).json({ success: false, error: 'Database error' });
+                }
 
-        if (req.file) {
-            const fileType = getFileType(req.file.mimetype, req.file.originalname);
-            attachmentData = {
-                filename: req.file.filename,
-                originalName: req.file.originalname,
-                type: fileType,
-                mimeType: req.file.mimetype,
-                size: req.file.size,
-                duration: 0
-            };
+                res.json({
+                    success: true,
+                    messageId: this.lastID
+                });
+
+                // Автоматически добавляем в чаты если это новый диалог
+                addToChatsAutomatically(senderEmail, receiverEmail, () => {});
+            }
+        );
+    } catch (error) {
+        console.error('❌ Ошибка отправки сообщения:', error);
+        res.status(500).json({ success: false, error: 'Internal server error' });
+    }
+});
+
+// Загрузка файла
+app.post('/upload', upload.single('file'), (req, res) => {
+    try {
+        if (!req.file) {
+            return res.status(400).json({ success: false, error: 'Файл не загружен' });
         }
+
+        const { senderEmail, receiverEmail, duration, message } = req.body;
+
+        if (!senderEmail || !receiverEmail) {
+            // Удаляем временный файл если нет email
+            fs.unlinkSync(req.file.path);
+            return res.status(400).json({ success: false, error: 'Email обязательны' });
+        }
+
+        const fileType = getFileType(req.file.mimetype, req.file.originalname);
 
         db.run(
             `INSERT INTO messages 
              (sender_email, receiver_email, message, attachment_type, 
               attachment_filename, attachment_original_name, attachment_mime_type, 
-              attachment_size, duration, status, downloaded_by_sender) 
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, 
+              attachment_size, duration) 
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
             [
                 senderEmail.toLowerCase(),
                 receiverEmail.toLowerCase(),
                 message || '',
-                attachmentData?.type || '',
-                attachmentData?.filename || '',
-                attachmentData?.originalName || '',
-                attachmentData?.mimeType || '',
-                attachmentData?.size || 0,
-                attachmentData?.duration || 0,
-                'sent',
-                1
+                fileType,
+                req.file.filename,
+                req.file.originalname,
+                req.file.mimetype,
+                req.file.size,
+                duration || 0
             ],
             function(err) {
                 if (err) {
-                    console.error('❌ Ошибка БД:', err);
-                    if (req.file) fs.unlinkSync(req.file.path);
+                    fs.unlinkSync(req.file.path);
                     return res.status(500).json({ success: false, error: 'Database error' });
                 }
 
                 // Перемещаем файл в постоянную папку
-                if (attachmentData && attachmentData.filename) {
-                    if (moveFileToPermanent(attachmentData.filename)) {
-                        console.log(`📦 Файл перемещен: ${attachmentData.filename}`);
-                    }
-                }
-
-                addToChatsAutomatically(senderEmail, receiverEmail, () => {
+                if (moveFileToPermanent(req.file.filename)) {
                     res.json({
                         success: true,
-                        message: 'Сообщение отправлено',
                         messageId: this.lastID,
-                        timestamp: new Date().toISOString(),
-                        attachment: attachmentData
+                        filename: req.file.filename
                     });
-                });
+
+                    // Автоматически добавляем в чаты если это новый диалог
+                    addToChatsAutomatically(senderEmail, receiverEmail, () => {});
+                } else {
+                    fs.unlinkSync(req.file.path);
+                    res.status(500).json({ success: false, error: 'Ошибка сохранения файла' });
+                }
             }
         );
     } catch (error) {
-        console.error('❌ Ошибка отправки сообщения:', error);
-        if (req.file) fs.unlinkSync(req.file.path);
+        console.error('❌ Ошибка загрузки файла:', error);
+        if (req.file && fs.existsSync(req.file.path)) {
+            fs.unlinkSync(req.file.path);
+        }
         res.status(500).json({ success: false, error: 'Internal server error' });
     }
 });
 
 // Скачивание файла
 app.get('/download/:filename', (req, res) => {
-    const filename = req.params.filename;
-    const messageId = req.query.messageId;
-    const userEmail = req.query.userEmail;
-    const filePath = path.join(permanentDir, filename);
-
-    if (!fs.existsSync(filePath)) {
-        return res.status(404).json({ success: false, error: 'File not found' });
-    }
-
-    if (messageId && userEmail) {
-        db.get(`SELECT sender_email, receiver_email FROM messages WHERE id = ? AND attachment_filename = ?`, 
-        [messageId, filename], (err, row) => {
-            if (!err && row) {
-                const isSender = row.sender_email.toLowerCase() === userEmail.toLowerCase();
-                const isReceiver = row.receiver_email.toLowerCase() === userEmail.toLowerCase();
-                
-                if (isSender || isReceiver) {
-                    updateDownloadStatus(messageId, userEmail, isSender);
-                }
-            }
-        });
-    }
-
-    const originalName = req.query.originalname || filename;
-    res.download(filePath, originalName);
-});
-
-// Удаление аккаунта
-app.delete('/delete-account/:userEmail', (req, res) => {
     try {
-        const userEmail = req.params.userEmail.toLowerCase();
+        const filename = req.params.filename;
+        const messageId = req.query.messageId;
+        const userEmail = req.query.userEmail;
+        const isSender = req.query.isSender === 'true';
 
-        db.serialize(() => {
-            // Удаляем все связанные данные пользователя
-            db.run("DELETE FROM friends WHERE user_email = ? OR friend_email = ?", [userEmail, userEmail]);
-            db.run("DELETE FROM messages WHERE sender_email = ? OR receiver_email = ?", [userEmail, userEmail]);
-            db.run("DELETE FROM users WHERE email = ?", [userEmail], function(err) {
-                if (err) {
-                    return res.status(500).json({ success: false, error: 'Database error' });
-                }
+        const filePath = path.join(permanentDir, filename);
 
-                if (this.changes === 0) {
-                    return res.status(404).json({ success: false, error: 'Пользователь не найден' });
-                }
+        if (!fs.existsSync(filePath)) {
+            return res.status(404).json({ success: false, error: 'Файл не найден' });
+        }
 
-                res.json({
-                    success: true,
-                    message: 'Аккаунт успешно удален'
-                });
-            });
+        // Обновляем статус скачивания
+        if (messageId && userEmail) {
+            updateDownloadStatus(messageId, userEmail, isSender);
+        }
+
+        const mimeType = mime.lookup(filename) || 'application/octet-stream';
+        const originalName = req.query.originalName || filename;
+
+        res.setHeader('Content-Type', mimeType);
+        res.setHeader('Content-Disposition', `attachment; filename="${encodeURIComponent(originalName)}"`);
+        
+        const fileStream = fs.createReadStream(filePath);
+        fileStream.pipe(res);
+
+        fileStream.on('error', (err) => {
+            console.error('❌ Ошибка отправки файла:', err);
+            res.status(500).json({ success: false, error: 'Ошибка отправки файла' });
         });
+
     } catch (error) {
-        console.error('❌ Ошибка удаления аккаунта:', error);
+        console.error('❌ Ошибка скачивания файла:', error);
         res.status(500).json({ success: false, error: 'Internal server error' });
     }
 });
 
-// Очистка истории чата
-app.post('/clear-chat', (req, res) => {
+// Получение информации о файле
+app.get('/file-info/:messageId', (req, res) => {
     try {
-        const { userEmail, friendEmail } = req.body;
+        const messageId = req.params.messageId;
 
-        if (!userEmail || !friendEmail) {
-            return res.status(400).json({ success: false, error: 'Email обязательны' });
+        db.get(
+            `SELECT attachment_filename, attachment_original_name, 
+                    attachment_mime_type, attachment_size, attachment_type
+             FROM messages WHERE id = ?`,
+            [messageId],
+            (err, row) => {
+                if (err) {
+                    return res.status(500).json({ success: false, error: 'Database error' });
+                }
+
+                if (!row || !row.attachment_filename) {
+                    return res.status(404).json({ success: false, error: 'Файл не найден' });
+                }
+
+                const filePath = path.join(permanentDir, row.attachment_filename);
+                const exists = fs.existsSync(filePath);
+
+                res.json({
+                    success: true,
+                    exists: exists,
+                    filename: row.attachment_filename,
+                    originalName: row.attachment_original_name,
+                    mimeType: row.attachment_mime_type,
+                    size: row.attachment_size,
+                    type: row.attachment_type
+                });
+            }
+        );
+    } catch (error) {
+        console.error('❌ Ошибка получения информации о файле:', error);
+        res.status(500).json({ success: false, error: 'Internal server error' });
+    }
+});
+
+// Создание группы
+app.post('/create-group', (req, res) => {
+    try {
+        const { name, description, createdBy, members } = req.body;
+
+        if (!name || !createdBy) {
+            return res.status(400).json({ success: false, error: 'Название и создатель обязательны' });
         }
 
         db.run(
-            `DELETE FROM messages 
-             WHERE (sender_email = ? AND receiver_email = ?) 
-                OR (sender_email = ? AND receiver_email = ?)`,
-            [userEmail.toLowerCase(), friendEmail.toLowerCase(), friendEmail.toLowerCase(), userEmail.toLowerCase()],
+            "INSERT INTO groups (name, description, created_by) VALUES (?, ?, ?)",
+            [name, description || '', createdBy.toLowerCase()],
+            function(err) {
+                if (err) {
+                    return res.status(500).json({ success: false, error: 'Database error' });
+                }
+
+                const groupId = this.lastID;
+
+                // Добавляем создателя в группу
+                db.run(
+                    "INSERT INTO group_members (group_id, user_email, role) VALUES (?, ?, 'admin')",
+                    [groupId, createdBy.toLowerCase()],
+                    function(err) {
+                        if (err) {
+                            return res.status(500).json({ success: false, error: 'Database error' });
+                        }
+
+                        // Добавляем остальных участников если есть
+                        if (members && members.length > 0) {
+                            const stmt = db.prepare(
+                                "INSERT INTO group_members (group_id, user_email) VALUES (?, ?)"
+                            );
+
+                            members.forEach(member => {
+                                if (member !== createdBy) {
+                                    stmt.run([groupId, member.toLowerCase()]);
+                                }
+                            });
+
+                            stmt.finalize();
+                        }
+
+                        res.json({
+                            success: true,
+                            groupId: groupId,
+                            message: 'Группа создана'
+                        });
+                    }
+                );
+            }
+        );
+    } catch (error) {
+        console.error('❌ Ошибка создания группы:', error);
+        res.status(500).json({ success: false, error: 'Internal server error' });
+    }
+});
+
+// Получение списка групп пользователя
+app.get('/groups/:userEmail', (req, res) => {
+    try {
+        const userEmail = req.params.userEmail.toLowerCase();
+
+        db.all(`
+            SELECT g.id, g.name, g.description, g.created_by, g.created_at,
+                   gm.role, gm.joined_at
+            FROM groups g
+            JOIN group_members gm ON g.id = gm.group_id
+            WHERE gm.user_email = ?
+            ORDER BY g.name
+        `, [userEmail], (err, rows) => {
+            if (err) {
+                return res.status(500).json({ success: false, error: 'Database error' });
+            }
+
+            res.json({
+                success: true,
+                groups: rows
+            });
+        });
+    } catch (error) {
+        console.error('❌ Ошибка получения групп:', error);
+        res.status(500).json({ success: false, error: 'Internal server error' });
+    }
+});
+
+// Получение участников группы
+app.get('/group-members/:groupId', (req, res) => {
+    try {
+        const groupId = req.params.groupId;
+
+        db.all(`
+            SELECT u.email, u.first_name, u.last_name, gm.role, gm.joined_at
+            FROM group_members gm
+            JOIN users u ON gm.user_email = u.email
+            WHERE gm.group_id = ?
+            ORDER BY gm.role DESC, u.first_name, u.last_name
+        `, [groupId], (err, rows) => {
+            if (err) {
+                return res.status(500).json({ success: false, error: 'Database error' });
+            }
+
+            res.json({
+                success: true,
+                members: rows
+            });
+        });
+    } catch (error) {
+        console.error('❌ Ошибка получения участников группы:', error);
+        res.status(500).json({ success: false, error: 'Internal server error' });
+    }
+});
+
+// Отправка сообщения в группу
+app.post('/send-group-message', (req, res) => {
+    try {
+        const { groupId, senderEmail, message, duration } = req.body;
+
+        if (!groupId || !senderEmail) {
+            return res.status(400).json({ success: false, error: 'Группа и отправитель обязательны' });
+        }
+
+        db.run(
+            `INSERT INTO group_messages (group_id, sender_email, message, duration) 
+             VALUES (?, ?, ?, ?)`,
+            [groupId, senderEmail.toLowerCase(), message || '', duration || 0],
             function(err) {
                 if (err) {
                     return res.status(500).json({ success: false, error: 'Database error' });
@@ -643,13 +830,182 @@ app.post('/clear-chat', (req, res) => {
 
                 res.json({
                     success: true,
-                    message: 'История чата очищена',
-                    deletedCount: this.changes
+                    messageId: this.lastID
                 });
             }
         );
     } catch (error) {
-        console.error('❌ Ошибка очистки чата:', error);
+        console.error('❌ Ошибка отправки группового сообщения:', error);
+        res.status(500).json({ success: false, error: 'Internal server error' });
+    }
+});
+
+// Загрузка файла в группу
+app.post('/upload-group', upload.single('file'), (req, res) => {
+    try {
+        if (!req.file) {
+            return res.status(400).json({ success: false, error: 'Файл не загружен' });
+        }
+
+        const { groupId, senderEmail, duration, message } = req.body;
+
+        if (!groupId || !senderEmail) {
+            fs.unlinkSync(req.file.path);
+            return res.status(400).json({ success: false, error: 'Группа и отправитель обязательны' });
+        }
+
+        const fileType = getFileType(req.file.mimetype, req.file.originalname);
+
+        db.run(
+            `INSERT INTO group_messages 
+             (group_id, sender_email, message, attachment_type, 
+              attachment_filename, attachment_original_name, attachment_mime_type, 
+              attachment_size, duration) 
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            [
+                groupId,
+                senderEmail.toLowerCase(),
+                message || '',
+                fileType,
+                req.file.filename,
+                req.file.originalname,
+                req.file.mimetype,
+                req.file.size,
+                duration || 0
+            ],
+            function(err) {
+                if (err) {
+                    fs.unlinkSync(req.file.path);
+                    return res.status(500).json({ success: false, error: 'Database error' });
+                }
+
+                if (moveFileToPermanent(req.file.filename)) {
+                    res.json({
+                        success: true,
+                        messageId: this.lastID,
+                        filename: req.file.filename
+                    });
+                } else {
+                    fs.unlinkSync(req.file.path);
+                    res.status(500).json({ success: false, error: 'Ошибка сохранения файла' });
+                }
+            }
+        );
+    } catch (error) {
+        console.error('❌ Ошибка загрузки файла в группу:', error);
+        if (req.file && fs.existsSync(req.file.path)) {
+            fs.unlinkSync(req.file.path);
+        }
+        res.status(500).json({ success: false, error: 'Internal server error' });
+    }
+});
+
+// Получение сообщений группы
+app.get('/group-messages/:groupId', (req, res) => {
+    try {
+        const groupId = req.params.groupId;
+
+        db.all(`
+            SELECT gm.id, gm.sender_email, gm.message, 
+                   gm.attachment_type, gm.attachment_filename, gm.attachment_original_name,
+                   gm.attachment_mime_type, gm.attachment_size, gm.duration, gm.thumbnail,
+                   datetime(gm.timestamp, 'localtime') as timestamp,
+                   u.first_name, u.last_name
+            FROM group_messages gm
+            JOIN users u ON gm.sender_email = u.email
+            WHERE gm.group_id = ?
+            ORDER BY gm.timestamp ASC
+        `, [groupId], (err, rows) => {
+            if (err) {
+                return res.status(500).json({ success: false, error: 'Database error' });
+            }
+
+            res.json({
+                success: true,
+                messages: rows
+            });
+        });
+    } catch (error) {
+        console.error('❌ Ошибка получения групповых сообщений:', error);
+        res.status(500).json({ success: false, error: 'Internal server error' });
+    }
+});
+
+// Добавление участника в группу
+app.post('/add-group-member', (req, res) => {
+    try {
+        const { groupId, userEmail } = req.body;
+
+        if (!groupId || !userEmail) {
+            return res.status(400).json({ success: false, error: 'Группа и пользователь обязательны' });
+        }
+
+        db.run(
+            "INSERT OR IGNORE INTO group_members (group_id, user_email) VALUES (?, ?)",
+            [groupId, userEmail.toLowerCase()],
+            function(err) {
+                if (err) {
+                    return res.status(500).json({ success: false, error: 'Database error' });
+                }
+
+                res.json({
+                    success: true,
+                    message: 'Участник добавлен'
+                });
+            }
+        );
+    } catch (error) {
+        console.error('❌ Ошибка добавления участника:', error);
+        res.status(500).json({ success: false, error: 'Internal server error' });
+    }
+});
+
+// Удаление участника из группы
+app.post('/remove-group-member', (req, res) => {
+    try {
+        const { groupId, userEmail } = req.body;
+
+        if (!groupId || !userEmail) {
+            return res.status(400).json({ success: false, error: 'Группа и пользователь обязательны' });
+        }
+
+        db.run(
+            "DELETE FROM group_members WHERE group_id = ? AND user_email = ?",
+            [groupId, userEmail.toLowerCase()],
+            function(err) {
+                if (err) {
+                    return res.status(500).json({ success: false, error: 'Database error' });
+                }
+
+                res.json({
+                    success: true,
+                    message: 'Участник удален'
+                });
+            }
+        );
+    } catch (error) {
+        console.error('❌ Ошибка удаления участника:', error);
+        res.status(500).json({ success: false, error: 'Internal server error' });
+    }
+});
+
+// Удаление группы
+app.delete('/group/:groupId', (req, res) => {
+    try {
+        const groupId = req.params.groupId;
+
+        db.run("DELETE FROM groups WHERE id = ?", [groupId], function(err) {
+            if (err) {
+                return res.status(500).json({ success: false, error: 'Database error' });
+            }
+
+            res.json({
+                success: true,
+                message: 'Группа удалена'
+            });
+        });
+    } catch (error) {
+        console.error('❌ Ошибка удаления группы:', error);
         res.status(500).json({ success: false, error: 'Internal server error' });
     }
 });
@@ -673,8 +1029,7 @@ app.post('/update-message-status', (req, res) => {
 
                 res.json({
                     success: true,
-                    message: 'Статус сообщения обновлен',
-                    updatedCount: this.changes
+                    message: 'Статус обновлен'
                 });
             }
         );
@@ -684,51 +1039,94 @@ app.post('/update-message-status', (req, res) => {
     }
 });
 
-// Получение информации о файле
-app.get('/file-info/:filename', (req, res) => {
+// Получение непрочитанных сообщений
+app.get('/unread-messages/:userEmail', (req, res) => {
     try {
-        const filename = req.params.filename;
-        const filePath = path.join(permanentDir, filename);
+        const userEmail = req.params.userEmail.toLowerCase();
 
-        if (!fs.existsSync(filePath)) {
-            return res.status(404).json({ success: false, error: 'File not found' });
-        }
-
-        const stats = fs.statSync(filePath);
-        const mimeType = mime.lookup(filename) || 'application/octet-stream';
-
-        db.get(
-            "SELECT attachment_original_name, attachment_size, attachment_mime_type FROM messages WHERE attachment_filename = ?",
-            [filename],
-            (err, row) => {
-                if (err) {
-                    return res.status(500).json({ success: false, error: 'Database error' });
-                }
-
-                res.json({
-                    success: true,
-                    filename: filename,
-                    originalName: row?.attachment_original_name || filename,
-                    size: row?.attachment_size || stats.size,
-                    mimeType: row?.attachment_mime_type || mimeType,
-                    created: stats.birthtime,
-                    modified: stats.mtime
-                });
+        db.all(`
+            SELECT m.id, m.sender_email, m.receiver_email, m.message, 
+                   m.attachment_type, m.attachment_filename, m.attachment_original_name,
+                   datetime(m.timestamp, 'localtime') as timestamp,
+                   u.first_name, u.last_name
+            FROM messages m
+            JOIN users u ON m.sender_email = u.email
+            WHERE m.receiver_email = ? AND m.status = 'sent'
+            ORDER BY m.timestamp ASC
+        `, [userEmail], (err, rows) => {
+            if (err) {
+                return res.status(500).json({ success: false, error: 'Database error' });
             }
-        );
+
+            res.json({
+                success: true,
+                unreadMessages: rows
+            });
+        });
     } catch (error) {
-        console.error('❌ Ошибка получения информации о файле:', error);
+        console.error('❌ Ошибка получения непрочитанных сообщений:', error);
         res.status(500).json({ success: false, error: 'Internal server error' });
     }
 });
 
-// Статические файлы
-app.use('/uploads', express.static(permanentDir));
+// Очистка временных файлов (запускается периодически)
+function cleanupTempFiles() {
+    const now = Date.now();
+    const oneHour = 60 * 60 * 1000;
+
+    fs.readdir(tempDir, (err, files) => {
+        if (err) {
+            console.error('❌ Ошибка чтения временной папки:', err);
+            return;
+        }
+
+        files.forEach(file => {
+            const filePath = path.join(tempDir, file);
+            fs.stat(filePath, (err, stats) => {
+                if (!err && stats && (now - stats.mtimeMs) > oneHour) {
+                    fs.unlink(filePath, (err) => {
+                        if (!err) {
+                            console.log(`🗑️  Удален временный файл: ${file}`);
+                        }
+                    });
+                }
+            });
+        });
+    });
+}
+
+// Запускаем очистку каждые 30 минут
+setInterval(cleanupTempFiles, 30 * 60 * 1000);
+
+// Обработка ошибок
+app.use((err, req, res, next) => {
+    console.error('❌ Необработанная ошибка:', err);
+    res.status(500).json({ success: false, error: 'Internal server error' });
+});
+
+// 404 обработчик
+app.use((req, res) => {
+    res.status(404).json({ success: false, error: 'Endpoint not found' });
+});
 
 // Запуск сервера
 app.listen(PORT, () => {
-    console.log(`🚀 Сервер Береста запущен на порту ${PORT}`);
-    console.log(`📍 Health check: http://localhost:${PORT}/health`);
+    console.log(`🚀 Сервер запущен на порту ${PORT}`);
     console.log(`📁 Папка загрузок: ${uploadDir}`);
-    console.log(`📊 База данных: ${dbPath}`);
+    console.log(`💾 База данных: ${dbPath}`);
 });
+
+// Graceful shutdown
+process.on('SIGINT', () => {
+    console.log('\n🛑 Остановка сервера...');
+    db.close((err) => {
+        if (err) {
+            console.error('❌ Ошибка закрытия БД:', err.message);
+        } else {
+            console.log('✅ Подключение к БД закрыто');
+        }
+        process.exit(0);
+    });
+});
+
+module.exports = app;
