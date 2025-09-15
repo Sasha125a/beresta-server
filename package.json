@@ -29,7 +29,7 @@
     "ws": "^8.13.0",
     "compression": "^1.7.4",
     "helmet": "^7.0.0",
-    "rate-limit": "^1.0.0"
+    "express-rate-limit": "^6.8.1"
   },
   "devDependencies": {
     "nodemon": "^3.0.1",
@@ -41,4 +41,5 @@
     "npm": ">=7.0.0"
   }
 }
+
 
