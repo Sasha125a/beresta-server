@@ -7,6 +7,13 @@ const fs = require('fs');
 const multer = require('multer');
 const mime = require('mime-types');
 const { v4: uuidv4 } = require('uuid');
+const ffmpeg = require('fluent-ffmpeg');
+const ffmpegPath = require('ffmpeg-static');
+const ffprobePath = require('ffprobe-static').path;
+
+// Устанавливаем пути к ffmpeg
+ffmpeg.setFfmpegPath(ffmpegPath);
+ffmpeg.setFfprobePath(ffprobePath);
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -24,9 +31,10 @@ app.use(bodyParser.urlencoded({ extended: true, limit: '100mb' }));
 const uploadDir = process.env.UPLOAD_DIR || path.join(__dirname, 'uploads');
 const tempDir = path.join(uploadDir, 'temp');
 const permanentDir = path.join(uploadDir, 'permanent');
+const thumbnailsDir = path.join(uploadDir, 'thumbnails');
 
 // Создаем необходимые директории
-[uploadDir, tempDir, permanentDir].forEach(dir => {
+[uploadDir, tempDir, permanentDir, thumbnailsDir].forEach(dir => {
     if (!fs.existsSync(dir)) {
         fs.mkdirSync(dir, { recursive: true });
         console.log('📁 Создана папка:', dir);
@@ -67,7 +75,7 @@ const db = new sqlite3.Database(dbPath, (err) => {
 
 db.run("PRAGMA foreign_keys = ON");
 
-// Создание таблиц
+// Создание таблиц (добавляем поле для миниатюр)
 db.serialize(() => {
     // Таблица пользователей
     db.run(`CREATE TABLE IF NOT EXISTS users (
@@ -172,7 +180,47 @@ function getFileType(mimetype, filename) {
         mimetype.includes('7z') || mimetype.includes('compressed')) {
         return 'archive';
     }
+    
+    // Дополнительная проверка по расширению
+    const ext = path.extname(filename).toLowerCase();
+    if (['.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp'].includes(ext)) return 'image';
+    if (['.mp4', '.avi', '.mov', '.mkv', '.webm', '.3gp'].includes(ext)) return 'video';
+    if (['.mp3', '.wav', '.aac', '.flac', '.ogg', '.m4a'].includes(ext)) return 'audio';
+    if (['.pdf', '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx', '.txt'].includes(ext)) return 'document';
+    if (['.zip', '.rar', '.7z', '.tar'].includes(ext)) return 'archive';
+    
     return 'file';
+}
+
+// Функция создания миниатюры для видео
+function createVideoThumbnail(videoPath, outputPath, callback) {
+    ffmpeg(videoPath)
+        .screenshots({
+            timestamps: ['00:00:01'],
+            filename: path.basename(outputPath),
+            folder: path.dirname(outputPath),
+            size: '320x240'
+        })
+        .on('end', () => {
+            console.log('✅ Миниатюра создана:', outputPath);
+            callback(null, outputPath);
+        })
+        .on('error', (err) => {
+            console.error('❌ Ошибка создания миниатюры:', err);
+            callback(err);
+        });
+}
+
+// Функция получения длительности видео
+function getVideoDuration(videoPath, callback) {
+    ffmpeg.ffprobe(videoPath, (err, metadata) => {
+        if (err) {
+            console.error('❌ Ошибка получения длительности видео:', err);
+            return callback(err);
+        }
+        const duration = Math.round(metadata.format.duration || 0);
+        callback(null, duration);
+    });
 }
 
 // Функция перемещения файла
@@ -554,7 +602,41 @@ app.post('/send-message', (req, res) => {
     }
 });
 
-// Загрузка файла
+// Загрузка файла (новый эндпоинт для Android приложения)
+app.post('/upload-file', upload.single('file'), (req, res) => {
+    try {
+        if (!req.file) {
+            return res.status(400).json({ success: false, error: 'Файл не загружен' });
+        }
+
+        const fileType = getFileType(req.file.mimetype, req.file.originalname);
+        const fileUrl = `/uploads/permanent/${req.file.filename}`;
+
+        // Перемещаем файл в постоянную папку
+        if (moveFileToPermanent(req.file.filename)) {
+            res.json({
+                success: true,
+                filename: req.file.filename,
+                originalName: req.file.originalname,
+                fileUrl: fileUrl,
+                fileType: fileType,
+                size: req.file.size,
+                mimeType: req.file.mimetype
+            });
+        } else {
+            fs.unlinkSync(req.file.path);
+            res.status(500).json({ success: false, error: 'Ошибка сохранения файла' });
+        }
+    } catch (error) {
+        console.error('❌ Ошибка загрузки файла:', error);
+        if (req.file && fs.existsSync(req.file.path)) {
+            fs.unlinkSync(req.file.path);
+        }
+        res.status(500).json({ success: false, error: 'Internal server error' });
+    }
+});
+
+// Загрузка файла с сообщением
 app.post('/upload', upload.single('file'), (req, res) => {
     try {
         if (!req.file) {
@@ -570,46 +652,80 @@ app.post('/upload', upload.single('file'), (req, res) => {
         }
 
         const fileType = getFileType(req.file.mimetype, req.file.originalname);
+        let thumbnailFilename = '';
+        let videoDuration = duration || 0;
 
-        db.run(
-            `INSERT INTO messages 
-             (sender_email, receiver_email, message, attachment_type, 
-              attachment_filename, attachment_original_name, attachment_mime_type, 
-              attachment_size, duration) 
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-            [
-                senderEmail.toLowerCase(),
-                receiverEmail.toLowerCase(),
-                message || '',
-                fileType,
-                req.file.filename,
-                req.file.originalname,
-                req.file.mimetype,
-                req.file.size,
-                duration || 0
-            ],
-            function(err) {
-                if (err) {
-                    fs.unlinkSync(req.file.path);
-                    return res.status(500).json({ success: false, error: 'Database error' });
+        // Обработка видео: создание миниатюры и получение длительности
+        if (fileType === 'video') {
+            const tempVideoPath = req.file.path;
+            const thumbnailName = `thumb_${path.parse(req.file.filename).name}.jpg`;
+            const thumbnailPath = path.join(thumbnailsDir, thumbnailName);
+
+            getVideoDuration(tempVideoPath, (err, duration) => {
+                if (!err && duration > 0) {
+                    videoDuration = duration;
                 }
 
-                // Перемещаем файл в постоянную папку
-                if (moveFileToPermanent(req.file.filename)) {
-                    res.json({
-                        success: true,
-                        messageId: this.lastID,
-                        filename: req.file.filename
-                    });
+                createVideoThumbnail(tempVideoPath, thumbnailPath, (err) => {
+                    if (!err) {
+                        thumbnailFilename = thumbnailName;
+                    }
+                    completeFileUpload();
+                });
+            });
+        } else {
+            completeFileUpload();
+        }
 
-                    // Автоматически добавляем в чаты если это новый диалог
-                    addToChatsAutomatically(senderEmail, receiverEmail, () => {});
-                } else {
-                    fs.unlinkSync(req.file.path);
-                    res.status(500).json({ success: false, error: 'Ошибка сохранения файла' });
+        function completeFileUpload() {
+            db.run(
+                `INSERT INTO messages 
+                 (sender_email, receiver_email, message, attachment_type, 
+                  attachment_filename, attachment_original_name, attachment_mime_type, 
+                  attachment_size, duration, thumbnail) 
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                [
+                    senderEmail.toLowerCase(),
+                    receiverEmail.toLowerCase(),
+                    message || '',
+                    fileType,
+                    req.file.filename,
+                    req.file.originalname,
+                    req.file.mimetype,
+                    req.file.size,
+                    videoDuration,
+                    thumbnailFilename
+                ],
+                function(err) {
+                    if (err) {
+                        fs.unlinkSync(req.file.path);
+                        if (thumbnailFilename) {
+                            fs.unlinkSync(path.join(thumbnailsDir, thumbnailFilename));
+                        }
+                        return res.status(500).json({ success: false, error: 'Database error' });
+                    }
+
+                    // Перемещаем файл в постоянную папку
+                    if (moveFileToPermanent(req.file.filename)) {
+                        res.json({
+                            success: true,
+                            messageId: this.lastID,
+                            filename: req.file.filename,
+                            thumbnail: thumbnailFilename
+                        });
+
+                        // Автоматически добавляем в чаты если это новый диалог
+                        addToChatsAutomatically(senderEmail, receiverEmail, () => {});
+                    } else {
+                        fs.unlinkSync(req.file.path);
+                        if (thumbnailFilename) {
+                            fs.unlinkSync(path.join(thumbnailsDir, thumbnailFilename));
+                        }
+                        res.status(500).json({ success: false, error: 'Ошибка сохранения файла' });
+                    }
                 }
-            }
-        );
+            );
+        }
     } catch (error) {
         console.error('❌ Ошибка загрузки файла:', error);
         if (req.file && fs.existsSync(req.file.path)) {
@@ -658,7 +774,7 @@ app.get('/download/:filename', (req, res) => {
     }
 });
 
-// Получение информации о файле
+// Получение информации о файле по ID сообщения
 app.get('/file-info/:messageId', (req, res) => {
     try {
         const messageId = req.params.messageId;
@@ -684,6 +800,45 @@ app.get('/file-info/:messageId', (req, res) => {
                     success: true,
                     exists: exists,
                     filename: row.attachment_filename,
+                    originalName: row.attachment_original_name,
+                    mimeType: row.attachment_mime_type,
+                    size: row.attachment_size,
+                    type: row.attachment_type
+                });
+            }
+        );
+    } catch (error) {
+        console.error('❌ Ошибка получения информации о файле:', error);
+        res.status(500).json({ success: false, error: 'Internal server error' });
+    }
+});
+
+// Получение информации о файле по имени файла (новый эндпоинт)
+app.get('/file-info-by-name/:filename', (req, res) => {
+    try {
+        const filename = req.params.filename;
+
+        db.get(
+            `SELECT attachment_original_name, attachment_mime_type, 
+                    attachment_size, attachment_type
+             FROM messages WHERE attachment_filename = ?`,
+            [filename],
+            (err, row) => {
+                if (err) {
+                    return res.status(500).json({ success: false, error: 'Database error' });
+                }
+
+                if (!row) {
+                    return res.status(404).json({ success: false, error: 'Файл не найден' });
+                }
+
+                const filePath = path.join(permanentDir, filename);
+                const exists = fs.existsSync(filePath);
+
+                res.json({
+                    success: true,
+                    exists: exists,
+                    filename: filename,
                     originalName: row.attachment_original_name,
                     mimeType: row.attachment_mime_type,
                     size: row.attachment_size,
@@ -762,10 +917,12 @@ app.get('/groups/:userEmail', (req, res) => {
 
         db.all(`
             SELECT g.id, g.name, g.description, g.created_by, g.created_at,
-                   gm.role, gm.joined_at
+                   gm.role, COUNT(gm2.user_email) as member_count
             FROM groups g
             JOIN group_members gm ON g.id = gm.group_id
+            LEFT JOIN group_members gm2 ON g.id = gm2.group_id
             WHERE gm.user_email = ?
+            GROUP BY g.id, g.name, g.description, g.created_by, g.created_at, gm.role
             ORDER BY g.name
         `, [userEmail], (err, rows) => {
             if (err) {
@@ -855,42 +1012,76 @@ app.post('/upload-group', upload.single('file'), (req, res) => {
         }
 
         const fileType = getFileType(req.file.mimetype, req.file.originalname);
+        let thumbnailFilename = '';
+        let videoDuration = duration || 0;
 
-        db.run(
-            `INSERT INTO group_messages 
-             (group_id, sender_email, message, attachment_type, 
-              attachment_filename, attachment_original_name, attachment_mime_type, 
-              attachment_size, duration) 
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-            [
-                groupId,
-                senderEmail.toLowerCase(),
-                message || '',
-                fileType,
-                req.file.filename,
-                req.file.originalname,
-                req.file.mimetype,
-                req.file.size,
-                duration || 0
-            ],
-            function(err) {
-                if (err) {
-                    fs.unlinkSync(req.file.path);
-                    return res.status(500).json({ success: false, error: 'Database error' });
+        // Обработка видео для групповых сообщений
+        if (fileType === 'video') {
+            const tempVideoPath = req.file.path;
+            const thumbnailName = `thumb_${path.parse(req.file.filename).name}.jpg`;
+            const thumbnailPath = path.join(thumbnailsDir, thumbnailName);
+
+            getVideoDuration(tempVideoPath, (err, duration) => {
+                if (!err && duration > 0) {
+                    videoDuration = duration;
                 }
 
-                if (moveFileToPermanent(req.file.filename)) {
-                    res.json({
-                        success: true,
-                        messageId: this.lastID,
-                        filename: req.file.filename
-                    });
-                } else {
-                    fs.unlinkSync(req.file.path);
-                    res.status(500).json({ success: false, error: 'Ошибка сохранения файла' });
+                createVideoThumbnail(tempVideoPath, thumbnailPath, (err) => {
+                    if (!err) {
+                        thumbnailFilename = thumbnailName;
+                    }
+                    completeGroupFileUpload();
+                });
+            });
+        } else {
+            completeGroupFileUpload();
+        }
+
+        function completeGroupFileUpload() {
+            db.run(
+                `INSERT INTO group_messages 
+                 (group_id, sender_email, message, attachment_type, 
+                  attachment_filename, attachment_original_name, attachment_mime_type, 
+                  attachment_size, duration, thumbnail) 
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                [
+                    groupId,
+                    senderEmail.toLowerCase(),
+                    message || '',
+                    fileType,
+                    req.file.filename,
+                    req.file.originalname,
+                    req.file.mimetype,
+                    req.file.size,
+                    videoDuration,
+                    thumbnailFilename
+                ],
+                function(err) {
+                    if (err) {
+                        fs.unlinkSync(req.file.path);
+                        if (thumbnailFilename) {
+                            fs.unlinkSync(path.join(thumbnailsDir, thumbnailFilename));
+                        }
+                        return res.status(500).json({ success: false, error: 'Database error' });
+                    }
+
+                    if (moveFileToPermanent(req.file.filename)) {
+                        res.json({
+                            success: true,
+                            messageId: this.lastID,
+                            filename: req.file.filename,
+                            thumbnail: thumbnailFilename
+                        });
+                    } else {
+                        fs.unlinkSync(req.file.path);
+                        if (thumbnailFilename) {
+                            fs.unlinkSync(path.join(thumbnailsDir, thumbnailFilename));
+                        }
+                        res.status(500).json({ success: false, error: 'Ошибка сохранения файла' });
+                    }
                 }
-            }
-        );
+            );
+        }
     } catch (error) {
         console.error('❌ Ошибка загрузки файла в группу:', error);
         if (req.file && fs.existsSync(req.file.path)) {
@@ -1069,7 +1260,65 @@ app.get('/unread-messages/:userEmail', (req, res) => {
     }
 });
 
-// Очистка временных файлов (запускается периодически)
+// Очистка истории чата
+app.post('/clear-chat', (req, res) => {
+    try {
+        const { userEmail, friendEmail } = req.body;
+
+        if (!userEmail || !friendEmail) {
+            return res.status(400).json({ success: false, error: 'Email обязательны' });
+        }
+
+        db.run(
+            `DELETE FROM messages 
+             WHERE (sender_email = ? AND receiver_email = ?) 
+                OR (sender_email = ? AND receiver_email = ?)`,
+            [userEmail.toLowerCase(), friendEmail.toLowerCase(), 
+             friendEmail.toLowerCase(), userEmail.toLowerCase()],
+            function(err) {
+                if (err) {
+                    return res.status(500).json({ success: false, error: 'Database error' });
+                }
+
+                res.json({
+                    success: true,
+                    message: 'История чата очищена',
+                    deletedCount: this.changes
+                });
+            }
+        );
+    } catch (error) {
+        console.error('❌ Ошибка очистки чата:', error);
+        res.status(500).json({ success: false, error: 'Internal server error' });
+    }
+});
+
+// Удаление аккаунта
+app.delete('/delete-account/:userEmail', (req, res) => {
+    try {
+        const userEmail = req.params.userEmail.toLowerCase();
+
+        db.run("DELETE FROM users WHERE email = ?", [userEmail], function(err) {
+            if (err) {
+                return res.status(500).json({ success: false, error: 'Database error' });
+            }
+
+            res.json({
+                success: true,
+                message: 'Аккаунт удален',
+                deletedCount: this.changes
+            });
+        });
+    } catch (error) {
+        console.error('❌ Ошибка удаления аккаунта:', error);
+        res.status(500).json({ success: false, error: 'Internal server error' });
+    }
+});
+
+// Статические файлы (для доступа к загруженным файлам)
+app.use('/uploads', express.static(uploadDir));
+
+// Очистка временных файлов
 function cleanupTempFiles() {
     const now = Date.now();
     const oneHour = 60 * 60 * 1000;
