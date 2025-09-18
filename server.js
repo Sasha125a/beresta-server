@@ -108,6 +108,7 @@ db.serialize(() => {
         attachment_original_name TEXT DEFAULT '',
         attachment_mime_type TEXT DEFAULT '',
         attachment_size INTEGER DEFAULT 0,
+        attachment_url TEXT DEFAULT '',
         duration INTEGER DEFAULT 0,
         thumbnail TEXT DEFAULT '',
         timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
