@@ -161,6 +161,16 @@ db.serialize(() => {
         FOREIGN KEY (sender_email) REFERENCES users (email) ON DELETE CASCADE
     )`);
 
+    // В создании таблицы users добавим новые поля
+    db.run(`CREATE TABLE IF NOT EXISTS users (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        email TEXT UNIQUE NOT NULL,
+        first_name TEXT NOT NULL,
+        last_name TEXT NOT NULL,
+        avatar_filename TEXT DEFAULT '',
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    )`);
+
     // Индексы
     db.run("CREATE INDEX IF NOT EXISTS idx_messages_conversation ON messages(sender_email, receiver_email)");
     db.run("CREATE INDEX IF NOT EXISTS idx_messages_timestamp ON messages(timestamp)");
@@ -1504,6 +1514,92 @@ app.post('/send-message-with-attachment', (req, res) => {
         );
     } catch (error) {
         console.error('❌ Ошибка отправки сообщения с вложением:', error);
+        res.status(500).json({ success: false, error: 'Internal server error' });
+    }
+});
+
+// Эндпоинт для получения информации о пользователе
+app.get('/user/:email', (req, res) => {
+    try {
+        const email = req.params.email.toLowerCase();
+
+        db.get(`SELECT email, first_name as firstName, last_name as lastName, 
+                avatar_filename as avatarFilename FROM users WHERE email = ?`, 
+        [email], (err, row) => {
+            if (err) {
+                return res.status(500).json({ success: false, error: 'Database error' });
+            }
+
+            if (!row) {
+                return res.status(404).json({ success: false, error: 'Пользователь не найден' });
+            }
+
+            res.json({
+                success: true,
+                user: row
+            });
+        });
+    } catch (error) {
+        console.error('❌ Ошибка получения пользователя:', error);
+        res.status(500).json({ success: false, error: 'Internal server error' });
+    }
+});
+
+// Эндпоинт для обновления профиля
+app.post('/update-profile', upload.single('avatar'), (req, res) => {
+    try {
+        const { email, firstName, lastName, removeAvatar } = req.body;
+
+        if (!email) {
+            return res.status(400).json({ success: false, error: 'Email обязателен' });
+        }
+
+        let avatarFilename = '';
+
+        // Обработка аватара
+        if (req.file) {
+            // Перемещаем файл в постоянную папку
+            if (moveFileToPermanent(req.file.filename)) {
+                avatarFilename = req.file.filename;
+            }
+        } else if (removeAvatar === 'true') {
+            // Удаляем аватар
+            avatarFilename = '';
+        }
+
+        let query = "UPDATE users SET first_name = ?, last_name = ?";
+        let params = [firstName, lastName];
+
+        if (avatarFilename !== undefined) {
+            query += ", avatar_filename = ?";
+            params.push(avatarFilename);
+        }
+
+        query += " WHERE email = ?";
+        params.push(email.toLowerCase());
+
+        db.run(query, params, function(err) {
+            if (err) {
+                return res.status(500).json({ success: false, error: 'Database error' });
+            }
+
+            // Получаем обновленные данные пользователя
+            db.get(`SELECT email, first_name as firstName, last_name as lastName, 
+                    avatar_filename as avatarFilename FROM users WHERE email = ?`, 
+            [email.toLowerCase()], (err, row) => {
+                if (err) {
+                    return res.status(500).json({ success: false, error: 'Database error' });
+                }
+
+                res.json({
+                    success: true,
+                    message: 'Профиль обновлен',
+                    user: row
+                });
+            });
+        });
+    } catch (error) {
+        console.error('❌ Ошибка обновления профиля:', error);
         res.status(500).json({ success: false, error: 'Internal server error' });
     }
 });
