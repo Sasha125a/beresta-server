@@ -38,6 +38,8 @@ const thumbnailsDir = path.join(uploadDir, 'thumbnails');
     if (!fs.existsSync(dir)) {
         fs.mkdirSync(dir, { recursive: true });
         console.log('📁 Создана папка:', dir);
+    } else {
+        console.log('📁 Папка уже существует:', dir);
     }
 });
 
@@ -75,7 +77,7 @@ const db = new sqlite3.Database(dbPath, (err) => {
 
 db.run("PRAGMA foreign_keys = ON");
 
-// Создание таблиц (добавляем поле для миниатюр)
+// Создание таблиц
 db.serialize(() => {
     // Таблица пользователей
     db.run(`CREATE TABLE IF NOT EXISTS users (
@@ -212,6 +214,43 @@ function createVideoThumbnail(videoPath, outputPath, callback) {
         });
 }
 
+// Функция создания превью для медиафайлов
+function createMediaPreview(filePath, outputPath, fileType, callback) {
+    if (fileType === 'video') {
+        // Для видео создаем превью из первого кадра
+        ffmpeg(filePath)
+            .screenshots({
+                timestamps: ['00:00:01'],
+                filename: path.basename(outputPath),
+                folder: path.dirname(outputPath),
+                size: '320x240'
+            })
+            .on('end', () => {
+                console.log('✅ Превью видео создано:', outputPath);
+                callback(null, outputPath);
+            })
+            .on('error', (err) => {
+                console.error('❌ Ошибка создания превью видео:', err);
+                callback(err);
+            });
+    } else if (fileType === 'image') {
+        // Для изображений создаем уменьшенную копию
+        ffmpeg(filePath)
+            .size('320x240')
+            .output(outputPath)
+            .on('end', () => {
+                console.log('✅ Превью изображения создано:', outputPath);
+                callback(null, outputPath);
+            })
+            .on('error', (err) => {
+                console.error('❌ Ошибка создания превью изображения:', err);
+                callback(err);
+            });
+    } else {
+        callback(new Error('Unsupported file type for preview'));
+    }
+}
+
 // Функция получения длительности видео
 function getVideoDuration(videoPath, callback) {
     ffmpeg.ffprobe(videoPath, (err, metadata) => {
@@ -230,10 +269,18 @@ function moveFileToPermanent(filename) {
     const permanentPath = path.join(permanentDir, filename);
     
     if (fs.existsSync(tempPath)) {
-        fs.renameSync(tempPath, permanentPath);
-        return true;
+        try {
+            fs.renameSync(tempPath, permanentPath);
+            console.log(`✅ Файл перемещен: ${filename} -> ${permanentPath}`);
+            return true;
+        } catch (error) {
+            console.error(`❌ Ошибка перемещения файла ${filename}:`, error);
+            return false;
+        }
+    } else {
+        console.error(`❌ Временный файл не найден: ${tempPath}`);
+        return false;
     }
-    return false;
 }
 
 // Функция удаления файла если оба пользователя скачали
@@ -610,11 +657,29 @@ app.post('/upload-file', upload.single('file'), (req, res) => {
             return res.status(400).json({ success: false, error: 'Файл не загружен' });
         }
 
+        console.log('📤 Загружен файл:', {
+            originalname: req.file.originalname,
+            filename: req.file.filename,
+            size: req.file.size,
+            path: req.file.path
+        });
+
         const fileType = getFileType(req.file.mimetype, req.file.originalname);
         const fileUrl = `/uploads/permanent/${req.file.filename}`;
 
         // Перемещаем файл в постоянную папку
         if (moveFileToPermanent(req.file.filename)) {
+            // Проверяем, существует ли файл в постоянной папке
+            const permanentPath = path.join(permanentDir, req.file.filename);
+            const fileExists = fs.existsSync(permanentPath);
+            
+            console.log('✅ Файл сохранен:', {
+                filename: req.file.filename,
+                permanentPath: permanentPath,
+                exists: fileExists,
+                fileUrl: fileUrl
+            });
+
             res.json({
                 success: true,
                 filename: req.file.filename,
@@ -625,6 +690,7 @@ app.post('/upload-file', upload.single('file'), (req, res) => {
                 mimeType: req.file.mimetype
             });
         } else {
+            console.error('❌ Ошибка перемещения файла');
             fs.unlinkSync(req.file.path);
             res.status(500).json({ success: false, error: 'Ошибка сохранения файла' });
         }
@@ -656,24 +722,33 @@ app.post('/upload', upload.single('file'), (req, res) => {
         let thumbnailFilename = '';
         let videoDuration = duration || 0;
 
-        // Обработка видео: создание миниатюры и получение длительности
-        if (fileType === 'video') {
-            const tempVideoPath = req.file.path;
-            const thumbnailName = `thumb_${path.parse(req.file.filename).name}.jpg`;
-            const thumbnailPath = path.join(thumbnailsDir, thumbnailName);
+        // Создаем превью для изображений и видео
+        if (fileType === 'image' || fileType === 'video') {
+            const previewName = `preview_${path.parse(req.file.filename).name}.jpg`;
+            const previewPath = path.join(thumbnailsDir, previewName);
 
-            getVideoDuration(tempVideoPath, (err, duration) => {
-                if (!err && duration > 0) {
-                    videoDuration = duration;
-                }
-
-                createVideoThumbnail(tempVideoPath, thumbnailPath, (err) => {
+            if (fileType === 'video') {
+                // Для видео получаем длительность
+                getVideoDuration(req.file.path, (err, duration) => {
+                    if (!err && duration > 0) {
+                        videoDuration = duration;
+                    }
+                    createMediaPreview(req.file.path, previewPath, fileType, (err) => {
+                        if (!err) {
+                            thumbnailFilename = previewName;
+                        }
+                        completeFileUpload();
+                    });
+                });
+            } else {
+                // Для изображений сразу создаем превью
+                createMediaPreview(req.file.path, previewPath, fileType, (err) => {
                     if (!err) {
-                        thumbnailFilename = thumbnailName;
+                        thumbnailFilename = previewName;
                     }
                     completeFileUpload();
                 });
-            });
+            }
         } else {
             completeFileUpload();
         }
@@ -732,6 +807,51 @@ app.post('/upload', upload.single('file'), (req, res) => {
         if (req.file && fs.existsSync(req.file.path)) {
             fs.unlinkSync(req.file.path);
         }
+        res.status(500).json({ success: false, error: 'Internal server error' });
+    }
+});
+
+// Отправка сообщения с информацией о файле
+app.post('/send-message-with-attachment', (req, res) => {
+    try {
+        const { senderEmail, receiverEmail, message, attachmentType, 
+                attachmentFilename, attachmentOriginalName, attachmentUrl } = req.body;
+
+        if (!senderEmail || !receiverEmail) {
+            return res.status(400).json({ success: false, error: 'Email обязательны' });
+        }
+
+        db.run(
+            `INSERT INTO messages 
+             (sender_email, receiver_email, message, attachment_type, 
+              attachment_filename, attachment_original_name, attachment_url) 
+             VALUES (?, ?, ?, ?, ?, ?, ?)`,
+            [
+                senderEmail.toLowerCase(),
+                receiverEmail.toLowerCase(),
+                message || '',
+                attachmentType || '',
+                attachmentFilename || '',
+                attachmentOriginalName || '',
+                attachmentUrl || ''
+            ],
+            function(err) {
+                if (err) {
+                    console.error('❌ Ошибка отправки сообщения с вложением:', err);
+                    return res.status(500).json({ success: false, error: 'Database error' });
+                }
+
+                res.json({
+                    success: true,
+                    messageId: this.lastID
+                });
+
+                // Автоматически добавляем в чаты если это новый диалог
+                addToChatsAutomatically(senderEmail, receiverEmail, () => {});
+            }
+        );
+    } catch (error) {
+        console.error('❌ Ошибка отправки сообщения с вложением:', error);
         res.status(500).json({ success: false, error: 'Internal server error' });
     }
 });
@@ -814,7 +934,7 @@ app.get('/file-info/:messageId', (req, res) => {
     }
 });
 
-// Получение информации о файле по имени файла (новый эндпоинт)
+// Получение информации о файле по имени файла
 app.get('/file-info-by-name/:filename', (req, res) => {
     try {
         const filename = req.params.filename;
@@ -850,6 +970,26 @@ app.get('/file-info-by-name/:filename', (req, res) => {
     } catch (error) {
         console.error('❌ Ошибка получения информации о файле:', error);
         res.status(500).json({ success: false, error: 'Internal server error' });
+    }
+});
+
+// Проверка существования файла
+app.get('/check-file/:filename', (req, res) => {
+    const filename = req.params.filename;
+    const filePath = path.join(permanentDir, filename);
+    
+    if (fs.existsSync(filePath)) {
+        res.json({
+            exists: true,
+            path: filePath,
+            size: fs.statSync(filePath).size
+        });
+    } else {
+        res.json({
+            exists: false,
+            path: filePath,
+            error: 'File not found'
+        });
     }
 });
 
@@ -1016,24 +1156,31 @@ app.post('/upload-group', upload.single('file'), (req, res) => {
         let thumbnailFilename = '';
         let videoDuration = duration || 0;
 
-        // Обработка видео для групповых сообщений
-        if (fileType === 'video') {
-            const tempVideoPath = req.file.path;
-            const thumbnailName = `thumb_${path.parse(req.file.filename).name}.jpg`;
-            const thumbnailPath = path.join(thumbnailsDir, thumbnailName);
+        // Создаем превью для изображений и видео в группах
+        if (fileType === 'image' || fileType === 'video') {
+            const previewName = `preview_${path.parse(req.file.filename).name}.jpg`;
+            const previewPath = path.join(thumbnailsDir, previewName);
 
-            getVideoDuration(tempVideoPath, (err, duration) => {
-                if (!err && duration > 0) {
-                    videoDuration = duration;
-                }
-
-                createVideoThumbnail(tempVideoPath, thumbnailPath, (err) => {
+            if (fileType === 'video') {
+                getVideoDuration(req.file.path, (err, duration) => {
+                    if (!err && duration > 0) {
+                        videoDuration = duration;
+                    }
+                    createMediaPreview(req.file.path, previewPath, fileType, (err) => {
+                        if (!err) {
+                            thumbnailFilename = previewName;
+                        }
+                        completeGroupFileUpload();
+                    });
+                });
+            } else {
+                createMediaPreview(req.file.path, previewPath, fileType, (err) => {
                     if (!err) {
-                        thumbnailFilename = thumbnailName;
+                        thumbnailFilename = previewName;
                     }
                     completeGroupFileUpload();
                 });
-            });
+            }
         } else {
             completeGroupFileUpload();
         }
