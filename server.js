@@ -1315,6 +1315,51 @@ app.delete('/delete-account/:userEmail', (req, res) => {
     }
 });
 
+// Добавьте этот endpoint в server.js после существующих POST endpoints
+app.post('/send-message-with-attachment', (req, res) => {
+    try {
+        const { senderEmail, receiverEmail, message, attachmentType, 
+                attachmentFilename, attachmentOriginalName, attachmentUrl } = req.body;
+
+        if (!senderEmail || !receiverEmail) {
+            return res.status(400).json({ success: false, error: 'Email обязательны' });
+        }
+
+        db.run(
+            `INSERT INTO messages 
+             (sender_email, receiver_email, message, attachment_type, 
+              attachment_filename, attachment_original_name, attachment_url) 
+             VALUES (?, ?, ?, ?, ?, ?, ?)`,
+            [
+                senderEmail.toLowerCase(),
+                receiverEmail.toLowerCase(),
+                message || '',
+                attachmentType || '',
+                attachmentFilename || '',
+                attachmentOriginalName || '',
+                attachmentUrl || ''
+            ],
+            function(err) {
+                if (err) {
+                    console.error('❌ Ошибка отправки сообщения с вложением:', err);
+                    return res.status(500).json({ success: false, error: 'Database error' });
+                }
+
+                res.json({
+                    success: true,
+                    messageId: this.lastID
+                });
+
+                // Автоматически добавляем в чаты если это новый диалог
+                addToChatsAutomatically(senderEmail, receiverEmail, () => {});
+            }
+        );
+    } catch (error) {
+        console.error('❌ Ошибка отправки сообщения с вложением:', error);
+        res.status(500).json({ success: false, error: 'Internal server error' });
+    }
+});
+
 // Статические файлы (для доступа к загруженным файлам)
 app.use('/uploads', express.static(uploadDir));
 
