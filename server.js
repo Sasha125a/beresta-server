@@ -10,6 +10,7 @@ const { v4: uuidv4 } = require('uuid');
 const ffmpeg = require('fluent-ffmpeg');
 const ffmpegPath = require('ffmpeg-static');
 const ffprobePath = require('ffprobe-static').path;
+const activeCalls = new Map();
 
 // Устанавливаем пути к ffmpeg
 ffmpeg.setFfmpegPath(ffmpegPath);
@@ -161,6 +162,21 @@ db.serialize(() => {
         last_name TEXT NOT NULL,
         avatar_filename TEXT DEFAULT '',
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    )`);
+
+    // Добавить в создание таблиц в server.js
+    db.run(`CREATE TABLE IF NOT EXISTS calls (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        call_id TEXT UNIQUE NOT NULL,
+        caller_email TEXT NOT NULL,
+        receiver_email TEXT NOT NULL,
+        call_type TEXT DEFAULT 'audio',
+        status TEXT DEFAULT 'ended',
+        duration INTEGER DEFAULT 0,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        ended_at DATETIME,
+        FOREIGN KEY (caller_email) REFERENCES users (email) ON DELETE CASCADE,
+        FOREIGN KEY (receiver_email) REFERENCES users (email) ON DELETE CASCADE
     )`);
 
     // Индексы
@@ -1596,6 +1612,276 @@ app.post('/update-profile', upload.single('avatar'), (req, res) => {
         res.status(500).json({ success: false, error: 'Internal server error' });
     }
 });
+
+// Инициализация звонка
+app.post('/call/initiate', (req, res) => {
+    try {
+        const { callerEmail, receiverEmail, callType } = req.body; // 'audio' или 'video'
+
+        if (!callerEmail || !receiverEmail) {
+            return res.status(400).json({ success: false, error: 'Email обязательны' });
+        }
+
+        const callId = uuidv4();
+        const callData = {
+            callId,
+            callerEmail: callerEmail.toLowerCase(),
+            receiverEmail: receiverEmail.toLowerCase(),
+            callType: callType || 'audio',
+            status: 'ringing',
+            createdAt: new Date().toISOString(),
+            offer: null,
+            answer: null,
+            iceCandidates: []
+        };
+
+        activeCalls.set(callId, callData);
+
+        // Отправляем уведомление получателю (в реальном приложении используйте WebSockets)
+        // Здесь просто возвращаем данные вызова
+
+        res.json({
+            success: true,
+            callId,
+            callData
+        });
+
+    } catch (error) {
+        console.error('❌ Ошибка инициализации звонка:', error);
+        res.status(500).json({ success: false, error: 'Internal server error' });
+    }
+});
+
+// Отмена звонка
+app.post('/call/cancel', (req, res) => {
+    try {
+        const { callId } = req.body;
+
+        if (!callId) {
+            return res.status(400).json({ success: false, error: 'ID звонка обязателен' });
+        }
+
+        if (activeCalls.has(callId)) {
+            const callData = activeCalls.get(callId);
+            callData.status = 'cancelled';
+            activeCalls.set(callId, callData);
+        }
+
+        res.json({ success: true, message: 'Звонок отменен' });
+
+    } catch (error) {
+        console.error('❌ Ошибка отмены звонка:', error);
+        res.status(500).json({ success: false, error: 'Internal server error' });
+    }
+});
+
+// Принятие звонка
+app.post('/call/accept', (req, res) => {
+    try {
+        const { callId } = req.body;
+
+        if (!callId) {
+            return res.status(400).json({ success: false, error: 'ID звонка обязателен' });
+        }
+
+        if (activeCalls.has(callId)) {
+            const callData = activeCalls.get(callId);
+            callData.status = 'accepted';
+            activeCalls.set(callId, callData);
+        }
+
+        res.json({ success: true, message: 'Звонок принят' });
+
+    } catch (error) {
+        console.error('❌ Ошибка принятия звонка:', error);
+        res.status(500).json({ success: false, error: 'Internal server error' });
+    }
+});
+
+// Отклонение звонка
+app.post('/call/reject', (req, res) => {
+    try {
+        const { callId } = req.body;
+
+        if (!callId) {
+            return res.status(400).json({ success: false, error: 'ID звонка обязателен' });
+        }
+
+        if (activeCalls.has(callId)) {
+            const callData = activeCalls.get(callId);
+            callData.status = 'rejected';
+            activeCalls.set(callId, callData);
+        }
+
+        res.json({ success: true, message: 'Звонок отклонен' });
+
+    } catch (error) {
+        console.error('❌ Ошибка отклонения звонка:', error);
+        res.status(500).json({ success: false, error: 'Internal server error' });
+    }
+});
+
+// Завершение звонка
+app.post('/call/end', (req, res) => {
+    try {
+        const { callId, duration } = req.body;
+
+        if (!callId) {
+            return res.status(400).json({ success: false, error: 'ID звонка обязателен' });
+        }
+
+        if (activeCalls.has(callId)) {
+            const callData = activeCalls.get(callId);
+            callData.status = 'ended';
+            callData.endedAt = new Date().toISOString();
+            callData.duration = duration || 0;
+            activeCalls.set(callId, callData);
+
+            // Сохраняем информацию о звонке в БД
+            db.run(
+                `INSERT INTO calls (call_id, caller_email, receiver_email, call_type, duration, status)
+                 VALUES (?, ?, ?, ?, ?, ?)`,
+                [callId, callData.callerEmail, callData.receiverEmail, 
+                 callData.callType, callData.duration, callData.status],
+                (err) => {
+                    if (err) {
+                        console.error('❌ Ошибка сохранения звонка:', err);
+                    }
+                }
+            );
+        }
+
+        res.json({ success: true, message: 'Звонок завершен' });
+
+    } catch (error) {
+        console.error('❌ Ошибка завершения звонка:', error);
+        res.status(500).json({ success: false, error: 'Internal server error' });
+    }
+});
+
+// Получение статуса звонка
+app.get('/call/status/:callId', (req, res) => {
+    try {
+        const callId = req.params.callId;
+
+        if (activeCalls.has(callId)) {
+            res.json({
+                success: true,
+                callData: activeCalls.get(callId)
+            });
+        } else {
+            res.status(404).json({ success: false, error: 'Звонок не найден' });
+        }
+
+    } catch (error) {
+        console.error('❌ Ошибка получения статуса звонка:', error);
+        res.status(500).json({ success: false, error: 'Internal server error' });
+    }
+});
+
+// WebRTC signaling - отправка offer
+app.post('/call/offer', (req, res) => {
+    try {
+        const { callId, offer } = req.body;
+
+        if (!callId || !offer) {
+            return res.status(400).json({ success: false, error: 'ID звонка и offer обязательны' });
+        }
+
+        if (activeCalls.has(callId)) {
+            const callData = activeCalls.get(callId);
+            callData.offer = offer;
+            activeCalls.set(callId, callData);
+        }
+
+        res.json({ success: true, message: 'Offer получен' });
+
+    } catch (error) {
+        console.error('❌ Ошибка обработки offer:', error);
+        res.status(500).json({ success: false, error: 'Internal server error' });
+    }
+});
+
+// WebRTC signaling - отправка answer
+app.post('/call/answer', (req, res) => {
+    try {
+        const { callId, answer } = req.body;
+
+        if (!callId || !answer) {
+            return res.status(400).json({ success: false, error: 'ID звонка и answer обязательны' });
+        }
+
+        if (activeCalls.has(callId)) {
+            const callData = activeCalls.get(callId);
+            callData.answer = answer;
+            activeCalls.set(callId, callData);
+        }
+
+        res.json({ success: true, message: 'Answer получен' });
+
+    } catch (error) {
+        console.error('❌ Ошибка обработки answer:', error);
+        res.status(500).json({ success: false, error: 'Internal server error' });
+    }
+});
+
+// WebRTC signaling - отправка ICE candidate
+app.post('/call/ice-candidate', (req, res) => {
+    try {
+        const { callId, candidate } = req.body;
+
+        if (!callId || !candidate) {
+            return res.status(400).json({ success: false, error: 'ID звонка и candidate обязательны' });
+        }
+
+        if (activeCalls.has(callId)) {
+            const callData = activeCalls.get(callId);
+            callData.iceCandidates.push(candidate);
+            activeCalls.set(callId, callData);
+        }
+
+        res.json({ success: true, message: 'ICE candidate получен' });
+
+    } catch (error) {
+        console.error('❌ Ошибка обработки ICE candidate:', error);
+        res.status(500).json({ success: false, error: 'Internal server error' });
+    }
+});
+
+// Получение ICE candidates
+app.get('/call/ice-candidates/:callId', (req, res) => {
+    try {
+        const callId = req.params.callId;
+
+        if (activeCalls.has(callId)) {
+            const callData = activeCalls.get(callId);
+            res.json({
+                success: true,
+                candidates: callData.iceCandidates
+            });
+        } else {
+            res.status(404).json({ success: false, error: 'Звонок не найден' });
+        }
+
+    } catch (error) {
+        console.error('❌ Ошибка получения ICE candidates:', error);
+        res.status(500).json({ success: false, error: 'Internal server error' });
+    }
+});
+
+// Очистка старых звонков
+setInterval(() => {
+    const now = Date.now();
+    const oneHour = 60 * 60 * 1000;
+
+    for (const [callId, callData] of activeCalls.entries()) {
+        const callTime = new Date(callData.createdAt).getTime();
+        if (now - callTime > oneHour) {
+            activeCalls.delete(callId);
+            console.log(`🗑️  Удален старый звонок: ${callId}`);
+        }
+    }
+}, 30 * 60 * 1000);
 
 // Статические файлы (для доступа к загруженным файлам)
 app.use('/uploads', express.static(uploadDir));
