@@ -407,6 +407,22 @@ function isValidChannelName(channelName) {
     return pattern.test(channelName) && channelName.length <= 64;
 }
 
+// Функция для генерации безопасного имени канала
+function generateSafeChannelName(baseName) {
+    // Удаляем все недопустимые символы
+    let safeName = baseName.replace(/[^a-zA-Z0-9!#$%&()+\-:;<=>.?@[\]^_{}|~]/g, '');
+    
+    // Ограничиваем длину 64 символами
+    safeName = safeName.substring(0, 64);
+    
+    // Если после очистки имя пустое, генерируем случайное
+    if (!safeName) {
+        safeName = 'channel_' + Math.random().toString(36).substring(2, 15);
+    }
+    
+    return safeName;
+}
+
 // Health check
 app.get('/health', (req, res) => {
     db.get("SELECT 1 as test", [], (err) => {
@@ -1982,6 +1998,14 @@ app.post('/agora/create-call', (req, res) => {
             return res.status(400).json({ success: false, error: 'Все поля обязательны' });
         }
 
+        // Валидация имени канала
+        if (!isValidChannelName(channelName)) {
+            return res.status(400).json({ 
+                success: false, 
+                error: 'Недопустимое имя канала' 
+            });
+        }
+
         // Сохраняем информацию о звонке в БД
         db.run(
             `INSERT INTO agora_calls (channel_name, caller_email, receiver_email, call_type, status)
@@ -1991,9 +2015,6 @@ app.post('/agora/create-call', (req, res) => {
                 if (err) {
                     return res.status(500).json({ success: false, error: 'Database error' });
                 }
-
-                // Здесь можно отправить push-уведомление получателю
-                // Например через WebSockets или FCM
 
                 res.json({
                     success: true,
