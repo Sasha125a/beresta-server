@@ -180,6 +180,20 @@ db.serialize(() => {
         FOREIGN KEY (receiver_email) REFERENCES users (email) ON DELETE CASCADE
     )`);
 
+    // Создайте таблицу для Agora звонков в БД
+    db.run(`CREATE TABLE IF NOT EXISTS agora_calls (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        channel_name TEXT UNIQUE NOT NULL,
+        caller_email TEXT NOT NULL,
+        receiver_email TEXT NOT NULL,
+        call_type TEXT DEFAULT 'audio',
+        status TEXT DEFAULT 'ringing',
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        ended_at DATETIME,
+        FOREIGN KEY (caller_email) REFERENCES users (email) ON DELETE CASCADE,
+        FOREIGN KEY (receiver_email) REFERENCES users (email) ON DELETE CASCADE
+    )`);
+
     // Индексы
     db.run("CREATE INDEX IF NOT EXISTS idx_messages_conversation ON messages(sender_email, receiver_email)");
     db.run("CREATE INDEX IF NOT EXISTS idx_messages_timestamp ON messages(timestamp)");
