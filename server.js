@@ -79,14 +79,6 @@ db.run("PRAGMA foreign_keys = ON");
 
 // Создание таблиц
 db.serialize(() => {
-    // Таблица пользователей
-    db.run(`CREATE TABLE IF NOT EXISTS users (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        email TEXT UNIQUE NOT NULL,
-        first_name TEXT NOT NULL,
-        last_name TEXT NOT NULL,
-        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-    )`);
 
     // Таблица друзей
     db.run(`CREATE TABLE IF NOT EXISTS friends (
