@@ -11,6 +11,7 @@ const ffmpeg = require('fluent-ffmpeg');
 const ffmpegPath = require('ffmpeg-static');
 const ffprobePath = require('ffprobe-static').path;
 const activeCalls = new Map();
+const Agora = require('agora-access-token');
 
 // Устанавливаем пути к ffmpeg
 ffmpeg.setFfmpegPath(ffmpegPath);
@@ -1898,6 +1899,138 @@ app.get('/pending-calls/:userEmail', (req, res) => {
         });
     } catch (error) {
         console.error('❌ Ошибка получения pending calls:', error);
+        res.status(500).json({ success: false, error: 'Internal server error' });
+    }
+});
+
+// Agora endpoints
+app.post('/agora/token', (req, res) => {
+    try {
+        const { channelName, userId } = req.body;
+
+        if (!channelName) {
+            return res.status(400).json({ success: false, error: 'Channel name обязателен' });
+        }
+
+        // Ваши Agora credentials
+        const appId = process.env.AGORA_APP_ID || '0eef2fbc530f4d27a19a18f6527dda20';
+        const appCertificate = process.env.AGORA_APP_CERTIFICATE || '5ffaa1348ef5433b8fbb37d22772ca0e';
+        const expirationTimeInSeconds = 3600; // 1 час
+
+        const currentTimestamp = Math.floor(Date.now() / 1000);
+        const privilegeExpiredTs = currentTimestamp + expirationTimeInSeconds;
+
+        const token = Agora.RtcTokenBuilder.buildTokenWithUid(
+            appId,
+            appCertificate,
+            channelName,
+            userId || 0,
+            Agora.RtcRole.PUBLISHER,
+            privilegeExpiredTs
+        );
+
+        res.json({
+            success: true,
+            token: token,
+            appId: appId,
+            channelName: channelName
+        });
+
+    } catch (error) {
+        console.error('❌ Ошибка генерации Agora токена:', error);
+        res.status(500).json({ success: false, error: 'Internal server error' });
+    }
+});
+
+app.post('/agora/create-call', (req, res) => {
+    try {
+        const { callerEmail, receiverEmail, callType, channelName } = req.body;
+
+        if (!callerEmail || !receiverEmail || !channelName) {
+            return res.status(400).json({ success: false, error: 'Все поля обязательны' });
+        }
+
+        // Сохраняем информацию о звонке в БД
+        db.run(
+            `INSERT INTO agora_calls (channel_name, caller_email, receiver_email, call_type, status)
+             VALUES (?, ?, ?, ?, 'ringing')`,
+            [channelName, callerEmail.toLowerCase(), receiverEmail.toLowerCase(), callType || 'audio'],
+            function(err) {
+                if (err) {
+                    return res.status(500).json({ success: false, error: 'Database error' });
+                }
+
+                // Здесь можно отправить push-уведомление получателю
+                // Например через WebSockets или FCM
+
+                res.json({
+                    success: true,
+                    callId: this.lastID,
+                    channelName: channelName
+                });
+            }
+        );
+
+    } catch (error) {
+        console.error('❌ Ошибка создания Agora звонка:', error);
+        res.status(500).json({ success: false, error: 'Internal server error' });
+    }
+});
+
+app.post('/agora/end-call', (req, res) => {
+    try {
+        const { channelName } = req.body;
+
+        if (!channelName) {
+            return res.status(400).json({ success: false, error: 'Channel name обязателен' });
+        }
+
+        db.run(
+            "UPDATE agora_calls SET status = 'ended', ended_at = CURRENT_TIMESTAMP WHERE channel_name = ?",
+            [channelName],
+            function(err) {
+                if (err) {
+                    return res.status(500).json({ success: false, error: 'Database error' });
+                }
+
+                res.json({
+                    success: true,
+                    message: 'Звонок завершен'
+                });
+            }
+        );
+
+    } catch (error) {
+        console.error('❌ Ошибка завершения Agora звонка:', error);
+        res.status(500).json({ success: false, error: 'Internal server error' });
+    }
+});
+
+app.get('/agora/active-calls/:userEmail', (req, res) => {
+    try {
+        const userEmail = req.params.userEmail.toLowerCase();
+
+        db.all(`
+            SELECT channel_name as channelName, caller_email as callerEmail, 
+                   receiver_email as receiverEmail, call_type as callType, 
+                   status, created_at as createdAt
+            FROM agora_calls 
+            WHERE (caller_email = ? OR receiver_email = ?) 
+            AND status = 'ringing'
+            ORDER BY created_at DESC
+        `, [userEmail, userEmail], (err, rows) => {
+            if (err) {
+                return res.status(500).json({ success: false, error: 'Database error' });
+            }
+
+            res.json({
+                success: true,
+                calls: rows
+            });
+        });
+
+    } catch (error) {
+        console.error('❌ Ошибка получения активных Agora звонков:', error);
         res.status(500).json({ success: false, error: 'Internal server error' });
     }
 });
