@@ -1917,10 +1917,10 @@ app.get('/pending-calls/:userEmail', (req, res) => {
     }
 });
 
-// Agora endpoints
-app.post('/agora/token', (req, res) => {
+// ЗАМЕНИТЕ текущий POST endpoint на этот GET endpoint:
+app.get('/agora/token/:channelName/:userId', (req, res) => {
     try {
-        const { channelName, userId } = req.body;
+        const { channelName, userId } = req.params;
 
         if (!channelName) {
             return res.status(400).json({ success: false, error: 'Channel name обязателен' });
@@ -1934,11 +1934,13 @@ app.post('/agora/token', (req, res) => {
         const currentTimestamp = Math.floor(Date.now() / 1000);
         const privilegeExpiredTs = currentTimestamp + expirationTimeInSeconds;
 
+        const uid = parseInt(userId) || 0;
+        
         const token = Agora.RtcTokenBuilder.buildTokenWithUid(
             appId,
             appCertificate,
             channelName,
-            userId || 0,
+            uid,
             Agora.RtcRole.PUBLISHER,
             privilegeExpiredTs
         );
