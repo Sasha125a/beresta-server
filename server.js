@@ -1883,6 +1883,25 @@ setInterval(() => {
     }
 }, 30 * 60 * 1000);
 
+// Получение pending calls для пользователя
+app.get('/pending-calls/:userEmail', (req, res) => {
+    try {
+        const userEmail = req.params.userEmail.toLowerCase();
+        
+        const pendingCalls = Array.from(activeCalls.values()).filter(call => 
+            call.receiverEmail === userEmail && call.status === 'ringing'
+        );
+        
+        res.json({
+            success: true,
+            calls: pendingCalls
+        });
+    } catch (error) {
+        console.error('❌ Ошибка получения pending calls:', error);
+        res.status(500).json({ success: false, error: 'Internal server error' });
+    }
+});
+
 // Статические файлы (для доступа к загруженным файлам)
 app.use('/uploads', express.static(uploadDir));
 
