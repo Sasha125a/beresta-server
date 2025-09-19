@@ -1513,12 +1513,13 @@ app.post('/send-message-with-attachment', (req, res) => {
 // Эндпоинт для получения информации о пользователе
 app.get('/user/:email', (req, res) => {
     try {
-        const email = req.params.email.toLowerCase();
+        const email = decodeURIComponent(req.params.email).toLowerCase();
 
         db.get(`SELECT email, first_name as firstName, last_name as lastName, 
                 avatar_filename as avatarFilename FROM users WHERE email = ?`, 
         [email], (err, row) => {
             if (err) {
+                console.error('❌ Ошибка БД при получении пользователя:', err);
                 return res.status(500).json({ success: false, error: 'Database error' });
             }
 
