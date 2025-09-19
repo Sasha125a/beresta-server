@@ -400,6 +400,13 @@ function addToChatsAutomatically(user1, user2, callback) {
     });
 }
 
+// Добавьте эту функцию для валидации имени канала
+function isValidChannelName(channelName) {
+    // Agora требует: 64 байта максимум, только цифры, буквы и некоторые символы
+    const pattern = /^[a-zA-Z0-9!#$%&()+\-:;<=>.?@[\]^_{}|~]{1,64}$/;
+    return pattern.test(channelName) && channelName.length <= 64;
+}
+
 // Health check
 app.get('/health', (req, res) => {
     db.get("SELECT 1 as test", [], (err) => {
@@ -1926,6 +1933,14 @@ app.get('/agora/token/:channelName/:userId', (req, res) => {
             return res.status(400).json({ success: false, error: 'Channel name обязателен' });
         }
 
+        // Валидация имени канала
+        if (!isValidChannelName(channelName)) {
+            return res.status(400).json({ 
+                success: false, 
+                error: 'Недопустимое имя канала. Разрешены только буквы, цифры и некоторые символы' 
+            });
+        }
+
         // Ваши Agora credentials
         const appId = process.env.AGORA_APP_ID || '0eef2fbc530f4d27a19a18f6527dda20';
         const appCertificate = process.env.AGORA_APP_CERTIFICATE || '5ffaa1348ef5433b8fbb37d22772ca0e';
@@ -1934,7 +1949,8 @@ app.get('/agora/token/:channelName/:userId', (req, res) => {
         const currentTimestamp = Math.floor(Date.now() / 1000);
         const privilegeExpiredTs = currentTimestamp + expirationTimeInSeconds;
 
-        const uid = parseInt(userId) || 0;
+        // Преобразуем userId в число, убеждаемся что оно положительное
+        const uid = Math.abs(parseInt(userId) || 0);
         
         const token = Agora.RtcTokenBuilder.buildTokenWithUid(
             appId,
