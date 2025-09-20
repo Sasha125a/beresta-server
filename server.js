@@ -12,6 +12,19 @@ const ffmpegPath = require('ffmpeg-static');
 const ffprobePath = require('ffprobe-static').path;
 const activeCalls = new Map();
 const Agora = require('agora-access-token');
+const http = require('http');
+const socketIo = require('socket.io');
+
+const server = http.createServer(app);
+const io = socketIo(server, {
+  cors: {
+    origin: "*",
+    methods: ["GET", "POST"]
+  }
+});
+
+// WebSocket соединения
+const activeUsers = new Map();
 
 // Устанавливаем пути к ffmpeg
 ffmpeg.setFfmpegPath(ffmpegPath);
@@ -2088,6 +2101,66 @@ app.get('/agora/active-calls/:userEmail', (req, res) => {
     }
 });
 
+// Эндпоинт для отправки уведомлений о звонках
+app.post('/send-call-notification', (req, res) => {
+  try {
+    const { channelName, receiverEmail, callType } = req.body;
+
+    // Отправляем через WebSocket
+    const receiverSocketId = activeUsers.get(receiverEmail);
+    if (receiverSocketId) {
+      io.to(receiverSocketId).emit('incoming_call', {
+        channelName,
+        callerEmail: req.body.callerEmail, // Добавьте callerEmail в запрос
+        callType
+      });
+    }
+
+    res.json({ success: true, message: 'Уведомление отправлено' });
+  } catch (error) {
+    console.error('❌ Ошибка отправки уведомления:', error);
+    res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+});
+
+io.on('connection', (socket) => {
+  console.log('✅ Пользователь подключился:', socket.id);
+
+  socket.on('user_online', (data) => {
+    activeUsers.set(data.email, socket.id);
+    console.log(`👤 Пользователь онлайн: ${data.email}`);
+  });
+
+  socket.on('call_notification', (data) => {
+    const receiverSocketId = activeUsers.get(data.receiverEmail);
+    if (receiverSocketId) {
+      io.to(receiverSocketId).emit('incoming_call', {
+        channelName: data.channelName,
+        callerEmail: data.callerEmail,
+        callType: data.callType
+      });
+    }
+  });
+
+  socket.on('end_call', (data) => {
+    const receiverSocketId = activeUsers.get(data.receiverEmail);
+    if (receiverSocketId) {
+      io.to(receiverSocketId).emit('call_ended', data.channelName);
+    }
+  });
+
+  socket.on('disconnect', () => {
+    // Удаляем пользователя из активных
+    for (let [email, socketId] of activeUsers.entries()) {
+      if (socketId === socket.id) {
+        activeUsers.delete(email);
+        console.log(`👤 Пользователь отключился: ${email}`);
+        break;
+      }
+    }
+  });
+});
+
 // Статические файлы (для доступа к загруженным файлам)
 app.use('/uploads', express.static(uploadDir));
 
@@ -2132,10 +2205,10 @@ app.use((req, res) => {
 });
 
 // Запуск сервера
-app.listen(PORT, () => {
-    console.log(`🚀 Сервер запущен на порту ${PORT}`);
-    console.log(`📁 Папка загрузок: ${uploadDir}`);
-    console.log(`💾 База данных: ${dbPath}`);
+// Замените app.listen на server.listen
+server.listen(PORT, () => {
+  console.log(`🚀 Сервер запущен на порту ${PORT}`);
+  console.log(`📡 WebSocket сервер активен`);
 });
 
 // Graceful shutdown
