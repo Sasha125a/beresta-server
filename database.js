@@ -1,20 +1,27 @@
-const { Client } = require('pg');
+const { Pool } = require('pg');
 require('dotenv').config();
 
-// Подключение к PostgreSQL
-const client = new Client({
+// Используем Pool вместо Client для управления соединениями
+const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false
+  ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false,
+  max: 20, // максимальное количество клиентов в пуле
+  idleTimeoutMillis: 30000, // закрыть соединения после 30 секунд бездействия
+  connectionTimeoutMillis: 2000, // таймаут подключения 2 секунды
 });
 
-// Функция для подключения к БД
-async function connectDB() {
+// Функция для подключения к БД и создания таблиц
+async function initializeDB() {
   try {
-    await client.connect();
+    // Проверяем подключение
+    const client = await pool.connect();
     console.log('✅ Подключение к PostgreSQL установлено');
     
     // Создание таблиц
-    await createTables();
+    await createTables(client);
+    
+    // Освобождаем клиента обратно в пул
+    client.release();
     
   } catch (error) {
     console.error('❌ Ошибка подключения к PostgreSQL:', error);
@@ -23,7 +30,7 @@ async function connectDB() {
 }
 
 // Функция для создания таблиц
-async function createTables() {
+async function createTables(client) {
   try {
     const queries = [
       // Таблица пользователей
@@ -141,30 +148,41 @@ async function createTables() {
     
   } catch (error) {
     console.error('❌ Ошибка создания таблиц:', error);
+    throw error;
   }
 }
 
 // Вспомогательные функции для работы с БД
 const db = {
   // Выполнить запрос с параметрами
-  query: (text, params) => client.query(text, params),
+  query: (text, params) => pool.query(text, params),
   
   // Получить одну запись
   get: async (text, params) => {
-    const result = await client.query(text, params);
+    const result = await pool.query(text, params);
     return result.rows[0];
   },
   
   // Получить все записи
   all: async (text, params) => {
-    const result = await client.query(text, params);
+    const result = await pool.query(text, params);
     return result.rows;
   },
   
   // Выполнить запрос без возврата данных
   run: async (text, params) => {
-    await client.query(text, params);
-  }
+    await pool.query(text, params);
+  },
+  
+  // Получить клиента из пула (для транзакций)
+  getClient: () => pool.connect()
 };
 
-module.exports = { client, connectDB, db };
+// Graceful shutdown
+process.on('SIGINT', async () => {
+  console.log('\n🛑 Остановка пула соединений...');
+  await pool.end();
+  process.exit(0);
+});
+
+module.exports = { initializeDB, db, pool };
