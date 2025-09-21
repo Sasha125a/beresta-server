@@ -30,7 +30,7 @@
     "ffmpeg-static": "^5.2.0",
     "ffprobe-static": "^3.1.0",
     "agora-access-token": "^2.0.4",
-    "socket.io": "^4.7.2"
+    "socket.io": "^4.7.2",
     "pg": "^8.11.3",
     "dotenv": "^16.3.1"
   },
@@ -50,4 +50,5 @@
   },
   "homepage": "https://github.com/your-username/beresta-server#readme"
 }
+
 
