@@ -1,37 +1,59 @@
 const { Pool } = require('pg');
 require('dotenv').config();
 
-// Используем Pool вместо Client для управления соединениями
+// Функция для проверки и корректировки строки подключения
+function getCorrectedConnectionString() {
+  let connectionString = process.env.DATABASE_URL;
+  
+  if (!connectionString) {
+    throw new Error('DATABASE_URL не установлен в переменных окружения');
+  }
+
+  console.log('🔗 Исходная строка подключения:', connectionString);
+  
+  return connectionString;
+}
+
+// Создаем пул соединений
 const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false,
-  max: 20, // максимальное количество клиентов в пуле
-  idleTimeoutMillis: 30000, // закрыть соединения после 30 секунд бездействия
-  connectionTimeoutMillis: 2000, // таймаут подключения 2 секунды
+  connectionString: getCorrectedConnectionString(),
+  ssl: {
+    rejectUnauthorized: false
+  },
+  // Явно указываем использовать IPv4
+  family: 4,
+  // Таймауты
+  connectionTimeoutMillis: 10000,
+  idleTimeoutMillis: 30000,
+  max: 10
 });
 
-// Функция для подключения к БД и создания таблиц
-async function initializeDB() {
+// Функция для проверки подключения
+async function checkConnection() {
+  let client;
   try {
-    // Проверяем подключение
-    const client = await pool.connect();
+    client = await pool.connect();
+    const result = await client.query('SELECT NOW() as current_time, version() as db_version');
     console.log('✅ Подключение к PostgreSQL установлено');
-    
-    // Создание таблиц
-    await createTables(client);
-    
-    // Освобождаем клиента обратно в пул
-    client.release();
-    
+    console.log('🕒 Время базы данных:', result.rows[0].current_time);
+    console.log('🐘 Версия PostgreSQL:', result.rows[0].db_version);
+    return true;
   } catch (error) {
-    console.error('❌ Ошибка подключения к PostgreSQL:', error);
-    process.exit(1);
+    console.error('❌ Ошибка подключения к PostgreSQL:', error.message);
+    console.log('🔍 Код ошибки:', error.code);
+    return false;
+  } finally {
+    if (client) client.release();
   }
 }
 
 // Функция для создания таблиц
-async function createTables(client) {
+async function createTables() {
+  const client = await pool.connect();
+  
   try {
+    console.log('🔄 Создание/проверка таблиц...');
+
     const queries = [
       // Таблица пользователей
       `CREATE TABLE IF NOT EXISTS users (
@@ -132,30 +154,92 @@ async function createTables(client) {
         ended_at TIMESTAMP
       )`,
 
-      // Индексы
+      // Индексы для оптимизации
       `CREATE INDEX IF NOT EXISTS idx_messages_conversation ON messages(sender_email, receiver_email)`,
       `CREATE INDEX IF NOT EXISTS idx_messages_timestamp ON messages(timestamp)`,
       `CREATE INDEX IF NOT EXISTS idx_messages_downloads ON messages(downloaded_by_sender, downloaded_by_receiver)`,
-      `CREATE INDEX IF NOT EXISTS idx_group_messages ON group_messages(group_id, timestamp)`,
-      `CREATE INDEX IF NOT EXISTS idx_group_members ON group_members(group_id, user_email)`
+      `CREATE INDEX IF NOT EXISTS idx_group_messages_group ON group_messages(group_id)`,
+      `CREATE INDEX IF NOT EXISTS idx_group_messages_time ON group_messages(timestamp)`,
+      `CREATE INDEX IF NOT EXISTS idx_group_members_group ON group_members(group_id)`,
+      `CREATE INDEX IF NOT EXISTS idx_group_members_user ON group_members(user_email)`,
+      `CREATE INDEX IF NOT EXISTS idx_users_email ON users(email)`,
+      `CREATE INDEX IF NOT EXISTS idx_friends_user ON friends(user_email)`,
+      `CREATE INDEX IF NOT EXISTS idx_friends_friend ON friends(friend_email)`,
+      `CREATE INDEX IF NOT EXISTS idx_calls_caller ON calls(caller_email)`,
+      `CREATE INDEX IF NOT EXISTS idx_calls_receiver ON calls(receiver_email)`,
+      `CREATE INDEX IF NOT EXISTS idx_agora_calls_caller ON agora_calls(caller_email)`,
+      `CREATE INDEX IF NOT EXISTS idx_agora_calls_receiver ON agora_calls(receiver_email)`
     ];
 
     for (const query of queries) {
-      await client.query(query);
+      try {
+        await client.query(query);
+        const tableName = query.match(/CREATE TABLE IF NOT EXISTS (\w+)/);
+        if (tableName) {
+          console.log(`✅ Таблица: ${tableName[1]}`);
+        }
+      } catch (tableError) {
+        console.error('❌ Ошибка создания таблицы:', tableError.message);
+      }
     }
     
     console.log('✅ Все таблицы созданы/проверены');
     
   } catch (error) {
     console.error('❌ Ошибка создания таблиц:', error);
-    throw error;
+  } finally {
+    client.release();
   }
+}
+
+// Функция для инициализации БД
+async function initializeDB() {
+  console.log('🔄 Инициализация базы данных...');
+  
+  if (!process.env.DATABASE_URL) {
+    console.error('❌ Ошибка: DATABASE_URL не установлен в переменных окружения');
+    console.log('💡 Добавьте в Render Environment:');
+    console.log('DATABASE_URL=postgresql://postgres:Sasha256orlov@aws-0-eu-west-1.pooler.supabase.com:6543/postgres');
+    process.exit(1);
+  }
+
+  // Проверяем подключение с повторными попытками
+  let connected = false;
+  let attempts = 0;
+  const maxAttempts = 3;
+
+  while (!connected && attempts < maxAttempts) {
+    attempts++;
+    console.log(`🔄 Попытка подключения ${attempts}/${maxAttempts}...`);
+    
+    connected = await checkConnection();
+    
+    if (!connected && attempts < maxAttempts) {
+      console.log('⏳ Повторная попытка через 2 секунды...');
+      await new Promise(resolve => setTimeout(resolve, 2000));
+    }
+  }
+
+  if (!connected) {
+    console.error('❌ Не удалось подключиться к базе данных после всех попыток');
+    console.log('🔍 Проверьте:');
+    console.log('1. Правильность строки подключения в Render Environment');
+    console.log('2. Что база данных Supabase активна');
+    console.log('3. Настройки firewall в Supabase');
+    process.exit(1);
+  }
+
+  // Создаем таблицы
+  await createTables();
 }
 
 // Вспомогательные функции для работы с БД
 const db = {
   // Выполнить запрос с параметрами
-  query: (text, params) => pool.query(text, params),
+  query: (text, params) => {
+    console.log('📊 SQL Query:', text.substring(0, 100) + (text.length > 100 ? '...' : ''));
+    return pool.query(text, params);
+  },
   
   // Получить одну запись
   get: async (text, params) => {
@@ -175,13 +259,36 @@ const db = {
   },
   
   // Получить клиента из пула (для транзакций)
-  getClient: () => pool.connect()
+  getClient: () => pool.connect(),
+  
+  // Проверить соединение
+  checkHealth: async () => {
+    try {
+      const result = await pool.query('SELECT 1 as health_check');
+      return result.rows[0].health_check === 1;
+    } catch (error) {
+      return false;
+    }
+  }
 };
+
+// Обработка ошибок пула
+pool.on('error', (err) => {
+  console.error('❌ Неожиданная ошибка пула соединений:', err);
+});
 
 // Graceful shutdown
 process.on('SIGINT', async () => {
   console.log('\n🛑 Остановка пула соединений...');
   await pool.end();
+  console.log('✅ Пул соединений остановлен');
+  process.exit(0);
+});
+
+process.on('SIGTERM', async () => {
+  console.log('\n🛑 Получен сигнал завершения...');
+  await pool.end();
+  console.log('✅ Пул соединений остановлен');
   process.exit(0);
 });
 
