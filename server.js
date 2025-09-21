@@ -14,7 +14,7 @@ const activeCalls = new Map();
 const Agora = require('agora-access-token');
 const http = require('http');
 const socketIo = require('socket.io');
-const { client, connectDB } = require('./database');
+const { initializeDB, db } = require('./database');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -2066,20 +2066,20 @@ app.use((req, res) => {
     res.status(404).json({ success: false, error: 'Endpoint not found' });
 });
 
-// НА это:
+// НА ЭТО:
 async function startServer() {
-    try {
-        await connectDB();
-        
-        server.listen(PORT, () => {
-            console.log(`🚀 Сервер запущен на порту ${PORT}`);
-            console.log(`📡 WebSocket сервер активен`);
-        });
-        
-    } catch (error) {
-        console.error('❌ Не удалось запустить сервер:', error);
-        process.exit(1);
-    }
+  try {
+    await initializeDB();
+    
+    server.listen(PORT, () => {
+      console.log(`🚀 Сервер запущен на порту ${PORT}`);
+      console.log(`📡 WebSocket сервер активен`);
+    });
+    
+  } catch (error) {
+    console.error('❌ Не удалось запустить сервер:', error);
+    process.exit(1);
+  }
 }
 
 startServer();
