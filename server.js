@@ -304,6 +304,24 @@ function generateSafeChannelName(baseName) {
     return safeName;
 }
 
+// Запуск сервера
+async function startServer() {
+  try {
+    await connectDB();
+    
+    server.listen(PORT, () => {
+      console.log(`🚀 Сервер запущен на порту ${PORT}`);
+      console.log(`📡 WebSocket сервер активен`);
+    });
+    
+  } catch (error) {
+    console.error('❌ Не удалось запустить сервер:', error);
+    process.exit(1);
+  }
+}
+
+startServer();
+
 // Health check
 app.get('/health', (req, res) => {
     db.get("SELECT 1 as test", [], (err) => {
