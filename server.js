@@ -2123,6 +2123,7 @@ app.post('/send-call-notification', (req, res) => {
   }
 });
 
+// server.js - ИСПРАВЛЕННАЯ ВЕРСИЯ
 io.on('connection', (socket) => {
   console.log('✅ Пользователь подключился:', socket.id);
 
@@ -2134,24 +2135,29 @@ io.on('connection', (socket) => {
   socket.on('call_notification', (data) => {
     const receiverSocketId = activeUsers.get(data.receiverEmail);
     if (receiverSocketId) {
-      // Должно быть:
+      // ИСПРАВЛЕНО: Правильное имя события
       io.to(receiverSocketId).emit('AGORA_INCOMING_CALL', {
         channelName: data.channelName,
         callerEmail: data.callerEmail,
         callType: data.callType
       });
+      console.log(`📞 Уведомление о звонке отправлено: ${data.channelName} -> ${data.receiverEmail}`);
+    } else {
+      console.log(`⚠️  Пользователь не в сети: ${data.receiverEmail}`);
     }
   });
 
   socket.on('end_call', (data) => {
     const receiverSocketId = activeUsers.get(data.receiverEmail);
     if (receiverSocketId) {
-      io.to(receiverSocketId).emit('call_ended', data.channelName);
+      // ИСПРАВЛЕНО: Правильное имя события
+      io.to(receiverSocketId).emit('AGORA_CALL_ENDED', {
+        channelName: data.channelName
+      });
     }
   });
 
   socket.on('disconnect', () => {
-    // Удаляем пользователя из активных
     for (let [email, socketId] of activeUsers.entries()) {
       if (socketId === socket.id) {
         activeUsers.delete(email);
