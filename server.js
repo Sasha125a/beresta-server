@@ -2134,7 +2134,8 @@ io.on('connection', (socket) => {
   socket.on('call_notification', (data) => {
     const receiverSocketId = activeUsers.get(data.receiverEmail);
     if (receiverSocketId) {
-      io.to(receiverSocketId).emit('incoming_call', {
+      // Должно быть:
+      io.to(receiverSocketId).emit('AGORA_INCOMING_CALL', {
         channelName: data.channelName,
         callerEmail: data.callerEmail,
         callType: data.callType
