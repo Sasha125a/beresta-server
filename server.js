@@ -304,22 +304,6 @@ function generateSafeChannelName(baseName) {
     return safeName;
 }
 
-// Запуск сервера
-async function startServer() {
-  try {
-    await connectDB();
-    
-    server.listen(PORT, () => {
-      console.log(`🚀 Сервер запущен на порту ${PORT}`);
-      console.log(`📡 WebSocket сервер активен`);
-    });
-    
-  } catch (error) {
-    console.error('❌ Не удалось запустить сервер:', error);
-    process.exit(1);
-  }
-}
-
 startServer();
 
 // Health check
@@ -2084,12 +2068,23 @@ app.use((req, res) => {
     res.status(404).json({ success: false, error: 'Endpoint not found' });
 });
 
-// Запуск сервера
-// Замените app.listen на server.listen
-server.listen(PORT, () => {
-  console.log(`🚀 Сервер запущен на порту ${PORT}`);
-  console.log(`📡 WebSocket сервер активен`);
-});
+// НА это:
+async function startServer() {
+    try {
+        await connectDB();
+        
+        server.listen(PORT, () => {
+            console.log(`🚀 Сервер запущен на порту ${PORT}`);
+            console.log(`📡 WebSocket сервер активен`);
+        });
+        
+    } catch (error) {
+        console.error('❌ Не удалось запустить сервер:', error);
+        process.exit(1);
+    }
+}
+
+startServer();
 
 // Graceful shutdown
 process.on('SIGINT', () => {
