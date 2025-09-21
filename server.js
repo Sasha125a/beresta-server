@@ -444,8 +444,8 @@ app.get('/health', (req, res) => {
     });
 });
 
-// Регистрация пользователя
-app.post('/register', (req, res) => {
+// Регистрация пользователя (PostgreSQL версия)
+app.post('/register', async (req, res) => {
     try {
         const { email, firstName, lastName } = req.body;
 
@@ -456,34 +456,31 @@ app.post('/register', (req, res) => {
             });
         }
 
-        db.get("SELECT id FROM users WHERE email = ?", [email.toLowerCase()], (err, row) => {
-            if (err) {
-                return res.status(500).json({ success: false, error: 'Database error' });
-            }
+        // Проверяем существование пользователя
+        const checkResult = await client.query(
+            "SELECT id FROM users WHERE email = $1",
+            [email.toLowerCase()]
+        );
 
-            if (row) {
-                return res.status(409).json({ 
-                    success: false, 
-                    error: 'Пользователь уже существует' 
-                });
-            }
+        if (checkResult.rows.length > 0) {
+            return res.status(409).json({ 
+                success: false, 
+                error: 'Пользователь уже существует' 
+            });
+        }
 
-            db.run(
-                "INSERT INTO users (email, first_name, last_name) VALUES (?, ?, ?)",
-                [email.toLowerCase(), firstName, lastName],
-                function(err) {
-                    if (err) {
-                        return res.status(500).json({ success: false, error: 'Database error' });
-                    }
+        // Создаем пользователя
+        const result = await client.query(
+            "INSERT INTO users (email, first_name, last_name) VALUES ($1, $2, $3) RETURNING *",
+            [email.toLowerCase(), firstName, lastName]
+        );
 
-                    res.json({
-                        success: true,
-                        message: 'Пользователь успешно зарегистрирован',
-                        userId: this.lastID
-                    });
-                }
-            );
+        res.json({
+            success: true,
+            message: 'Пользователь успешно зарегистрирован',
+            userId: result.rows[0].id
         });
+
     } catch (error) {
         console.error('❌ Ошибка регистрации:', error);
         res.status(500).json({ success: false, error: 'Internal server error' });
