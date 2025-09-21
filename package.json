@@ -33,7 +33,7 @@
     "fluent-ffmpeg": "^2.1.2",
     "ffmpeg-static": "^5.1.0",
     "ffprobe-static": "^3.1.0",
-    "agora-access-token": "^2.0.4"
+    "agora-access-token": "^2.0.4",
     "socket.io": "^4.7.2"
   },
   "devDependencies": {
@@ -69,4 +69,5 @@
     "arm64"
   ]
 }
+
 
