@@ -80,15 +80,7 @@ const upload = multer({
     }
 });
 
-// Инициализация базы данных
-const dbPath = process.env.DB_PATH || path.join(__dirname, 'beresta.db');
-const db = new sqlite3.Database(dbPath, (err) => {
-    if (err) {
-        console.error('❌ Ошибка подключения к БД:', err.message);
-    } else {
-        console.log('✅ Подключение к SQLite базе данных установлено');
-    }
-});
+const { client, connectDB } = require('./database');
 
 db.run("PRAGMA foreign_keys = ON");
 
