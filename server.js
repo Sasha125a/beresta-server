@@ -338,7 +338,6 @@ app.get('/health', (req, res) => {
     });
 });
 
-// Регистрация пользователя (PostgreSQL версия)
 app.post('/register', async (req, res) => {
     try {
         const { email, firstName, lastName } = req.body;
@@ -351,12 +350,12 @@ app.post('/register', async (req, res) => {
         }
 
         // Проверяем существование пользователя
-        const checkResult = await client.query(
-            "SELECT id FROM users WHERE email = $1",
+        const existingUser = await db.get(
+            "SELECT id FROM users WHERE email = $1", 
             [email.toLowerCase()]
         );
 
-        if (checkResult.rows.length > 0) {
+        if (existingUser) {
             return res.status(409).json({ 
                 success: false, 
                 error: 'Пользователь уже существует' 
@@ -364,7 +363,7 @@ app.post('/register', async (req, res) => {
         }
 
         // Создаем пользователя
-        const result = await client.query(
+        const result = await db.query(
             "INSERT INTO users (email, first_name, last_name) VALUES ($1, $2, $3) RETURNING *",
             [email.toLowerCase(), firstName, lastName]
         );
@@ -381,20 +380,16 @@ app.post('/register', async (req, res) => {
     }
 });
 
-// Получение списка пользователей
-app.get('/users', (req, res) => {
+app.get('/users', async (req, res) => {
     try {
-        db.all("SELECT email, first_name as firstName, last_name as lastName FROM users ORDER BY first_name, last_name", 
-        [], 
-        (err, rows) => {
-            if (err) {
-                return res.status(500).json({ success: false, error: 'Database error' });
-            }
+        const rows = await db.all(
+            "SELECT email, first_name as firstName, last_name as lastName FROM users ORDER BY first_name, last_name", 
+            []
+        );
 
-            res.json({
-                success: true,
-                users: rows
-            });
+        res.json({
+            success: true,
+            users: rows
         });
     } catch (error) {
         console.error('❌ Ошибка получения пользователей:', error);
@@ -569,8 +564,7 @@ app.get('/messages/:userEmail/:friendEmail', (req, res) => {
     );
 });
 
-// Отправка сообщения
-app.post('/send-message', (req, res) => {
+app.post('/send-message', async (req, res) => {
     try {
         const { senderEmail, receiverEmail, message, duration } = req.body;
 
@@ -578,24 +572,20 @@ app.post('/send-message', (req, res) => {
             return res.status(400).json({ success: false, error: 'Email обязательны' });
         }
 
-        db.run(
+        const result = await db.query(
             `INSERT INTO messages (sender_email, receiver_email, message, duration) 
-             VALUES (?, ?, ?, ?)`,
-            [senderEmail.toLowerCase(), receiverEmail.toLowerCase(), message || '', duration || 0],
-            function(err) {
-                if (err) {
-                    return res.status(500).json({ success: false, error: 'Database error' });
-                }
-
-                res.json({
-                    success: true,
-                    messageId: this.lastID
-                });
-
-                // Автоматически добавляем в чаты если это новый диалог
-                addToChatsAutomatically(senderEmail, receiverEmail, () => {});
-            }
+             VALUES ($1, $2, $3, $4) RETURNING *`,
+            [senderEmail.toLowerCase(), receiverEmail.toLowerCase(), message || '', duration || 0]
         );
+
+        res.json({
+            success: true,
+            messageId: result.rows[0].id
+        });
+
+        // Автоматически добавляем в чаты если это новый диалог
+        addToChatsAutomatically(senderEmail, receiverEmail, () => {});
+
     } catch (error) {
         console.error('❌ Ошибка отправки сообщения:', error);
         res.status(500).json({ success: false, error: 'Internal server error' });
