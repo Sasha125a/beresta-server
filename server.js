@@ -81,8 +81,6 @@ const upload = multer({
     }
 });
 
-db.run("PRAGMA foreign_keys = ON");
-
 // Функция для определения типа файла
 function getFileType(mimetype, filename) {
     if (mimetype.startsWith('image/')) return 'image';
