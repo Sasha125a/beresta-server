@@ -15,6 +15,9 @@ const Agora = require('agora-access-token');
 const http = require('http');
 const socketIo = require('socket.io');
 
+const app = express();
+const PORT = process.env.PORT || 3000;
+
 const server = http.createServer(app);
 const io = socketIo(server, {
   cors: {
@@ -29,9 +32,6 @@ const activeUsers = new Map();
 // Устанавливаем пути к ffmpeg
 ffmpeg.setFfmpegPath(ffmpegPath);
 ffmpeg.setFfprobePath(ffprobePath);
-
-const app = express();
-const PORT = process.env.PORT || 3000;
 
 // Middleware
 app.use(cors({
