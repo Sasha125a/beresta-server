@@ -14,6 +14,7 @@ const activeCalls = new Map();
 const Agora = require('agora-access-token');
 const http = require('http');
 const socketIo = require('socket.io');
+const { client, connectDB } = require('./database');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -79,8 +80,6 @@ const upload = multer({
         cb(null, true);
     }
 });
-
-const { client, connectDB } = require('./database');
 
 db.run("PRAGMA foreign_keys = ON");
 
