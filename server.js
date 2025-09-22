@@ -1,7 +1,7 @@
 const express = require('express');
 const cors = require('cors');
 const bodyParser = require('body-parser');
-const sqlite3 = require('sqlite3').verbose();
+const { Pool } = require('pg');
 const path = require('path');
 const fs = require('fs');
 const multer = require('multer');
@@ -18,6 +18,21 @@ const fileStorage = require('./fileStorage'); // ИЗМЕНЕНО: переим�
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+
+// ✅ ПОДКЛЮЧЕНИЕ К POSTGRESQL (вместо SQLite)
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: { rejectUnauthorized: false }
+});
+
+// Проверка подключения
+pool.query('SELECT NOW()', (err, res) => {
+  if (err) {
+    console.error('❌ Ошибка подключения к PostgreSQL:', err);
+  } else {
+    console.log('✅ Подключение к PostgreSQL установлено:', res.rows[0]);
+  }
+});
 
 const server = http.createServer(app);
 const io = socketIo(server, {
