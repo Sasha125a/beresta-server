@@ -59,7 +59,7 @@ const thumbnailsDir = path.join(uploadDir, 'thumbnails');
     }
 });
 
-const multerStorage = multer.diskStorage({ // ИЗМЕНЕНО: переименовано
+const multerStorage = multer.diskStorage({
     destination: (req, file, cb) => {
         cb(null, tempDir);
     },
@@ -71,7 +71,7 @@ const multerStorage = multer.diskStorage({ // ИЗМЕНЕНО: переимен
 });
 
 const upload = multer({
-    storage: multerStorage, // ИЗМЕНЕНО: используем переименованную переменную
+    storage: multerStorage,
     limits: {
         fileSize: 100 * 1024 * 1024,
         fieldSize: 50 * 1024 * 1024
@@ -81,149 +81,139 @@ const upload = multer({
     }
 });
 
-// Функция для создания таблиц
-async function createTables() {
-  const client = await pool.connect();
-  
-  try {
+// 🔴 ЗАМЕНИТЬ: Настройка SQLite базы данных (вместо PostgreSQL)
+const dbPath = process.env.DB_PATH || path.join(__dirname, 'data', 'chat.db');
+const dataDir = path.dirname(dbPath);
+
+// Создаем папку для базы данных если не существует
+if (!fs.existsSync(dataDir)) {
+    fs.mkdirSync(dataDir, { recursive: true });
+}
+
+// Инициализация SQLite базы данных
+const db = new sqlite3.Database(dbPath, (err) => {
+    if (err) {
+        console.error('❌ Ошибка подключения к БД:', err.message);
+    } else {
+        console.log('✅ Подключение к SQLite базе данных установлено');
+        createTables();
+    }
+});
+
+// 🔴 ЗАМЕНИТЬ: Функция для создания таблиц с SQLite синтаксисом
+function createTables() {
     console.log('🔄 Создание/проверка таблиц...');
 
     const queries = [
-      // Таблица пользователей
-      `CREATE TABLE IF NOT EXISTS users (
-        id SERIAL PRIMARY KEY,
-        email TEXT UNIQUE NOT NULL,
-        first_name TEXT NOT NULL,
-        last_name TEXT NOT NULL,
-        avatar_filename TEXT DEFAULT '',
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-      )`,
+        // Таблица пользователей
+        `CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            email TEXT UNIQUE NOT NULL,
+            first_name TEXT NOT NULL,
+            last_name TEXT NOT NULL,
+            avatar_filename TEXT DEFAULT '',
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )`,
 
-      // Таблица друзей
-      `CREATE TABLE IF NOT EXISTS friends (
-        id SERIAL PRIMARY KEY,
-        user_email TEXT NOT NULL,
-        friend_email TEXT NOT NULL,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        UNIQUE(user_email, friend_email)
-      )`,
+        // Таблица друзей
+        `CREATE TABLE IF NOT EXISTS friends (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_email TEXT NOT NULL,
+            friend_email TEXT NOT NULL,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(user_email, friend_email)
+        )`,
 
-      // Таблица сообщений
-      `CREATE TABLE IF NOT EXISTS messages (
-        id SERIAL PRIMARY KEY,
-        sender_email TEXT NOT NULL,
-        receiver_email TEXT NOT NULL,
-        message TEXT DEFAULT '',
-        attachment_type TEXT DEFAULT '',
-        attachment_filename TEXT DEFAULT '',
-        attachment_original_name TEXT DEFAULT '',
-        attachment_mime_type TEXT DEFAULT '',
-        attachment_size INTEGER DEFAULT 0,
-        attachment_url TEXT DEFAULT '',
-        duration INTEGER DEFAULT 0,
-        thumbnail TEXT DEFAULT '',
-        timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        status TEXT DEFAULT 'sent',
-        downloaded_by_sender BOOLEAN DEFAULT FALSE,
-        downloaded_by_receiver BOOLEAN DEFAULT FALSE
-      )`,
+        // Таблица сообщений
+        `CREATE TABLE IF NOT EXISTS messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            sender_email TEXT NOT NULL,
+            receiver_email TEXT NOT NULL,
+            message TEXT DEFAULT '',
+            attachment_type TEXT DEFAULT '',
+            attachment_filename TEXT DEFAULT '',
+            attachment_original_name TEXT DEFAULT '',
+            attachment_mime_type TEXT DEFAULT '',
+            attachment_size INTEGER DEFAULT 0,
+            attachment_url TEXT DEFAULT '',
+            duration INTEGER DEFAULT 0,
+            thumbnail TEXT DEFAULT '',
+            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+            status TEXT DEFAULT 'sent',
+            downloaded_by_sender BOOLEAN DEFAULT FALSE,
+            downloaded_by_receiver BOOLEAN DEFAULT FALSE
+        )`,
 
-      // Таблица групп
-      `CREATE TABLE IF NOT EXISTS groups (
-        id SERIAL PRIMARY KEY,
-        name TEXT NOT NULL,
-        description TEXT DEFAULT '',
-        created_by TEXT NOT NULL,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-      )`,
+        // Таблица групп
+        `CREATE TABLE IF NOT EXISTS groups (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            description TEXT DEFAULT '',
+            created_by TEXT NOT NULL,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )`,
 
-      // Таблица участников групп
-      `CREATE TABLE IF NOT EXISTS group_members (
-        id SERIAL PRIMARY KEY,
-        group_id INTEGER NOT NULL,
-        user_email TEXT NOT NULL,
-        role TEXT DEFAULT 'member',
-        joined_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        UNIQUE(group_id, user_email)
-      )`,
+        // Таблица участников групп
+        `CREATE TABLE IF NOT EXISTS group_members (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            group_id INTEGER NOT NULL,
+            user_email TEXT NOT NULL,
+            role TEXT DEFAULT 'member',
+            joined_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(group_id, user_email)
+        )`,
 
-      // Таблица групповых сообщений
-      `CREATE TABLE IF NOT EXISTS group_messages (
-        id SERIAL PRIMARY KEY,
-        group_id INTEGER NOT NULL,
-        sender_email TEXT NOT NULL,
-        message TEXT DEFAULT '',
-        attachment_type TEXT DEFAULT '',
-        attachment_filename TEXT DEFAULT '',
-        attachment_original_name TEXT DEFAULT '',
-        attachment_mime_type TEXT DEFAULT '',
-        attachment_size INTEGER DEFAULT 0,
-        duration INTEGER DEFAULT 0,
-        thumbnail TEXT DEFAULT '',
-        timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-      )`,
+        // Таблица групповых сообщений
+        `CREATE TABLE IF NOT EXISTS group_messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            group_id INTEGER NOT NULL,
+            sender_email TEXT NOT NULL,
+            message TEXT DEFAULT '',
+            attachment_type TEXT DEFAULT '',
+            attachment_filename TEXT DEFAULT '',
+            attachment_original_name TEXT DEFAULT '',
+            attachment_mime_type TEXT DEFAULT '',
+            attachment_size INTEGER DEFAULT 0,
+            duration INTEGER DEFAULT 0,
+            thumbnail TEXT DEFAULT '',
+            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+        )`,
 
-      // Таблица звонков
-      `CREATE TABLE IF NOT EXISTS calls (
-        id SERIAL PRIMARY KEY,
-        call_id TEXT UNIQUE NOT NULL,
-        caller_email TEXT NOT NULL,
-        receiver_email TEXT NOT NULL,
-        call_type TEXT DEFAULT 'audio',
-        status TEXT DEFAULT 'ended',
-        duration INTEGER DEFAULT 0,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        ended_at TIMESTAMP
-      )`,
+        // Таблица звонков
+        `CREATE TABLE IF NOT EXISTS calls (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            call_id TEXT UNIQUE NOT NULL,
+            caller_email TEXT NOT NULL,
+            receiver_email TEXT NOT NULL,
+            call_type TEXT DEFAULT 'audio',
+            status TEXT DEFAULT 'ended',
+            duration INTEGER DEFAULT 0,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            ended_at DATETIME
+        )`,
 
-      // Таблица Agora звонков
-      `CREATE TABLE IF NOT EXISTS agora_calls (
-        id SERIAL PRIMARY KEY,
-        channel_name TEXT UNIQUE NOT NULL,
-        caller_email TEXT NOT NULL,
-        receiver_email TEXT NOT NULL,
-        call_type TEXT DEFAULT 'audio',
-        status TEXT DEFAULT 'ringing',
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        ended_at TIMESTAMP
-      )`,
-
-      // Индексы для оптимизации
-      `CREATE INDEX IF NOT EXISTS idx_messages_conversation ON messages(sender_email, receiver_email)`,
-      `CREATE INDEX IF NOT EXISTS idx_messages_timestamp ON messages(timestamp)`,
-      `CREATE INDEX IF NOT EXISTS idx_messages_downloads ON messages(downloaded_by_sender, downloaded_by_receiver)`,
-      `CREATE INDEX IF NOT EXISTS idx_group_messages_group ON group_messages(group_id)`,
-      `CREATE INDEX IF NOT EXISTS idx_group_messages_time ON group_messages(timestamp)`,
-      `CREATE INDEX IF NOT EXISTS idx_group_members_group ON group_members(group_id)`,
-      `CREATE INDEX IF NOT EXISTS idx_group_members_user ON group_members(user_email)`,
-      `CREATE INDEX IF NOT EXISTS idx_users_email ON users(email)`,
-      `CREATE INDEX IF NOT EXISTS idx_friends_user ON friends(user_email)`,
-      `CREATE INDEX IF NOT EXISTS idx_friends_friend ON friends(friend_email)`,
-      `CREATE INDEX IF NOT EXISTS idx_calls_caller ON calls(caller_email)`,
-      `CREATE INDEX IF NOT EXISTS idx_calls_receiver ON calls(receiver_email)`,
-      `CREATE INDEX IF NOT EXISTS idx_agora_calls_caller ON agora_calls(caller_email)`,
-      `CREATE INDEX IF NOT EXISTS idx_agora_calls_receiver ON agora_calls(receiver_email)`
+        // Таблица Agora звонков
+        `CREATE TABLE IF NOT EXISTS agora_calls (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            channel_name TEXT UNIQUE NOT NULL,
+            caller_email TEXT NOT NULL,
+            receiver_email TEXT NOT NULL,
+            call_type TEXT DEFAULT 'audio',
+            status TEXT DEFAULT 'ringing',
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            ended_at DATETIME
+        )`
     ];
 
-    for (const query of queries) {
-      try {
-        await client.query(query);
-        const tableName = query.match(/CREATE TABLE IF NOT EXISTS (\w+)/);
-        if (tableName) {
-          console.log(`✅ Таблица: ${tableName[1]}`);
-        }
-      } catch (tableError) {
-        console.error('❌ Ошибка создания таблицы:', tableError.message);
-      }
-    }
-    
-    console.log('✅ Все таблицы созданы/проверены');
-    
-  } catch (error) {
-    console.error('❌ Ошибка создания таблиц:', error);
-  } finally {
-    client.release();
-  }
+    queries.forEach((query, index) => {
+        db.run(query, (err) => {
+            if (err) {
+                console.error(`❌ Ошибка создания таблицы ${index + 1}:`, err.message);
+            } else {
+                console.log(`✅ Таблица ${index + 1} создана/проверена`);
+            }
+        });
+    });
 }
 
 // Функция для определения типа файла
@@ -463,7 +453,7 @@ app.get('/health', (req, res) => {
     });
 });
 
-app.post('/register', async (req, res) => {
+app.post('/register', (req, res) => {
     try {
         const { email, firstName, lastName } = req.body;
 
@@ -475,29 +465,41 @@ app.post('/register', async (req, res) => {
         }
 
         // Проверяем существование пользователя
-        const existingUser = await db.get(
-            "SELECT id FROM users WHERE email = $1", 
-            [email.toLowerCase()]
+        db.get(
+            "SELECT id FROM users WHERE email = ?", 
+            [email.toLowerCase()],
+            (err, existingUser) => {
+                if (err) {
+                    console.error('❌ Ошибка проверки пользователя:', err);
+                    return res.status(500).json({ success: false, error: 'Database error' });
+                }
+
+                if (existingUser) {
+                    return res.status(409).json({ 
+                        success: false, 
+                        error: 'Пользователь уже существует' 
+                    });
+                }
+
+                // Создаем пользователя (SQLite синтаксис)
+                db.run(
+                    "INSERT INTO users (email, first_name, last_name) VALUES (?, ?, ?)",
+                    [email.toLowerCase(), firstName, lastName],
+                    function(err) {
+                        if (err) {
+                            console.error('❌ Ошибка регистрации:', err);
+                            return res.status(500).json({ success: false, error: 'Database error' });
+                        }
+
+                        res.json({
+                            success: true,
+                            message: 'Пользователь успешно зарегистрирован',
+                            userId: this.lastID
+                        });
+                    }
+                );
+            }
         );
-
-        if (existingUser) {
-            return res.status(409).json({ 
-                success: false, 
-                error: 'Пользователь уже существует' 
-            });
-        }
-
-        // Создаем пользователя
-        const result = await db.query(
-            "INSERT INTO users (email, first_name, last_name) VALUES ($1, $2, $3) RETURNING *",
-            [email.toLowerCase(), firstName, lastName]
-        );
-
-        res.json({
-            success: true,
-            message: 'Пользователь успешно зарегистрирован',
-            userId: result.rows[0].id
-        });
 
     } catch (error) {
         console.error('❌ Ошибка регистрации:', error);
