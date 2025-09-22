@@ -1073,28 +1073,24 @@ app.post('/create-group', (req, res) => {
 });
 
 // Получение списка групп пользователя
-app.get('/groups/:userEmail', (req, res) => {
+app.get('/groups/:userEmail', async (req, res) => {
     try {
         const userEmail = req.params.userEmail.toLowerCase();
 
-        db.all(`
+        const result = await pool.query(`
             SELECT g.id, g.name, g.description, g.created_by, g.created_at,
                    gm.role, COUNT(gm2.user_email) as member_count
             FROM groups g
             JOIN group_members gm ON g.id = gm.group_id
             LEFT JOIN group_members gm2 ON g.id = gm2.group_id
-            WHERE gm.user_email = ?
+            WHERE gm.user_email = $1
             GROUP BY g.id, g.name, g.description, g.created_by, g.created_at, gm.role
             ORDER BY g.name
-        `, [userEmail], (err, rows) => {
-            if (err) {
-                return res.status(500).json({ success: false, error: 'Database error' });
-            }
+        `, [userEmail]);
 
-            res.json({
-                success: true,
-                groups: rows
-            });
+        res.json({
+            success: true,
+            groups: result.rows
         });
     } catch (error) {
         console.error('❌ Ошибка получения групп:', error);
@@ -1530,26 +1526,23 @@ app.post('/send-message-with-attachment', (req, res) => {
 });
 
 // Эндпоинт для получения информации о пользователе
-app.get('/user/:email', (req, res) => {
+app.get('/user/:email', async (req, res) => {
     try {
         const email = decodeURIComponent(req.params.email).toLowerCase();
 
-        db.get(`SELECT email, first_name as firstName, last_name as lastName, 
-                avatar_filename as avatarFilename FROM users WHERE email = ?`, 
-        [email], (err, row) => {
-            if (err) {
-                console.error('❌ Ошибка БД при получении пользователя:', err);
-                return res.status(500).json({ success: false, error: 'Database error' });
-            }
+        const result = await pool.query(
+            `SELECT email, first_name as "firstName", last_name as "lastName", 
+             avatar_filename as "avatarFilename" FROM users WHERE email = $1`, 
+            [email]
+        );
 
-            if (!row) {
-                return res.status(404).json({ success: false, error: 'Пользователь не найден' });
-            }
+        if (result.rows.length === 0) {
+            return res.status(404).json({ success: false, error: 'Пользователь не найден' });
+        }
 
-            res.json({
-                success: true,
-                user: row
-            });
+        res.json({
+            success: true,
+            user: result.rows[0]
         });
     } catch (error) {
         console.error('❌ Ошибка получения пользователя:', error);
