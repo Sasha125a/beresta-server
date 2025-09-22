@@ -14,6 +14,7 @@ const activeCalls = new Map();
 const Agora = require('agora-access-token');
 const http = require('http');
 const socketIo = require('socket.io');
+const admin = require('firebase-admin');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -117,9 +118,33 @@ const upload = multer({
     }
 });
 
+// Инициализация Firebase Admin
+const serviceAccount = {
+  type: "service_account",
+  project_id: process.env.FIREBASE_PROJECT_ID,
+  private_key_id: process.env.FIREBASE_PRIVATE_KEY_ID,
+  private_key: process.env.FIREBASE_PRIVATE_KEY?.replace(/\\n/g, '\n'),
+  client_email: process.env.FIREBASE_CLIENT_EMAIL,
+  client_id: process.env.FIREBASE_CLIENT_ID,
+  auth_uri: "https://accounts.google.com/o/oauth2/auth",
+  token_uri: "https://oauth2.googleapis.com/token",
+  auth_provider_x509_cert_url: "https://www.googleapis.com/oauth2/v1/certs",
+  client_x509_cert_url: process.env.FIREBASE_CLIENT_CERT_URL
+};
+
+try {
+  admin.initializeApp({
+    credential: admin.credential.cert(serviceAccount)
+  });
+  console.log('✅ Firebase Admin инициализирован');
+} catch (error) {
+  console.error('❌ Ошибка инициализации Firebase:', error);
+}
+
 // Функция для создания таблиц
 async function createTables() {
   const client = await pool.connect();
+  await client.query(createPushSubscriptionsTable);
   
   try {
     console.log('🔄 Создание/проверка таблиц...');
@@ -215,6 +240,18 @@ async function createTables() {
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         ended_at TIMESTAMP
       )`,
+
+      // ДОБАВИТЬ ТАБЛИЦУ ДЛЯ FCM ТОКЕНОВ
+      const createPushSubscriptionsTable = `
+      CREATE TABLE IF NOT EXISTS fcm_tokens (
+        id SERIAL PRIMARY KEY,
+        user_email TEXT NOT NULL,
+        fcm_token TEXT NOT NULL,
+        platform TEXT DEFAULT 'android',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(user_email, fcm_token)
+      )`;
 
       // Индексы
       `CREATE INDEX IF NOT EXISTS idx_messages_conversation ON messages(sender_email, receiver_email)`,
@@ -1422,25 +1459,144 @@ app.get('/agora/active-calls/:userEmail', async (req, res) => {
     }
 });
 
-// Отправка уведомления о звонке
-app.post('/send-call-notification', (req, res) => {
-    try {
-        const { channelName, receiverEmail, callType, callerEmail } = req.body;
+// ОБНОВЛЕННЫЙ ЭНДПОИНТ ДЛЯ УВЕДОМЛЕНИЙ О ЗВОНКАХ
+app.post('/send-call-notification', async (req, res) => {
+  try {
+    const { channelName, receiverEmail, callType, callerEmail } = req.body;
 
-        const receiverSocketId = activeUsers.get(receiverEmail);
-        if (receiverSocketId) {
-            io.to(receiverSocketId).emit('incoming_call', {
-                channelName,
-                callerEmail,
-                callType
-            });
-        }
+    console.log(`📞 Отправка уведомления: ${callerEmail} -> ${receiverEmail}`);
 
-        res.json({ success: true, message: 'Уведомление отправлено' });
-    } catch (error) {
-        console.error('❌ Ошибка отправки уведомления:', error);
-        res.status(500).json({ success: false, error: 'Internal server error' });
+    // 1. WebSocket уведомление (если пользователь онлайн)
+    const receiverSocketId = activeUsers.get(receiverEmail.toLowerCase());
+    if (receiverSocketId && io.sockets.sockets.has(receiverSocketId)) {
+      io.to(receiverSocketId).emit('AGORA_INCOMING_CALL', {
+        channelName,
+        callerEmail,
+        callType,
+        timestamp: new Date().toISOString()
+      });
+      console.log(`✅ WebSocket уведомление отправлено: ${receiverEmail}`);
     }
+
+    // 2. Push уведомление (даже если пользователь оффлайн)
+    const pushSent = await sendPushNotification(
+      receiverEmail,
+      'Входящий звонок',
+      `${callerEmail} вызывает вас`,
+      {
+        type: 'incoming_call',
+        channelName: channelName,
+        callerEmail: callerEmail,
+        callType: callType,
+        timestamp: new Date().toISOString()
+      }
+    );
+
+    if (pushSent) {
+      console.log(`✅ Push-уведомление отправлено: ${receiverEmail}`);
+    }
+
+    res.json({ 
+      success: true, 
+      message: 'Уведомления отправлены',
+      websocketDelivered: !!receiverSocketId,
+      pushDelivered: pushSent
+    });
+
+  } catch (error) {
+    console.error('❌ Ошибка отправки уведомлений:', error);
+    res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+});
+
+// ЭНДПОИНТ ДЛЯ СОХРАНЕНИЯ FCM ТОКЕНА
+app.post('/save-fcm-token', async (req, res) => {
+  try {
+    const { userEmail, fcmToken, platform = 'android' } = req.body;
+
+    if (!userEmail || !fcmToken) {
+      return res.status(400).json({ success: false, error: 'Email и токен обязательны' });
+    }
+
+    await pool.query(
+      `INSERT INTO fcm_tokens (user_email, fcm_token, platform, updated_at) 
+       VALUES ($1, $2, $3, CURRENT_TIMESTAMP) 
+       ON CONFLICT (user_email, fcm_token) 
+       DO UPDATE SET updated_at = CURRENT_TIMESTAMP`,
+      [userEmail.toLowerCase(), fcmToken, platform]
+    );
+
+    res.json({ success: true, message: 'FCM токен сохранен' });
+  } catch (error) {
+    console.error('❌ Ошибка сохранения FCM токена:', error);
+    res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+});
+
+// ФУНКЦИЯ ОТПРАВКИ PUSH-УВЕДОМЛЕНИЙ
+async function sendPushNotification(userEmail, title, body, data = {}) {
+  try {
+    const result = await pool.query(
+      'SELECT fcm_token FROM fcm_tokens WHERE user_email = $1 AND updated_at > NOW() - INTERVAL \'30 days\'',
+      [userEmail.toLowerCase()]
+    );
+
+    if (result.rows.length === 0) {
+      console.log(`❌ FCM токен не найден для пользователя: ${userEmail}`);
+      return false;
+    }
+
+    const fcmToken = result.rows[0].fcm_token;
+
+    const message = {
+      token: fcmToken,
+      notification: {
+        title: title,
+        body: body
+      },
+      data: data,
+      android: {
+        priority: 'high',
+        notification: {
+          sound: 'default',
+          vibrateTimingsMillis: [0, 500, 250, 500],
+          channelId: 'calls_channel'
+        }
+      },
+      apns: {
+        payload: {
+          aps: {
+            sound: 'default',
+            badge: 1
+          }
+        }
+      }
+    };
+
+    const response = await admin.messaging().send(message);
+    console.log(`✅ Push-уведомление отправлено: ${response}`);
+    return true;
+  } catch (error) {
+    console.error('❌ Ошибка отправки push-уведомления:', error);
+    return false;
+  }
+}
+
+// ЭНДПОИНТ ДЛЯ УДАЛЕНИЯ FCM ТОКЕНА (при выходе)
+app.post('/remove-fcm-token', async (req, res) => {
+  try {
+    const { userEmail, fcmToken } = req.body;
+
+    await pool.query(
+      'DELETE FROM fcm_tokens WHERE user_email = $1 AND fcm_token = $2',
+      [userEmail.toLowerCase(), fcmToken]
+    );
+
+    res.json({ success: true, message: 'FCM токен удален' });
+  } catch (error) {
+    console.error('❌ Ошибка удаления FCM токена:', error);
+    res.status(500).json({ success: false, error: 'Internal server error' });
+  }
 });
 
 // WebSocket соединения
