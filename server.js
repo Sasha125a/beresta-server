@@ -14,25 +14,9 @@ const activeCalls = new Map();
 const Agora = require('agora-access-token');
 const http = require('http');
 const socketIo = require('socket.io');
-const fileStorage = require('./fileStorage'); // ИЗМЕНЕНО: переименовано
 
 const app = express();
 const PORT = process.env.PORT || 3000;
-
-// ✅ ПОДКЛЮЧЕНИЕ К POSTGRESQL (вместо SQLite)
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: { rejectUnauthorized: false }
-});
-
-// Проверка подключения
-pool.query('SELECT NOW()', (err, res) => {
-  if (err) {
-    console.error('❌ Ошибка подключения к PostgreSQL:', err);
-  } else {
-    console.log('✅ Подключение к PostgreSQL установлено:', res.rows[0]);
-  }
-});
 
 const server = http.createServer(app);
 const io = socketIo(server, {
@@ -40,6 +24,12 @@ const io = socketIo(server, {
     origin: "*",
     methods: ["GET", "POST"]
   }
+});
+
+// PostgreSQL подключение
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false
 });
 
 // WebSocket соединения
@@ -96,139 +86,129 @@ const upload = multer({
     }
 });
 
-// 🔴 ЗАМЕНИТЬ: Настройка SQLite базы данных (вместо PostgreSQL)
-const dbPath = process.env.DB_PATH || path.join(__dirname, 'data', 'chat.db');
-const dataDir = path.dirname(dbPath);
-
-// Создаем папку для базы данных если не существует
-if (!fs.existsSync(dataDir)) {
-    fs.mkdirSync(dataDir, { recursive: true });
-}
-
-// Инициализация SQLite базы данных
-const db = new sqlite3.Database(dbPath, (err) => {
-    if (err) {
-        console.error('❌ Ошибка подключения к БД:', err.message);
-    } else {
-        console.log('✅ Подключение к SQLite базе данных установлено');
-        createTables();
-    }
-});
-
-// 🔴 ЗАМЕНИТЬ: Функция для создания таблиц с SQLite синтаксисом
-function createTables() {
+// Функция для создания таблиц
+async function createTables() {
+  const client = await pool.connect();
+  
+  try {
     console.log('🔄 Создание/проверка таблиц...');
 
     const queries = [
-        // Таблица пользователей
-        `CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            email TEXT UNIQUE NOT NULL,
-            first_name TEXT NOT NULL,
-            last_name TEXT NOT NULL,
-            avatar_filename TEXT DEFAULT '',
-            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-        )`,
+      `CREATE TABLE IF NOT EXISTS users (
+        id SERIAL PRIMARY KEY,
+        email TEXT UNIQUE NOT NULL,
+        first_name TEXT NOT NULL,
+        last_name TEXT NOT NULL,
+        avatar_filename TEXT DEFAULT '',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )`,
 
-        // Таблица друзей
-        `CREATE TABLE IF NOT EXISTS friends (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_email TEXT NOT NULL,
-            friend_email TEXT NOT NULL,
-            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-            UNIQUE(user_email, friend_email)
-        )`,
+      `CREATE TABLE IF NOT EXISTS friends (
+        id SERIAL PRIMARY KEY,
+        user_email TEXT NOT NULL,
+        friend_email TEXT NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(user_email, friend_email)
+      )`,
 
-        // Таблица сообщений
-        `CREATE TABLE IF NOT EXISTS messages (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            sender_email TEXT NOT NULL,
-            receiver_email TEXT NOT NULL,
-            message TEXT DEFAULT '',
-            attachment_type TEXT DEFAULT '',
-            attachment_filename TEXT DEFAULT '',
-            attachment_original_name TEXT DEFAULT '',
-            attachment_mime_type TEXT DEFAULT '',
-            attachment_size INTEGER DEFAULT 0,
-            attachment_url TEXT DEFAULT '',
-            duration INTEGER DEFAULT 0,
-            thumbnail TEXT DEFAULT '',
-            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-            status TEXT DEFAULT 'sent',
-            downloaded_by_sender BOOLEAN DEFAULT FALSE,
-            downloaded_by_receiver BOOLEAN DEFAULT FALSE
-        )`,
+      `CREATE TABLE IF NOT EXISTS messages (
+        id SERIAL PRIMARY KEY,
+        sender_email TEXT NOT NULL,
+        receiver_email TEXT NOT NULL,
+        message TEXT DEFAULT '',
+        attachment_type TEXT DEFAULT '',
+        attachment_filename TEXT DEFAULT '',
+        attachment_original_name TEXT DEFAULT '',
+        attachment_mime_type TEXT DEFAULT '',
+        attachment_size INTEGER DEFAULT 0,
+        attachment_url TEXT DEFAULT '',
+        duration INTEGER DEFAULT 0,
+        thumbnail TEXT DEFAULT '',
+        timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        status TEXT DEFAULT 'sent',
+        downloaded_by_sender BOOLEAN DEFAULT FALSE,
+        downloaded_by_receiver BOOLEAN DEFAULT FALSE
+      )`,
 
-        // Таблица групп
-        `CREATE TABLE IF NOT EXISTS groups (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT NOT NULL,
-            description TEXT DEFAULT '',
-            created_by TEXT NOT NULL,
-            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-        )`,
+      `CREATE TABLE IF NOT EXISTS groups (
+        id SERIAL PRIMARY KEY,
+        name TEXT NOT NULL,
+        description TEXT DEFAULT '',
+        created_by TEXT NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )`,
 
-        // Таблица участников групп
-        `CREATE TABLE IF NOT EXISTS group_members (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            group_id INTEGER NOT NULL,
-            user_email TEXT NOT NULL,
-            role TEXT DEFAULT 'member',
-            joined_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-            UNIQUE(group_id, user_email)
-        )`,
+      `CREATE TABLE IF NOT EXISTS group_members (
+        id SERIAL PRIMARY KEY,
+        group_id INTEGER NOT NULL,
+        user_email TEXT NOT NULL,
+        role TEXT DEFAULT 'member',
+        joined_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(group_id, user_email)
+      )`,
 
-        // Таблица групповых сообщений
-        `CREATE TABLE IF NOT EXISTS group_messages (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            group_id INTEGER NOT NULL,
-            sender_email TEXT NOT NULL,
-            message TEXT DEFAULT '',
-            attachment_type TEXT DEFAULT '',
-            attachment_filename TEXT DEFAULT '',
-            attachment_original_name TEXT DEFAULT '',
-            attachment_mime_type TEXT DEFAULT '',
-            attachment_size INTEGER DEFAULT 0,
-            duration INTEGER DEFAULT 0,
-            thumbnail TEXT DEFAULT '',
-            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
-        )`,
+      `CREATE TABLE IF NOT EXISTS group_messages (
+        id SERIAL PRIMARY KEY,
+        group_id INTEGER NOT NULL,
+        sender_email TEXT NOT NULL,
+        message TEXT DEFAULT '',
+        attachment_type TEXT DEFAULT '',
+        attachment_filename TEXT DEFAULT '',
+        attachment_original_name TEXT DEFAULT '',
+        attachment_mime_type TEXT DEFAULT '',
+        attachment_size INTEGER DEFAULT 0,
+        duration INTEGER DEFAULT 0,
+        thumbnail TEXT DEFAULT '',
+        timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )`,
 
-        // Таблица звонков
-        `CREATE TABLE IF NOT EXISTS calls (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            call_id TEXT UNIQUE NOT NULL,
-            caller_email TEXT NOT NULL,
-            receiver_email TEXT NOT NULL,
-            call_type TEXT DEFAULT 'audio',
-            status TEXT DEFAULT 'ended',
-            duration INTEGER DEFAULT 0,
-            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-            ended_at DATETIME
-        )`,
+      `CREATE TABLE IF NOT EXISTS calls (
+        id SERIAL PRIMARY KEY,
+        call_id TEXT UNIQUE NOT NULL,
+        caller_email TEXT NOT NULL,
+        receiver_email TEXT NOT NULL,
+        call_type TEXT DEFAULT 'audio',
+        status TEXT DEFAULT 'ended',
+        duration INTEGER DEFAULT 0,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        ended_at TIMESTAMP
+      )`,
 
-        // Таблица Agora звонков
-        `CREATE TABLE IF NOT EXISTS agora_calls (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            channel_name TEXT UNIQUE NOT NULL,
-            caller_email TEXT NOT NULL,
-            receiver_email TEXT NOT NULL,
-            call_type TEXT DEFAULT 'audio',
-            status TEXT DEFAULT 'ringing',
-            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-            ended_at DATETIME
-        )`
+      `CREATE TABLE IF NOT EXISTS agora_calls (
+        id SERIAL PRIMARY KEY,
+        channel_name TEXT UNIQUE NOT NULL,
+        caller_email TEXT NOT NULL,
+        receiver_email TEXT NOT NULL,
+        call_type TEXT DEFAULT 'audio',
+        status TEXT DEFAULT 'ringing',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        ended_at TIMESTAMP
+      )`,
+
+      // Индексы
+      `CREATE INDEX IF NOT EXISTS idx_messages_conversation ON messages(sender_email, receiver_email)`,
+      `CREATE INDEX IF NOT EXISTS idx_messages_timestamp ON messages(timestamp)`,
+      `CREATE INDEX IF NOT EXISTS idx_group_messages_group ON group_messages(group_id)`,
+      `CREATE INDEX IF NOT EXISTS idx_group_members_group ON group_members(group_id)`,
+      `CREATE INDEX IF NOT EXISTS idx_users_email ON users(email)`
     ];
 
-    queries.forEach((query, index) => {
-        db.run(query, (err) => {
-            if (err) {
-                console.error(`❌ Ошибка создания таблицы ${index + 1}:`, err.message);
-            } else {
-                console.log(`✅ Таблица ${index + 1} создана/проверена`);
-            }
-        });
-    });
+    for (const query of queries) {
+      try {
+        await client.query(query);
+        console.log(`✅ Таблица/индекс создан`);
+      } catch (tableError) {
+        console.error('❌ Ошибка создания:', tableError.message);
+      }
+    }
+    
+    console.log('✅ Все таблицы созданы/проверены');
+    
+  } catch (error) {
+    console.error('❌ Ошибка создания таблиц:', error);
+  } finally {
+    client.release();
+  }
 }
 
 // Функция для определения типа файла
@@ -246,7 +226,6 @@ function getFileType(mimetype, filename) {
         return 'archive';
     }
     
-    // Дополнительная проверка по расширению
     const ext = path.extname(filename).toLowerCase();
     if (['.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp'].includes(ext)) return 'image';
     if (['.mp4', '.avi', '.mov', '.mkv', '.webm', '.3gp'].includes(ext)) return 'video';
@@ -257,29 +236,9 @@ function getFileType(mimetype, filename) {
     return 'file';
 }
 
-// Функция создания миниатюры для видео
-function createVideoThumbnail(videoPath, outputPath, callback) {
-    ffmpeg(videoPath)
-        .screenshots({
-            timestamps: ['00:00:01'],
-            filename: path.basename(outputPath),
-            folder: path.dirname(outputPath),
-            size: '320x240'
-        })
-        .on('end', () => {
-            console.log('✅ Миниатюра создана:', outputPath);
-            callback(null, outputPath);
-        })
-        .on('error', (err) => {
-            console.error('❌ Ошибка создания миниатюры:', err);
-            callback(err);
-        });
-}
-
 // Функция создания превью для медиафайлов
 function createMediaPreview(filePath, outputPath, fileType, callback) {
     if (fileType === 'video') {
-        // Для видео создаем превью из первого кадра
         ffmpeg(filePath)
             .screenshots({
                 timestamps: ['00:00:01'],
@@ -296,7 +255,6 @@ function createMediaPreview(filePath, outputPath, fileType, callback) {
                 callback(err);
             });
     } else if (fileType === 'image') {
-        // Для изображений создаем уменьшенную копию
         ffmpeg(filePath)
             .size('320x240')
             .output(outputPath)
@@ -345,130 +303,105 @@ function moveFileToPermanent(filename) {
     }
 }
 
-// Функция удаления файла если оба пользователя скачали
-function checkAndDeleteFile(messageId, filename) {
-    db.get(`SELECT downloaded_by_sender, downloaded_by_receiver FROM messages WHERE id = ?`, 
-    [messageId], (err, row) => {
-        if (err) {
-            console.error('❌ Ошибка проверки статуса скачивания:', err);
-            return;
-        }
+// Функция проверки и удаления файла если оба пользователя скачали
+async function checkAndDeleteFile(messageId, filename) {
+    try {
+        const result = await pool.query(
+            `SELECT downloaded_by_sender, downloaded_by_receiver FROM messages WHERE id = $1`,
+            [messageId]
+        );
 
-        if (row && row.downloaded_by_sender && row.downloaded_by_receiver) {
-            const filePath = path.join(permanentDir, filename);
-            if (fs.existsSync(filePath)) {
-                fs.unlinkSync(filePath);
-                console.log(`🗑️  Файл удален: ${filename}`);
+        if (result.rows.length > 0) {
+            const row = result.rows[0];
+            if (row.downloaded_by_sender && row.downloaded_by_receiver) {
+                const filePath = path.join(permanentDir, filename);
+                if (fs.existsSync(filePath)) {
+                    fs.unlinkSync(filePath);
+                    console.log(`🗑️  Файл удален: ${filename}`);
+                }
             }
         }
-    });
+    } catch (err) {
+        console.error('❌ Ошибка проверки статуса скачивания:', err);
+    }
 }
 
 // Функция обновления статуса скачивания
-function updateDownloadStatus(messageId, userEmail, isSender) {
-    const field = isSender ? 'downloaded_by_sender' : 'downloaded_by_receiver';
-    
-    db.run(`UPDATE messages SET ${field} = 1 WHERE id = ?`, [messageId], function(err) {
-        if (err) {
-            console.error('❌ Ошибка обновления статуса скачивания:', err);
-            return;
-        }
+async function updateDownloadStatus(messageId, userEmail, isSender) {
+    try {
+        const field = isSender ? 'downloaded_by_sender' : 'downloaded_by_receiver';
         
-        db.get(`SELECT attachment_filename FROM messages WHERE id = ?`, [messageId], (err, row) => {
-            if (!err && row && row.attachment_filename) {
-                checkAndDeleteFile(messageId, row.attachment_filename);
-            }
-        });
-    });
+        await pool.query(
+            `UPDATE messages SET ${field} = true WHERE id = $1`,
+            [messageId]
+        );
+        
+        // Проверяем нужно ли удалить файл
+        const result = await pool.query(
+            `SELECT attachment_filename FROM messages WHERE id = $1`,
+            [messageId]
+        );
+        
+        if (result.rows.length > 0 && result.rows[0].attachment_filename) {
+            await checkAndDeleteFile(messageId, result.rows[0].attachment_filename);
+        }
+    } catch (err) {
+        console.error('❌ Ошибка обновления статуса скачивания:', err);
+    }
 }
 
 // Функция автоматического добавления в чаты
-function addToChatsAutomatically(user1, user2, callback) {
-    db.get("SELECT COUNT(*) as count FROM users WHERE email IN (?, ?)", 
-    [user1.toLowerCase(), user2.toLowerCase()], 
-    (err, row) => {
-        if (err) {
-            console.error('❌ Ошибка проверки пользователей:', err);
-            return callback();
-        }
+async function addToChatsAutomatically(user1, user2) {
+    try {
+        const result = await pool.query(
+            "SELECT COUNT(*) as count FROM users WHERE email IN ($1, $2)",
+            [user1.toLowerCase(), user2.toLowerCase()]
+        );
 
-        if (row.count !== 2) {
+        if (parseInt(result.rows[0].count) !== 2) {
             console.log('⚠️  Один или оба пользователя не найдены');
-            return callback();
+            return;
         }
 
-        const queries = [
-            "INSERT OR IGNORE INTO friends (user_email, friend_email) VALUES (?, ?)",
-            "INSERT OR IGNORE INTO friends (user_email, friend_email) VALUES (?, ?)"
-        ];
+        await pool.query(
+            "INSERT INTO friends (user_email, friend_email) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+            [user1.toLowerCase(), user2.toLowerCase()]
+        );
 
-        const values = [
-            [user1.toLowerCase(), user2.toLowerCase()],
+        await pool.query(
+            "INSERT INTO friends (user_email, friend_email) VALUES ($1, $2) ON CONFLICT DO NOTHING",
             [user2.toLowerCase(), user1.toLowerCase()]
-        ];
+        );
 
-        let completed = 0;
-        const total = queries.length;
-
-        function checkCompletion() {
-            completed++;
-            if (completed === total) {
-                console.log(`✅ Автоматически добавлены чаты: ${user1} ↔️ ${user2}`);
-                callback();
-            }
-        }
-
-        queries.forEach((query, index) => {
-            db.run(query, values[index], function(err) {
-                if (err) {
-                    console.error('❌ Ошибка автоматического добавления в чаты:', err);
-                }
-                checkCompletion();
-            });
-        });
-    });
+        console.log(`✅ Автоматически добавлены чаты: ${user1} ↔️ ${user2}`);
+    } catch (error) {
+        console.error('❌ Ошибка автоматического добавления в чаты:', error);
+    }
 }
 
-// Добавьте эту функцию для валидации имени канала
+// Валидация имени канала Agora
 function isValidChannelName(channelName) {
-    // Agora требует: 64 байта максимум, только цифры, буквы и некоторые символы
     const pattern = /^[a-zA-Z0-9!#$%&()+\-:;<=>.?@[\]^_{}|~]{1,64}$/;
     return pattern.test(channelName) && channelName.length <= 64;
 }
 
-// Функция для генерации безопасного имени канала
-function generateSafeChannelName(baseName) {
-    // Удаляем все недопустимые символы
-    let safeName = baseName.replace(/[^a-zA-Z0-9!#$%&()+\-:;<=>.?@[\]^_{}|~]/g, '');
-    
-    // Ограничиваем длину 64 символами
-    safeName = safeName.substring(0, 64);
-    
-    // Если после очистки имя пустое, генерируем случайное
-    if (!safeName) {
-        safeName = 'channel_' + Math.random().toString(36).substring(2, 15);
-    }
-    
-    return safeName;
-}
-
 // Health check
-app.get('/health', (req, res) => {
-    db.get("SELECT 1 as test", [], (err) => {
-        if (err) {
-            return res.status(500).json({ success: false, error: 'Database error' });
-        }
+app.get('/health', async (req, res) => {
+    try {
+        await pool.query('SELECT 1');
         res.json({ 
             success: true, 
             status: 'Server is running',
             timestamp: new Date().toISOString(),
-            upload_dir: uploadDir,
-            db_path: dbPath
+            database: 'PostgreSQL'
         });
-    });
+    } catch (error) {
+        res.status(500).json({ success: false, error: 'Database error' });
+    }
 });
 
-app.post('/register', (req, res) => {
+// Регистрация пользователя
+app.post('/register', async (req, res) => {
     try {
         const { email, firstName, lastName } = req.body;
 
@@ -480,41 +413,29 @@ app.post('/register', (req, res) => {
         }
 
         // Проверяем существование пользователя
-        db.get(
-            "SELECT id FROM users WHERE email = ?", 
-            [email.toLowerCase()],
-            (err, existingUser) => {
-                if (err) {
-                    console.error('❌ Ошибка проверки пользователя:', err);
-                    return res.status(500).json({ success: false, error: 'Database error' });
-                }
-
-                if (existingUser) {
-                    return res.status(409).json({ 
-                        success: false, 
-                        error: 'Пользователь уже существует' 
-                    });
-                }
-
-                // Создаем пользователя (SQLite синтаксис)
-                db.run(
-                    "INSERT INTO users (email, first_name, last_name) VALUES (?, ?, ?)",
-                    [email.toLowerCase(), firstName, lastName],
-                    function(err) {
-                        if (err) {
-                            console.error('❌ Ошибка регистрации:', err);
-                            return res.status(500).json({ success: false, error: 'Database error' });
-                        }
-
-                        res.json({
-                            success: true,
-                            message: 'Пользователь успешно зарегистрирован',
-                            userId: this.lastID
-                        });
-                    }
-                );
-            }
+        const existingUser = await pool.query(
+            "SELECT id FROM users WHERE email = $1", 
+            [email.toLowerCase()]
         );
+
+        if (existingUser.rows.length > 0) {
+            return res.status(409).json({ 
+                success: false, 
+                error: 'Пользователь уже существует' 
+            });
+        }
+
+        // Создаем пользователя
+        const result = await pool.query(
+            "INSERT INTO users (email, first_name, last_name) VALUES ($1, $2, $3) RETURNING *",
+            [email.toLowerCase(), firstName, lastName]
+        );
+
+        res.json({
+            success: true,
+            message: 'Пользователь успешно зарегистрирован',
+            userId: result.rows[0].id
+        });
 
     } catch (error) {
         console.error('❌ Ошибка регистрации:', error);
@@ -522,16 +443,16 @@ app.post('/register', (req, res) => {
     }
 });
 
+// Получение всех пользователей
 app.get('/users', async (req, res) => {
     try {
-        const rows = await db.all(
-            "SELECT email, first_name as firstName, last_name as lastName FROM users ORDER BY first_name, last_name", 
-            []
+        const result = await pool.query(
+            "SELECT email, first_name as \"firstName\", last_name as \"lastName\" FROM users ORDER BY first_name, last_name"
         );
 
         res.json({
             success: true,
-            users: rows
+            users: result.rows
         });
     } catch (error) {
         console.error('❌ Ошибка получения пользователей:', error);
@@ -540,7 +461,7 @@ app.get('/users', async (req, res) => {
 });
 
 // Добавление в друзья
-app.post('/add-friend', (req, res) => {
+app.post('/add-friend', async (req, res) => {
     try {
         const { userEmail, friendEmail } = req.body;
 
@@ -548,35 +469,29 @@ app.post('/add-friend', (req, res) => {
             return res.status(400).json({ success: false, error: 'Email обязательны' });
         }
 
-        db.get("SELECT COUNT(*) as count FROM users WHERE email IN (?, ?)", 
-        [userEmail.toLowerCase(), friendEmail.toLowerCase()], 
-        (err, row) => {
-            if (err) {
-                return res.status(500).json({ success: false, error: 'Database error' });
-            }
+        // Проверяем существование пользователей
+        const usersResult = await pool.query(
+            "SELECT COUNT(*) as count FROM users WHERE email IN ($1, $2)",
+            [userEmail.toLowerCase(), friendEmail.toLowerCase()]
+        );
 
-            if (row.count !== 2) {
-                return res.status(404).json({ 
-                    success: false, 
-                    error: 'Пользователи не найдены' 
-                });
-            }
+        if (parseInt(usersResult.rows[0].count) !== 2) {
+            return res.status(404).json({ 
+                success: false, 
+                error: 'Пользователи не найдены' 
+            });
+        }
 
-            db.run(
-                "INSERT OR IGNORE INTO friends (user_email, friend_email) VALUES (?, ?)",
-                [userEmail.toLowerCase(), friendEmail.toLowerCase()],
-                function(err) {
-                    if (err) {
-                        return res.status(500).json({ success: false, error: 'Database error' });
-                    }
+        await pool.query(
+            "INSERT INTO friends (user_email, friend_email) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+            [userEmail.toLowerCase(), friendEmail.toLowerCase()]
+        );
 
-                    res.json({
-                        success: true,
-                        message: 'Друг добавлен'
-                    });
-                }
-            );
+        res.json({
+            success: true,
+            message: 'Друг добавлен'
         });
+
     } catch (error) {
         console.error('❌ Ошибка добавления друга:', error);
         res.status(500).json({ success: false, error: 'Internal server error' });
@@ -584,7 +499,7 @@ app.post('/add-friend', (req, res) => {
 });
 
 // Удаление из друзей
-app.post('/remove-friend', (req, res) => {
+app.post('/remove-friend', async (req, res) => {
     try {
         const { userEmail, friendEmail } = req.body;
 
@@ -592,20 +507,16 @@ app.post('/remove-friend', (req, res) => {
             return res.status(400).json({ success: false, error: 'Email обязательны' });
         }
 
-        db.run(
-            "DELETE FROM friends WHERE user_email = ? AND friend_email = ?",
-            [userEmail.toLowerCase(), friendEmail.toLowerCase()],
-            function(err) {
-                if (err) {
-                    return res.status(500).json({ success: false, error: 'Database error' });
-                }
-
-                res.json({
-                    success: true,
-                    message: 'Друг удален'
-                });
-            }
+        const result = await pool.query(
+            "DELETE FROM friends WHERE user_email = $1 AND friend_email = $2",
+            [userEmail.toLowerCase(), friendEmail.toLowerCase()]
         );
+
+        res.json({
+            success: true,
+            message: 'Друг удален'
+        });
+
     } catch (error) {
         console.error('❌ Ошибка удаления друга:', error);
         res.status(500).json({ success: false, error: 'Internal server error' });
@@ -613,63 +524,58 @@ app.post('/remove-friend', (req, res) => {
 });
 
 // Получение чатов пользователя
-app.get('/chats/:userEmail', (req, res) => {
+app.get('/chats/:userEmail', async (req, res) => {
     try {
         const userEmail = req.params.userEmail.toLowerCase();
 
-        db.all(`
+        const result = await pool.query(`
             SELECT 
-                u.email as contactEmail,
-                u.first_name as firstName,
-                u.last_name as lastName,
+                u.email as "contactEmail",
+                u.first_name as "firstName",
+                u.last_name as "lastName",
                 'friend' as type,
-                MAX(m.timestamp) as lastMessageTime
+                MAX(m.timestamp) as "lastMessageTime"
             FROM friends f
             JOIN users u ON u.email = f.friend_email
             LEFT JOIN messages m ON 
                 (m.sender_email = f.user_email AND m.receiver_email = f.friend_email) OR
                 (m.sender_email = f.friend_email AND m.receiver_email = f.user_email)
-            WHERE f.user_email = ?
+            WHERE f.user_email = $1
             GROUP BY u.email, u.first_name, u.last_name
             
             UNION
             
             SELECT 
                 CASE 
-                    WHEN m.sender_email = ? THEN m.receiver_email
+                    WHEN m.sender_email = $2 THEN m.receiver_email
                     ELSE m.sender_email
-                END as contactEmail,
-                u.first_name as firstName,
-                u.last_name as lastName,
+                END as "contactEmail",
+                u.first_name as "firstName",
+                u.last_name as "lastName",
                 'chat' as type,
-                MAX(m.timestamp) as lastMessageTime
+                MAX(m.timestamp) as "lastMessageTime"
             FROM messages m
             JOIN users u ON u.email = CASE 
-                WHEN m.sender_email = ? THEN m.receiver_email
+                WHEN m.sender_email = $2 THEN m.receiver_email
                 ELSE m.sender_email
             END
-            WHERE (m.sender_email = ? OR m.receiver_email = ?)
+            WHERE (m.sender_email = $2 OR m.receiver_email = $2)
             AND NOT EXISTS (
                 SELECT 1 FROM friends f 
-                WHERE f.user_email = ? 
+                WHERE f.user_email = $2 
                 AND f.friend_email = CASE 
-                    WHEN m.sender_email = ? THEN m.receiver_email
+                    WHEN m.sender_email = $2 THEN m.receiver_email
                     ELSE m.sender_email
                 END
             )
-            GROUP BY contactEmail, u.first_name, u.last_name
+            GROUP BY "contactEmail", u.first_name, u.last_name
             
-            ORDER BY lastMessageTime DESC, firstName, lastName
-        `, [userEmail, userEmail, userEmail, userEmail, userEmail, userEmail, userEmail], 
-        (err, rows) => {
-            if (err) {
-                return res.status(500).json({ success: false, error: 'Database error' });
-            }
+            ORDER BY "lastMessageTime" DESC, "firstName", "lastName"
+        `, [userEmail, userEmail]);
 
-            res.json({
-                success: true,
-                chats: rows
-            });
+        res.json({
+            success: true,
+            chats: result.rows
         });
     } catch (error) {
         console.error('❌ Ошибка получения чатов:', error);
@@ -2138,7 +2044,7 @@ app.post('/send-call-notification', (req, res) => {
   }
 });
 
-// server.js - ИСПРАВЛЕННАЯ ВЕРСИЯ
+// WebSocket соединения
 io.on('connection', (socket) => {
   console.log('✅ Пользователь подключился:', socket.id);
 
@@ -2150,22 +2056,18 @@ io.on('connection', (socket) => {
   socket.on('call_notification', (data) => {
     const receiverSocketId = activeUsers.get(data.receiverEmail);
     if (receiverSocketId) {
-      // ИСПРАВЛЕНО: Правильное имя события
       io.to(receiverSocketId).emit('AGORA_INCOMING_CALL', {
         channelName: data.channelName,
         callerEmail: data.callerEmail,
         callType: data.callType
       });
       console.log(`📞 Уведомление о звонке отправлено: ${data.channelName} -> ${data.receiverEmail}`);
-    } else {
-      console.log(`⚠️  Пользователь не в сети: ${data.receiverEmail}`);
     }
   });
 
   socket.on('end_call', (data) => {
     const receiverSocketId = activeUsers.get(data.receiverEmail);
     if (receiverSocketId) {
-      // ИСПРАВЛЕНО: Правильное имя события
       io.to(receiverSocketId).emit('AGORA_CALL_ENDED', {
         channelName: data.channelName
       });
@@ -2183,72 +2085,24 @@ io.on('connection', (socket) => {
   });
 });
 
-// Статические файлы (для доступа к загруженным файлам)
+// Статические файлы
 app.use('/uploads', express.static(uploadDir));
 
-// Очистка временных файлов
-function cleanupTempFiles() {
-    const now = Date.now();
-    const oneHour = 60 * 60 * 1000;
-
-    fs.readdir(tempDir, (err, files) => {
-        if (err) {
-            console.error('❌ Ошибка чтения временной папки:', err);
-            return;
-        }
-
-        files.forEach(file => {
-            const filePath = path.join(tempDir, file);
-            fs.stat(filePath, (err, stats) => {
-                if (!err && stats && (now - stats.mtimeMs) > oneHour) {
-                    fs.unlink(filePath, (err) => {
-                        if (!err) {
-                            console.log(`🗑️  Удален временный файл: ${file}`);
-                        }
-                    });
-                }
-            });
-        });
-    });
-}
-
-// Запускаем очистку каждые 30 минут
-setInterval(cleanupTempFiles, 30 * 60 * 1000);
-
-// Обработка ошибок
-app.use((err, req, res, next) => {
-    console.error('❌ Необработанная ошибка:', err);
-    res.status(500).json({ success: false, error: 'Internal server error' });
+// Запуск сервера
+server.listen(PORT, async () => {
+    console.log(`🚀 Сервер запущен на порту ${PORT}`);
+    console.log(`📡 WebSocket сервер активен`);
+    
+    // Создаем таблицы при запуске
+    await createTables();
 });
-
-// 404 обработчик
-app.use((req, res) => {
-    res.status(404).json({ success: false, error: 'Endpoint not found' });
-});
-
-// ДОБАВИТЬ перед первым вызовом startServer():
-function startServer() {
-    server.listen(PORT, () => {
-        console.log(`🚀 Сервер запущен на порту ${PORT}`);
-        console.log(`📡 WebSocket сервер активен`);
-        console.log(`💾 Данные сохраняются в папке ./data/`);
-    });
-}
-
-// Затем оставить только ОДИН вызов:
-startServer();
 
 // Graceful shutdown
-process.on('SIGINT', () => {
+process.on('SIGINT', async () => {
     console.log('\n🛑 Остановка сервера...');
-    db.close((err) => {
-        if (err) {
-            console.error('❌ Ошибка закрытия БД:', err.message);
-        } else {
-            console.log('✅ Подключение к БД закрыто');
-        }
-        process.exit(0);
-    });
+    await pool.end();
+    console.log('✅ Подключение к БД закрыто');
+    process.exit(0);
 });
 
 module.exports = app;
