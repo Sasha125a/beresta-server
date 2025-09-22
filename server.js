@@ -447,8 +447,6 @@ function generateSafeChannelName(baseName) {
     return safeName;
 }
 
-startServer();
-
 // Health check
 app.get('/health', (req, res) => {
     db.get("SELECT 1 as test", [], (err) => {
@@ -2211,13 +2209,16 @@ app.use((req, res) => {
     res.status(404).json({ success: false, error: 'Endpoint not found' });
 });
 
-// НА ЭТО:
-server.listen(PORT, () => {
-  console.log(`🚀 Сервер запущен на порту ${PORT}`);
-  console.log(`📡 WebSocket сервер активен`);
-  console.log(`💾 Данные сохраняются в папке ./data/`);
-});
+// ДОБАВИТЬ перед первым вызовом startServer():
+function startServer() {
+    server.listen(PORT, () => {
+        console.log(`🚀 Сервер запущен на порту ${PORT}`);
+        console.log(`📡 WebSocket сервер активен`);
+        console.log(`💾 Данные сохраняются в папке ./data/`);
+    });
+}
 
+// Затем оставить только ОДИН вызов:
 startServer();
 
 // Graceful shutdown
