@@ -14,7 +14,7 @@ const activeCalls = new Map();
 const Agora = require('agora-access-token');
 const http = require('http');
 const socketIo = require('socket.io');
-const { initializeDB, db } = require('./database');
+const storage = require('./fileStorage');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -80,6 +80,151 @@ const upload = multer({
         cb(null, true);
     }
 });
+
+// Функция для создания таблиц
+async function createTables() {
+  const client = await pool.connect();
+  
+  try {
+    console.log('🔄 Создание/проверка таблиц...');
+
+    const queries = [
+      // Таблица пользователей
+      `CREATE TABLE IF NOT EXISTS users (
+        id SERIAL PRIMARY KEY,
+        email TEXT UNIQUE NOT NULL,
+        first_name TEXT NOT NULL,
+        last_name TEXT NOT NULL,
+        avatar_filename TEXT DEFAULT '',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )`,
+
+      // Таблица друзей
+      `CREATE TABLE IF NOT EXISTS friends (
+        id SERIAL PRIMARY KEY,
+        user_email TEXT NOT NULL,
+        friend_email TEXT NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(user_email, friend_email)
+      )`,
+
+      // Таблица сообщений
+      `CREATE TABLE IF NOT EXISTS messages (
+        id SERIAL PRIMARY KEY,
+        sender_email TEXT NOT NULL,
+        receiver_email TEXT NOT NULL,
+        message TEXT DEFAULT '',
+        attachment_type TEXT DEFAULT '',
+        attachment_filename TEXT DEFAULT '',
+        attachment_original_name TEXT DEFAULT '',
+        attachment_mime_type TEXT DEFAULT '',
+        attachment_size INTEGER DEFAULT 0,
+        attachment_url TEXT DEFAULT '',
+        duration INTEGER DEFAULT 0,
+        thumbnail TEXT DEFAULT '',
+        timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        status TEXT DEFAULT 'sent',
+        downloaded_by_sender BOOLEAN DEFAULT FALSE,
+        downloaded_by_receiver BOOLEAN DEFAULT FALSE
+      )`,
+
+      // Таблица групп
+      `CREATE TABLE IF NOT EXISTS groups (
+        id SERIAL PRIMARY KEY,
+        name TEXT NOT NULL,
+        description TEXT DEFAULT '',
+        created_by TEXT NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )`,
+
+      // Таблица участников групп
+      `CREATE TABLE IF NOT EXISTS group_members (
+        id SERIAL PRIMARY KEY,
+        group_id INTEGER NOT NULL,
+        user_email TEXT NOT NULL,
+        role TEXT DEFAULT 'member',
+        joined_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(group_id, user_email)
+      )`,
+
+      // Таблица групповых сообщений
+      `CREATE TABLE IF NOT EXISTS group_messages (
+        id SERIAL PRIMARY KEY,
+        group_id INTEGER NOT NULL,
+        sender_email TEXT NOT NULL,
+        message TEXT DEFAULT '',
+        attachment_type TEXT DEFAULT '',
+        attachment_filename TEXT DEFAULT '',
+        attachment_original_name TEXT DEFAULT '',
+        attachment_mime_type TEXT DEFAULT '',
+        attachment_size INTEGER DEFAULT 0,
+        duration INTEGER DEFAULT 0,
+        thumbnail TEXT DEFAULT '',
+        timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )`,
+
+      // Таблица звонков
+      `CREATE TABLE IF NOT EXISTS calls (
+        id SERIAL PRIMARY KEY,
+        call_id TEXT UNIQUE NOT NULL,
+        caller_email TEXT NOT NULL,
+        receiver_email TEXT NOT NULL,
+        call_type TEXT DEFAULT 'audio',
+        status TEXT DEFAULT 'ended',
+        duration INTEGER DEFAULT 0,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        ended_at TIMESTAMP
+      )`,
+
+      // Таблица Agora звонков
+      `CREATE TABLE IF NOT EXISTS agora_calls (
+        id SERIAL PRIMARY KEY,
+        channel_name TEXT UNIQUE NOT NULL,
+        caller_email TEXT NOT NULL,
+        receiver_email TEXT NOT NULL,
+        call_type TEXT DEFAULT 'audio',
+        status TEXT DEFAULT 'ringing',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        ended_at TIMESTAMP
+      )`,
+
+      // Индексы для оптимизации
+      `CREATE INDEX IF NOT EXISTS idx_messages_conversation ON messages(sender_email, receiver_email)`,
+      `CREATE INDEX IF NOT EXISTS idx_messages_timestamp ON messages(timestamp)`,
+      `CREATE INDEX IF NOT EXISTS idx_messages_downloads ON messages(downloaded_by_sender, downloaded_by_receiver)`,
+      `CREATE INDEX IF NOT EXISTS idx_group_messages_group ON group_messages(group_id)`,
+      `CREATE INDEX IF NOT EXISTS idx_group_messages_time ON group_messages(timestamp)`,
+      `CREATE INDEX IF NOT EXISTS idx_group_members_group ON group_members(group_id)`,
+      `CREATE INDEX IF NOT EXISTS idx_group_members_user ON group_members(user_email)`,
+      `CREATE INDEX IF NOT EXISTS idx_users_email ON users(email)`,
+      `CREATE INDEX IF NOT EXISTS idx_friends_user ON friends(user_email)`,
+      `CREATE INDEX IF NOT EXISTS idx_friends_friend ON friends(friend_email)`,
+      `CREATE INDEX IF NOT EXISTS idx_calls_caller ON calls(caller_email)`,
+      `CREATE INDEX IF NOT EXISTS idx_calls_receiver ON calls(receiver_email)`,
+      `CREATE INDEX IF NOT EXISTS idx_agora_calls_caller ON agora_calls(caller_email)`,
+      `CREATE INDEX IF NOT EXISTS idx_agora_calls_receiver ON agora_calls(receiver_email)`
+    ];
+
+    for (const query of queries) {
+      try {
+        await client.query(query);
+        const tableName = query.match(/CREATE TABLE IF NOT EXISTS (\w+)/);
+        if (tableName) {
+          console.log(`✅ Таблица: ${tableName[1]}`);
+        }
+      } catch (tableError) {
+        console.error('❌ Ошибка создания таблицы:', tableError.message);
+      }
+    }
+    
+    console.log('✅ Все таблицы созданы/проверены');
+    
+  } catch (error) {
+    console.error('❌ Ошибка создания таблиц:', error);
+  } finally {
+    client.release();
+  }
+}
 
 // Функция для определения типа файла
 function getFileType(mimetype, filename) {
@@ -2067,20 +2212,11 @@ app.use((req, res) => {
 });
 
 // НА ЭТО:
-async function startServer() {
-  try {
-    await initializeDB();
-    
-    server.listen(PORT, () => {
-      console.log(`🚀 Сервер запущен на порту ${PORT}`);
-      console.log(`📡 WebSocket сервер активен`);
-    });
-    
-  } catch (error) {
-    console.error('❌ Не удалось запустить сервер:', error);
-    process.exit(1);
-  }
-}
+server.listen(PORT, () => {
+  console.log(`🚀 Сервер запущен на порту ${PORT}`);
+  console.log(`📡 WebSocket сервер активен`);
+  console.log(`💾 Данные сохраняются в папке ./data/`);
+});
 
 startServer();
 
