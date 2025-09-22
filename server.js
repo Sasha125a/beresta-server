@@ -14,7 +14,7 @@ const activeCalls = new Map();
 const Agora = require('agora-access-token');
 const http = require('http');
 const socketIo = require('socket.io');
-const storage = require('./fileStorage');
+const fileStorage = require('./fileStorage'); // ИЗМЕНЕНО: переименовано
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -59,7 +59,7 @@ const thumbnailsDir = path.join(uploadDir, 'thumbnails');
     }
 });
 
-const storage = multer.diskStorage({
+const multerStorage = multer.diskStorage({ // ИЗМЕНЕНО: переименовано
     destination: (req, file, cb) => {
         cb(null, tempDir);
     },
@@ -71,7 +71,7 @@ const storage = multer.diskStorage({
 });
 
 const upload = multer({
-    storage: storage,
+    storage: multerStorage, // ИЗМЕНЕНО: используем переименованную переменную
     limits: {
         fileSize: 100 * 1024 * 1024,
         fieldSize: 50 * 1024 * 1024
