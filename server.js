@@ -1490,6 +1490,29 @@ app.post('/send-call-notification', async (req, res) => {
     }
 });
 
+// Простая функция для "проталкивания" звонка
+app.post('/push-call', async (req, res) => {
+    try {
+        const { channelName, callerEmail, receiverEmail, callType } = req.body;
+        
+        console.log(`📞 Проталкиваем звонок: ${channelName} -> ${receiverEmail}`);
+        
+        // Просто сохраняем звонок в базу - сервис на телефоне сам его найдет
+        await pool.query(
+            `INSERT INTO agora_calls (channel_name, caller_email, receiver_email, call_type, status)
+             VALUES ($1, $2, $3, $4, 'ringing') 
+             ON CONFLICT (channel_name) 
+             DO UPDATE SET status = 'ringing', created_at = CURRENT_TIMESTAMP`,
+            [channelName, callerEmail, receiverEmail, callType || 'audio']
+        );
+        
+        res.json({ success: true, message: 'Звонок отправлен' });
+    } catch (error) {
+        console.error('❌ Ошибка проталкивания звонка:', error);
+        res.status(500).json({ success: false, error: 'Internal server error' });
+    }
+});
+
 // WebSocket соединения
 io.on('connection', (socket) => {
   console.log('✅ Пользователь подключился:', socket.id);
