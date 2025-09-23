@@ -144,12 +144,23 @@ try {
 // Функция для создания таблиц
 async function createTables() {
   const client = await pool.connect();
-  await client.query(createPushSubscriptionsTable);
   
   try {
     console.log('🔄 Создание/проверка таблиц...');
 
+    // Перенесите объявление таблицы fcm_tokens в начало массива queries
     const queries = [
+      // Таблица для FCM токенов ДОЛЖНА БЫТЬ ОБЪЯВЛЕНА КАК СТРОКА
+      `CREATE TABLE IF NOT EXISTS fcm_tokens (
+        id SERIAL PRIMARY KEY,
+        user_email TEXT NOT NULL,
+        fcm_token TEXT NOT NULL,
+        platform TEXT DEFAULT 'android',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(user_email, fcm_token)
+      )`,
+
       `CREATE TABLE IF NOT EXISTS users (
         id SERIAL PRIMARY KEY,
         email TEXT UNIQUE NOT NULL,
@@ -240,18 +251,6 @@ async function createTables() {
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         ended_at TIMESTAMP
       )`,
-
-      // ДОБАВИТЬ ТАБЛИЦУ ДЛЯ FCM ТОКЕНОВ
-      const createPushSubscriptionsTable = `
-      CREATE TABLE IF NOT EXISTS fcm_tokens (
-        id SERIAL PRIMARY KEY,
-        user_email TEXT NOT NULL,
-        fcm_token TEXT NOT NULL,
-        platform TEXT DEFAULT 'android',
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        UNIQUE(user_email, fcm_token)
-      )`;
 
       // Индексы
       `CREATE INDEX IF NOT EXISTS idx_messages_conversation ON messages(sender_email, receiver_email)`,
