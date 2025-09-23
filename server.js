@@ -1489,8 +1489,24 @@ app.post('/send-call-notification', async (req, res) => {
       });
       console.log(`✅ WebSocket уведомление отправлено: ${receiverEmail}`);
     }
-});
 
+    // 3. Отправляем ответ клиенту
+    res.json({
+      success: true,
+      message: 'Уведомление отправлено',
+      callId: callId,
+      websocketDelivered: websocketDelivered
+    });
+
+  } catch (error) {
+    console.error('❌ Ошибка отправки уведомления о звонке:', error);
+    res.status(500).json({ 
+      success: false, 
+      error: 'Internal server error',
+      details: error.message 
+    });
+  }
+});
 // WebSocket соединения
 io.on('connection', (socket) => {
   console.log('✅ Пользователь подключился:', socket.id);
