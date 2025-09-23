@@ -67,24 +67,6 @@ pool.on('remove', () => {
 // WebSocket соединения
 const activeUsers = new Map();
 
-// ЗАМЕНЯЕМ сложную логику Firebase на простую WebSocket
-socket.on('call_notification', (data) => {
-    const receiverSocketId = activeUsers.get(data.receiverEmail.toLowerCase());
-    
-    if (receiverSocketId) {
-        console.log(`📞 Отправляем уведомление о звонке через WebSocket: ${data.channelName}`);
-        
-        io.to(receiverSocketId).emit('incoming_call', {
-            channelName: data.channelName,
-            callerEmail: data.callerEmail,
-            callType: data.callType,
-            timestamp: new Date().toISOString()
-        });
-    } else {
-        console.log(`❌ Пользователь оффлайн: ${data.receiverEmail}`);
-    }
-});
-
 // Устанавливаем пути к ffmpeg
 ffmpeg.setFfmpegPath(ffmpegPath);
 ffmpeg.setFfprobePath(ffprobePath);
@@ -1508,24 +1490,29 @@ app.post('/send-call-notification', async (req, res) => {
     });
   }
 });
-// WebSocket соединения
+// WebSocket обработчики
 io.on('connection', (socket) => {
   console.log('✅ Пользователь подключился:', socket.id);
 
   socket.on('user_online', (data) => {
-    activeUsers.set(data.email, socket.id);
+    activeUsers.set(data.email.toLowerCase(), socket.id);
     console.log(`👤 Пользователь онлайн: ${data.email}`);
   });
 
   socket.on('call_notification', (data) => {
-    const receiverSocketId = activeUsers.get(data.receiverEmail);
+    const receiverSocketId = activeUsers.get(data.receiverEmail.toLowerCase());
+    
     if (receiverSocketId) {
-      io.to(receiverSocketId).emit('incoming_call', {
-        channelName: data.channelName,
-        callerEmail: data.callerEmail,
-        callType: data.callType
-      });
-      console.log(`📞 Уведомление о звонке отправлено: ${data.channelName} -> ${data.receiverEmail}`);
+        console.log(`📞 Отправляем уведомление о звонке через WebSocket: ${data.channelName}`);
+        
+        io.to(receiverSocketId).emit('incoming_call', {
+            channelName: data.channelName,
+            callerEmail: data.callerEmail,
+            callType: data.callType,
+            timestamp: new Date().toISOString()
+        });
+    } else {
+        console.log(`❌ Пользователь оффлайн: ${data.receiverEmail}`);
     }
   });
 
