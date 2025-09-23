@@ -1427,6 +1427,7 @@ app.get('/agora/active-calls/:userEmail', async (req, res) => {
             FROM agora_calls 
             WHERE (caller_email = $1 OR receiver_email = $1) 
             AND status = 'ringing'
+            AND created_at > NOW() - INTERVAL '5 minutes'
             ORDER BY created_at DESC
         `, [userEmail]);
 
@@ -1490,29 +1491,6 @@ app.post('/send-call-notification', async (req, res) => {
     }
 });
 
-// Простая функция для "проталкивания" звонка
-app.post('/push-call', async (req, res) => {
-    try {
-        const { channelName, callerEmail, receiverEmail, callType } = req.body;
-        
-        console.log(`📞 Проталкиваем звонок: ${channelName} -> ${receiverEmail}`);
-        
-        // Просто сохраняем звонок в базу - сервис на телефоне сам его найдет
-        await pool.query(
-            `INSERT INTO agora_calls (channel_name, caller_email, receiver_email, call_type, status)
-             VALUES ($1, $2, $3, $4, 'ringing') 
-             ON CONFLICT (channel_name) 
-             DO UPDATE SET status = 'ringing', created_at = CURRENT_TIMESTAMP`,
-            [channelName, callerEmail, receiverEmail, callType || 'audio']
-        );
-        
-        res.json({ success: true, message: 'Звонок отправлен' });
-    } catch (error) {
-        console.error('❌ Ошибка проталкивания звонка:', error);
-        res.status(500).json({ success: false, error: 'Internal server error' });
-    }
-});
-
 // WebSocket соединения
 io.on('connection', (socket) => {
   console.log('✅ Пользователь подключился:', socket.id);
@@ -1525,7 +1503,7 @@ io.on('connection', (socket) => {
   socket.on('call_notification', (data) => {
     const receiverSocketId = activeUsers.get(data.receiverEmail);
     if (receiverSocketId) {
-      io.to(receiverSocketId).emit('AGORA_INCOMING_CALL', {
+      io.to(receiverSocketId).emit('incoming_call', {
         channelName: data.channelName,
         callerEmail: data.callerEmail,
         callType: data.callType
@@ -1537,7 +1515,7 @@ io.on('connection', (socket) => {
   socket.on('end_call', (data) => {
     const receiverSocketId = activeUsers.get(data.receiverEmail);
     if (receiverSocketId) {
-      io.to(receiverSocketId).emit('AGORA_CALL_ENDED', {
+      io.to(receiverSocketId).emit('call_ended', {
         channelName: data.channelName
       });
     }
@@ -1557,6 +1535,112 @@ io.on('connection', (socket) => {
 // Статические файлы
 app.use('/uploads', express.static(uploadDir));
 
+// Новый эндпоинт для проталкивания звонков
+app.post('/push-call', async (req, res) => {
+    try {
+        const { channelName, callerEmail, receiverEmail, callType } = req.body;
+        
+        console.log(`📞 Проталкиваем звонок: ${channelName} -> ${receiverEmail}`);
+        
+        if (!channelName || !callerEmail || !receiverEmail) {
+            return res.status(400).json({ 
+                success: false, 
+                error: 'channelName, callerEmail, receiverEmail обязательны' 
+            });
+        }
+
+        // Сохраняем звонок в базу
+        await pool.query(
+            `INSERT INTO agora_calls (channel_name, caller_email, receiver_email, call_type, status)
+             VALUES ($1, $2, $3, $4, 'ringing') 
+             ON CONFLICT (channel_name) 
+             DO UPDATE SET status = 'ringing', created_at = CURRENT_TIMESTAMP`,
+            [channelName, callerEmail, receiverEmail, callType || 'audio']
+        );
+        
+        res.json({ 
+            success: true, 
+            message: 'Звонок отправлен',
+            channelName: channelName
+        });
+        
+    } catch (error) {
+        console.error('❌ Ошибка проталкивания звонка:', error);
+        res.status(500).json({ 
+            success: false, 
+            error: 'Internal server error',
+            details: error.message 
+        });
+    }
+});
+
+// Эндпоинт для проверки звонков (для мобильного приложения)
+app.get('/check-calls/:userEmail', async (req, res) => {
+    try {
+        const userEmail = req.params.userEmail.toLowerCase();
+        
+        console.log(`🔍 Проверка звонков для: ${userEmail}`);
+        
+        const result = await pool.query(`
+            SELECT channel_name as "channelName", caller_email as "callerEmail", 
+                   receiver_email as "receiverEmail", call_type as "callType", 
+                   status, created_at as "createdAt"
+            FROM agora_calls 
+            WHERE receiver_email = $1 
+            AND status = 'ringing'
+            AND created_at > NOW() - INTERVAL '5 minutes'
+            ORDER BY created_at DESC
+            LIMIT 5
+        `, [userEmail]);
+
+        console.log(`📞 Найдено активных звонков: ${result.rows.length}`);
+        
+        res.json({
+            success: true,
+            calls: result.rows,
+            timestamp: new Date().toISOString()
+        });
+
+    } catch (error) {
+        console.error('❌ Ошибка проверки звонков:', error);
+        res.status(500).json({ 
+            success: false, 
+            error: 'Internal server error' 
+        });
+    }
+});
+
+// Эндпоинт для завершения звонка
+app.post('/end-call', async (req, res) => {
+    try {
+        const { channelName } = req.body;
+
+        if (!channelName) {
+            return res.status(400).json({ 
+                success: false, 
+                error: 'channelName обязателен' 
+            });
+        }
+
+        await pool.query(
+            "UPDATE agora_calls SET status = 'ended', ended_at = CURRENT_TIMESTAMP WHERE channel_name = $1",
+            [channelName]
+        );
+
+        res.json({
+            success: true,
+            message: 'Звонок завершен'
+        });
+
+    } catch (error) {
+        console.error('❌ Ошибка завершения звонка:', error);
+        res.status(500).json({ 
+            success: false, 
+            error: 'Internal server error' 
+        });
+    }
+});
+
 // Запуск сервера
 server.listen(PORT, async () => {
     console.log(`🚀 Сервер запущен на порту ${PORT}`);
@@ -1573,5 +1657,3 @@ process.on('SIGINT', async () => {
     console.log('✅ Подключение к БД закрыто');
     process.exit(0);
 });
-
-module.exports = app;
