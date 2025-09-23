@@ -1529,49 +1529,132 @@ app.get('/agora/active-calls/:userEmail', async (req, res) => {
 // ОБНОВЛЕННЫЙ ЭНДПОИНТ ДЛЯ УВЕДОМЛЕНИЙ О ЗВОНКАХ
 app.post('/send-call-notification', async (req, res) => {
   try {
-    const { channelName, receiverEmail, callType, callerEmail } = req.body;
+    const { channelName, receiverEmail, callType, callerEmail, callerName } = req.body;
 
-    console.log(`📞 Отправка уведомления: ${callerEmail} -> ${receiverEmail}`);
+    console.log(`📞 Отправка уведомления о звонке:`, {
+      caller: callerEmail,
+      receiver: receiverEmail,
+      channel: channelName,
+      type: callType
+    });
 
-    // 1. WebSocket уведомление (если пользователь онлайн)
+    if (!channelName || !receiverEmail || !callerEmail) {
+      return res.status(400).json({ 
+        success: false, 
+        error: 'channelName, receiverEmail, callerEmail обязательны' 
+      });
+    }
+
+    // 1. Сохраняем информацию о звонке в базу
+    let callId;
+    try {
+      const callResult = await pool.query(
+        `INSERT INTO agora_calls (channel_name, caller_email, receiver_email, call_type, status)
+         VALUES ($1, $2, $3, $4, 'ringing') RETURNING id`,
+        [channelName, callerEmail.toLowerCase(), receiverEmail.toLowerCase(), callType || 'audio']
+      );
+      callId = callResult.rows[0].id;
+    } catch (dbError) {
+      console.error('❌ Ошибка сохранения звонка в БД:', dbError);
+    }
+
+    // 2. WebSocket уведомление (если пользователь онлайн)
     const receiverSocketId = activeUsers.get(receiverEmail.toLowerCase());
-    if (receiverSocketId && io.sockets.sockets.has(receiverSocketId)) {
+    const websocketDelivered = !!(receiverSocketId && io.sockets.sockets.has(receiverSocketId));
+    
+    if (websocketDelivered) {
       io.to(receiverSocketId).emit('AGORA_INCOMING_CALL', {
         channelName,
         callerEmail,
-        callType,
+        callerName: callerName || callerEmail,
+        callType: callType || 'audio',
+        callId: callId,
         timestamp: new Date().toISOString()
       });
       console.log(`✅ WebSocket уведомление отправлено: ${receiverEmail}`);
     }
 
-    // 2. Push уведомление (даже если пользователь оффлайн)
+    // 3. Push уведомление (даже если пользователь оффлайн)
+    const displayName = callerName || callerEmail.split('@')[0];
     const pushSent = await sendPushNotification(
       receiverEmail,
-      'Входящий звонок',
-      `${callerEmail} вызывает вас`,
+      '📞 Входящий звонок',
+      `${displayName} вызывает вас`,
       {
         type: 'incoming_call',
         channelName: channelName,
         callerEmail: callerEmail,
-        callType: callType,
+        callerName: displayName,
+        callType: callType || 'audio',
+        callId: callId,
         timestamp: new Date().toISOString()
       }
     );
 
-    if (pushSent) {
-      console.log(`✅ Push-уведомление отправлено: ${receiverEmail}`);
-    }
-
     res.json({ 
       success: true, 
       message: 'Уведомления отправлены',
-      websocketDelivered: !!receiverSocketId,
-      pushDelivered: pushSent
+      details: {
+        callId: callId,
+        websocketDelivered: websocketDelivered,
+        pushDelivered: pushSent,
+        channelName: channelName
+      }
     });
 
   } catch (error) {
-    console.error('❌ Ошибка отправки уведомлений:', error);
+    console.error('❌ Ошибка отправки уведомлений о звонке:', error);
+    res.status(500).json({ 
+      success: false, 
+      error: 'Internal server error',
+      details: error.message 
+    });
+  }
+});
+
+// ОТМЕНА УВЕДОМЛЕНИЯ О ЗВОНКЕ
+app.post('/cancel-call-notification', async (req, res) => {
+  try {
+    const { channelName, callerEmail, receiverEmail } = req.body;
+
+    console.log(`❌ Отмена уведомления о звонке: ${channelName}`);
+
+    // 1. Обновляем статус звонка в БД
+    await pool.query(
+      "UPDATE agora_calls SET status = 'canceled', ended_at = CURRENT_TIMESTAMP WHERE channel_name = $1",
+      [channelName]
+    );
+
+    // 2. WebSocket уведомление об отмене
+    const receiverSocketId = activeUsers.get(receiverEmail.toLowerCase());
+    if (receiverSocketId && io.sockets.sockets.has(receiverSocketId)) {
+      io.to(receiverSocketId).emit('AGORA_CALL_CANCELED', {
+        channelName,
+        callerEmail,
+        timestamp: new Date().toISOString()
+      });
+    }
+
+    // 3. Push уведомление об отмене (опционально)
+    await sendPushNotification(
+      receiverEmail,
+      '❌ Звонок отменен',
+      `${callerEmail} отменил звонок`,
+      {
+        type: 'call_canceled',
+        channelName: channelName,
+        callerEmail: callerEmail,
+        timestamp: new Date().toISOString()
+      }
+    );
+
+    res.json({ 
+      success: true, 
+      message: 'Уведомление о звонке отменено' 
+    });
+
+  } catch (error) {
+    console.error('❌ Ошибка отмены уведомления:', error);
     res.status(500).json({ success: false, error: 'Internal server error' });
   }
 });
