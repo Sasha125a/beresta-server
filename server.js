@@ -141,6 +141,18 @@ try {
   console.error('❌ Ошибка инициализации Firebase:', error);
 }
 
+// Проверка Firebase
+admin.messaging().send({
+  token: 'test-token',
+  notification: { title: 'Test', body: 'Test' }
+}, true) // dryRun: true - только проверка без отправки
+.then(() => {
+  console.log('✅ Firebase Admin настроен корректно');
+})
+.catch(error => {
+  console.error('❌ Ошибка Firebase Admin:', error.message);
+});
+
 // Функция для создания таблиц
 async function createTables() {
   const client = await pool.connect();
@@ -1588,54 +1600,127 @@ app.post('/save-fcm-token', async (req, res) => {
   }
 });
 
-// ФУНКЦИЯ ОТПРАВКИ PUSH-УВЕДОМЛЕНИЙ
+// УЛУЧШЕННАЯ ФУНКЦИЯ ОТПРАВКИ PUSH-УВЕДОМЛЕНИЙ О ЗВОНКАХ
 async function sendPushNotification(userEmail, title, body, data = {}) {
   try {
+    console.log(`📱 Попытка отправки push-уведомления для: ${userEmail}`);
+    
+    // Ищем актуальные FCM токены пользователя
     const result = await pool.query(
-      'SELECT fcm_token FROM fcm_tokens WHERE user_email = $1 AND updated_at > NOW() - INTERVAL \'30 days\'',
+      `SELECT fcm_token, platform FROM fcm_tokens 
+       WHERE user_email = $1 
+       AND updated_at > NOW() - INTERVAL '30 days'
+       ORDER BY updated_at DESC
+       LIMIT 5`,
       [userEmail.toLowerCase()]
     );
 
     if (result.rows.length === 0) {
-      console.log(`❌ FCM токен не найден для пользователя: ${userEmail}`);
+      console.log(`❌ Активных FCM токенов не найдено для: ${userEmail}`);
       return false;
     }
 
-    const fcmToken = result.rows[0].fcm_token;
+    console.log(`✅ Найдено токенов: ${result.rows.length} для ${userEmail}`);
 
-    const message = {
-      token: fcmToken,
-      notification: {
-        title: title,
-        body: body
-      },
-      data: data,
-      android: {
-        priority: 'high',
-        notification: {
-          sound: 'default',
-          vibrateTimingsMillis: [0, 500, 250, 500],
-          channelId: 'calls_channel'
-        }
-      },
-      apns: {
-        payload: {
-          aps: {
-            sound: 'default',
-            badge: 1
+    let successCount = 0;
+
+    // Отправляем уведомления на все активные токены пользователя
+    for (const tokenRow of result.rows) {
+      try {
+        const message = {
+          token: tokenRow.fcm_token,
+          notification: {
+            title: title,
+            body: body
+          },
+          data: {
+            ...data,
+            notification_foreground: 'true', // Для обработки в foreground
+            click_action: 'INCOMING_CALL_ACTION'
+          },
+          android: {
+            priority: 'high',
+            ttl: 60 * 1000, // 60 секунд
+            notification: {
+              sound: 'default',
+              channelId: 'calls_channel',
+              vibrateTimingsMillis: [0, 500, 250, 500],
+              priority: 'max',
+              visibility: 'public',
+              defaultSound: true,
+              lightSettings: {
+                color: '#FF0000',
+                lightOnDurationMillis: 1000,
+                lightOffDurationMillis: 1000
+              }
+            }
+          },
+          apns: {
+            payload: {
+              aps: {
+                sound: 'default',
+                badge: 1,
+                category: 'INCOMING_CALL',
+                'mutable-content': 1
+              }
+            }
           }
+        };
+
+        console.log(`📤 Отправка на токен: ${tokenRow.fcm_token.substring(0, 20)}...`);
+        
+        const response = await admin.messaging().send(message);
+        console.log(`✅ Push-уведомление отправлено успешно: ${response}`);
+        successCount++;
+        
+      } catch (tokenError) {
+        console.error(`❌ Ошибка отправки на токен:`, tokenError.message);
+        
+        // Если токен невалидный, удаляем его из БД
+        if (tokenError.code === 'messaging/invalid-registration-token' || 
+            tokenError.code === 'messaging/registration-token-not-registered') {
+          await pool.query(
+            'DELETE FROM fcm_tokens WHERE fcm_token = $1',
+            [tokenRow.fcm_token]
+          );
+          console.log(`🗑️  Невалидный токен удален: ${tokenRow.fcm_token.substring(0, 20)}...`);
         }
       }
-    };
+    }
 
-    const response = await admin.messaging().send(message);
-    console.log(`✅ Push-уведомление отправлено: ${response}`);
-    return true;
+    console.log(`📊 Итог: успешно отправлено ${successCount} из ${result.rows.length} уведомлений`);
+    return successCount > 0;
+
   } catch (error) {
-    console.error('❌ Ошибка отправки push-уведомления:', error);
+    console.error('❌ Критическая ошибка отправки push-уведомления:', error);
     return false;
   }
 }
+
+// ПОЛУЧЕНИЕ ИНФОРМАЦИИ О FCM ТОКЕНАХ ПОЛЬЗОВАТЕЛЯ
+app.get('/fcm-tokens/:userEmail', async (req, res) => {
+  try {
+    const userEmail = req.params.userEmail.toLowerCase();
+
+    const result = await pool.query(
+      `SELECT fcm_token, platform, created_at, updated_at 
+       FROM fcm_tokens 
+       WHERE user_email = $1 
+       ORDER BY updated_at DESC`,
+      [userEmail]
+    );
+
+    res.json({
+      success: true,
+      tokens: result.rows,
+      count: result.rows.length
+    });
+
+  } catch (error) {
+    console.error('❌ Ошибка получения FCM токенов:', error);
+    res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+});
 
 // ЭНДПОИНТ ДЛЯ УДАЛЕНИЯ FCM ТОКЕНА (при выходе)
 app.post('/remove-fcm-token', async (req, res) => {
