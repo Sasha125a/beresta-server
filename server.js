@@ -118,7 +118,7 @@ const upload = multer({
     }
 });
 
-// Инициализация Firebase Admin
+// Более безопасная инициализация Firebase
 const serviceAccount = {
   type: "service_account",
   project_id: process.env.FIREBASE_PROJECT_ID,
@@ -132,27 +132,29 @@ const serviceAccount = {
   client_x509_cert_url: process.env.FIREBASE_CLIENT_CERT_URL
 };
 
-try {
-  admin.initializeApp({
-    credential: admin.credential.cert(serviceAccount)
-  });
-  console.log('✅ Firebase Admin инициализирован');
-} catch (error) {
-  console.error('❌ Ошибка инициализации Firebase:', error);
-}
+// Проверка наличия обязательных переменных
+const requiredFirebaseVars = [
+  'FIREBASE_PROJECT_ID',
+  'FIREBASE_PRIVATE_KEY_ID', 
+  'FIREBASE_PRIVATE_KEY',
+  'FIREBASE_CLIENT_EMAIL'
+];
 
-// Проверка Firebase (без отправки тестового уведомления)
-admin.auth().getUser('test-user-id')
-  .then(() => {
-    console.log('✅ Firebase Admin настроен корректно');
-  })
-  .catch(error => {
-    if (error.code === 'auth/user-not-found') {
-      console.log('✅ Firebase Admin подключен (ожидаемая ошибка для тестового пользователя)');
-    } else {
-      console.error('❌ Ошибка Firebase Admin:', error.message);
-    }
-  });
+const missingVars = requiredFirebaseVars.filter(varName => !process.env[varName]);
+
+if (missingVars.length > 0) {
+  console.warn('⚠️  Отсутствуют переменные Firebase:', missingVars);
+  console.log('📱 Push-уведомления будут отключены');
+} else {
+  try {
+    admin.initializeApp({
+      credential: admin.credential.cert(serviceAccount)
+    });
+    console.log('✅ Firebase Admin инициализирован');
+  } catch (error) {
+    console.error('❌ Ошибка инициализации Firebase:', error);
+  }
+}
 
 // Функция для создания таблиц
 async function createTables() {
