@@ -141,17 +141,18 @@ try {
   console.error('❌ Ошибка инициализации Firebase:', error);
 }
 
-// Проверка Firebase
-admin.messaging().send({
-  token: 'test-token',
-  notification: { title: 'Test', body: 'Test' }
-}, true) // dryRun: true - только проверка без отправки
-.then(() => {
-  console.log('✅ Firebase Admin настроен корректно');
-})
-.catch(error => {
-  console.error('❌ Ошибка Firebase Admin:', error.message);
-});
+// Проверка Firebase (без отправки тестового уведомления)
+admin.auth().getUser('test-user-id')
+  .then(() => {
+    console.log('✅ Firebase Admin настроен корректно');
+  })
+  .catch(error => {
+    if (error.code === 'auth/user-not-found') {
+      console.log('✅ Firebase Admin подключен (ожидаемая ошибка для тестового пользователя)');
+    } else {
+      console.error('❌ Ошибка Firebase Admin:', error.message);
+    }
+  });
 
 // Функция для создания таблиц
 async function createTables() {
