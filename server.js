@@ -14,7 +14,6 @@ const activeCalls = new Map();
 const Agora = require('agora-access-token');
 const http = require('http');
 const socketIo = require('socket.io');
-const admin = require('firebase-admin');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -67,6 +66,24 @@ pool.on('remove', () => {
 // WebSocket соединения
 const activeUsers = new Map();
 
+// ЗАМЕНЯЕМ сложную логику Firebase на простую WebSocket
+socket.on('call_notification', (data) => {
+    const receiverSocketId = activeUsers.get(data.receiverEmail.toLowerCase());
+    
+    if (receiverSocketId) {
+        console.log(`📞 Отправляем уведомление о звонке через WebSocket: ${data.channelName}`);
+        
+        io.to(receiverSocketId).emit('incoming_call', {
+            channelName: data.channelName,
+            callerEmail: data.callerEmail,
+            callType: data.callType,
+            timestamp: new Date().toISOString()
+        });
+    } else {
+        console.log(`❌ Пользователь оффлайн: ${data.receiverEmail}`);
+    }
+});
+
 // Устанавливаем пути к ffmpeg
 ffmpeg.setFfmpegPath(ffmpegPath);
 ffmpeg.setFfprobePath(ffprobePath);
@@ -118,44 +135,6 @@ const upload = multer({
     }
 });
 
-// Более безопасная инициализация Firebase
-const serviceAccount = {
-  type: "service_account",
-  project_id: process.env.FIREBASE_PROJECT_ID,
-  private_key_id: process.env.FIREBASE_PRIVATE_KEY_ID,
-  private_key: process.env.FIREBASE_PRIVATE_KEY?.replace(/\\n/g, '\n'),
-  client_email: process.env.FIREBASE_CLIENT_EMAIL,
-  client_id: process.env.FIREBASE_CLIENT_ID,
-  auth_uri: "https://accounts.google.com/o/oauth2/auth",
-  token_uri: "https://oauth2.googleapis.com/token",
-  auth_provider_x509_cert_url: "https://www.googleapis.com/oauth2/v1/certs",
-  client_x509_cert_url: process.env.FIREBASE_CLIENT_CERT_URL
-};
-
-// Проверка наличия обязательных переменных
-const requiredFirebaseVars = [
-  'FIREBASE_PROJECT_ID',
-  'FIREBASE_PRIVATE_KEY_ID', 
-  'FIREBASE_PRIVATE_KEY',
-  'FIREBASE_CLIENT_EMAIL'
-];
-
-const missingVars = requiredFirebaseVars.filter(varName => !process.env[varName]);
-
-if (missingVars.length > 0) {
-  console.warn('⚠️  Отсутствуют переменные Firebase:', missingVars);
-  console.log('📱 Push-уведомления будут отключены');
-} else {
-  try {
-    admin.initializeApp({
-      credential: admin.credential.cert(serviceAccount)
-    });
-    console.log('✅ Firebase Admin инициализирован');
-  } catch (error) {
-    console.error('❌ Ошибка инициализации Firebase:', error);
-  }
-}
-
 // Функция для создания таблиц
 async function createTables() {
   const client = await pool.connect();
@@ -163,18 +142,7 @@ async function createTables() {
   try {
     console.log('🔄 Создание/проверка таблиц...');
 
-    // Перенесите объявление таблицы fcm_tokens в начало массива queries
     const queries = [
-      // Таблица для FCM токенов ДОЛЖНА БЫТЬ ОБЪЯВЛЕНА КАК СТРОКА
-      `CREATE TABLE IF NOT EXISTS fcm_tokens (
-        id SERIAL PRIMARY KEY,
-        user_email TEXT NOT NULL,
-        fcm_token TEXT NOT NULL,
-        platform TEXT DEFAULT 'android',
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        UNIQUE(user_email, fcm_token)
-      )`,
 
       `CREATE TABLE IF NOT EXISTS users (
         id SERIAL PRIMARY KEY,
@@ -430,62 +398,6 @@ async function updateDownloadStatus(messageId, userEmail, isSender) {
     } catch (err) {
         console.error('❌ Ошибка обновления статуса скачивания:', err);
     }
-}
-
-// ФУНКЦИЯ ОТПРАВКИ PUSH-УВЕДОМЛЕНИЙ О ЗВОНКАХ
-async function sendCallNotification(userEmail, callerEmail, channelName, callType) {
-  try {
-    const result = await pool.query(
-      'SELECT fcm_token FROM fcm_tokens WHERE user_email = $1',
-      [userEmail.toLowerCase()]
-    );
-
-    if (result.rows.length === 0) {
-      console.log(`❌ FCM токен не найден для пользователя: ${userEmail}`);
-      return false;
-    }
-
-    const fcmToken = result.rows[0].fcm_token;
-
-    const message = {
-      token: fcmToken,
-      notification: {
-        title: 'Входящий звонок',
-        body: `${callerEmail} вызывает вас`
-      },
-      data: {
-        type: 'incoming_call',
-        channelName: channelName,
-        callerEmail: callerEmail,
-        callType: callType,
-        timestamp: new Date().toISOString(),
-        click_action: 'ACCEPT_CALL' // Важно для открытия приложения
-      },
-      android: {
-        priority: 'high',
-        notification: {
-          sound: 'default',
-          channelId: 'calls_channel'
-        }
-      },
-      apns: {
-        payload: {
-          aps: {
-            sound: 'default',
-            badge: 1,
-            category: 'INCOMING_CALL'
-          }
-        }
-      }
-    };
-
-    const response = await admin.messaging().send(message);
-    console.log(`✅ Push-уведомление о звонке отправлено: ${response}`);
-    return true;
-  } catch (error) {
-    console.error('❌ Ошибка отправки push-уведомления о звонке:', error);
-    return false;
-  }
 }
 
 // Функция автоматического добавления в чаты
@@ -1576,253 +1488,6 @@ app.post('/send-call-notification', async (req, res) => {
       });
       console.log(`✅ WebSocket уведомление отправлено: ${receiverEmail}`);
     }
-
-    // 3. Push уведомление (даже если пользователь оффлайн)
-    const displayName = callerName || callerEmail.split('@')[0];
-    const pushSent = await sendPushNotification(
-      receiverEmail,
-      '📞 Входящий звонок',
-      `${displayName} вызывает вас`,
-      {
-        type: 'incoming_call',
-        channelName: channelName,
-        callerEmail: callerEmail,
-        callerName: displayName,
-        callType: callType || 'audio',
-        callId: callId,
-        timestamp: new Date().toISOString()
-      }
-    );
-
-    res.json({ 
-      success: true, 
-      message: 'Уведомления отправлены',
-      details: {
-        callId: callId,
-        websocketDelivered: websocketDelivered,
-        pushDelivered: pushSent,
-        channelName: channelName
-      }
-    });
-
-  } catch (error) {
-    console.error('❌ Ошибка отправки уведомлений о звонке:', error);
-    res.status(500).json({ 
-      success: false, 
-      error: 'Internal server error',
-      details: error.message 
-    });
-  }
-});
-
-// ОТМЕНА УВЕДОМЛЕНИЯ О ЗВОНКЕ
-app.post('/cancel-call-notification', async (req, res) => {
-  try {
-    const { channelName, callerEmail, receiverEmail } = req.body;
-
-    console.log(`❌ Отмена уведомления о звонке: ${channelName}`);
-
-    // 1. Обновляем статус звонка в БД
-    await pool.query(
-      "UPDATE agora_calls SET status = 'canceled', ended_at = CURRENT_TIMESTAMP WHERE channel_name = $1",
-      [channelName]
-    );
-
-    // 2. WebSocket уведомление об отмене
-    const receiverSocketId = activeUsers.get(receiverEmail.toLowerCase());
-    if (receiverSocketId && io.sockets.sockets.has(receiverSocketId)) {
-      io.to(receiverSocketId).emit('AGORA_CALL_CANCELED', {
-        channelName,
-        callerEmail,
-        timestamp: new Date().toISOString()
-      });
-    }
-
-    // 3. Push уведомление об отмене (опционально)
-    await sendPushNotification(
-      receiverEmail,
-      '❌ Звонок отменен',
-      `${callerEmail} отменил звонок`,
-      {
-        type: 'call_canceled',
-        channelName: channelName,
-        callerEmail: callerEmail,
-        timestamp: new Date().toISOString()
-      }
-    );
-
-    res.json({ 
-      success: true, 
-      message: 'Уведомление о звонке отменено' 
-    });
-
-  } catch (error) {
-    console.error('❌ Ошибка отмены уведомления:', error);
-    res.status(500).json({ success: false, error: 'Internal server error' });
-  }
-});
-
-// ЭНДПОИНТ ДЛЯ СОХРАНЕНИЯ FCM ТОКЕНА
-app.post('/save-fcm-token', async (req, res) => {
-  try {
-    const { userEmail, fcmToken, platform = 'android' } = req.body;
-
-    if (!userEmail || !fcmToken) {
-      return res.status(400).json({ success: false, error: 'Email и токен обязательны' });
-    }
-
-    await pool.query(
-      `INSERT INTO fcm_tokens (user_email, fcm_token, platform, updated_at) 
-       VALUES ($1, $2, $3, CURRENT_TIMESTAMP) 
-       ON CONFLICT (user_email, fcm_token) 
-       DO UPDATE SET updated_at = CURRENT_TIMESTAMP`,
-      [userEmail.toLowerCase(), fcmToken, platform]
-    );
-
-    res.json({ success: true, message: 'FCM токен сохранен' });
-  } catch (error) {
-    console.error('❌ Ошибка сохранения FCM токена:', error);
-    res.status(500).json({ success: false, error: 'Internal server error' });
-  }
-});
-
-// УЛУЧШЕННАЯ ФУНКЦИЯ ОТПРАВКИ PUSH-УВЕДОМЛЕНИЙ О ЗВОНКАХ
-async function sendPushNotification(userEmail, title, body, data = {}) {
-  try {
-    console.log(`📱 Попытка отправки push-уведомления для: ${userEmail}`);
-    
-    // Ищем актуальные FCM токены пользователя
-    const result = await pool.query(
-      `SELECT fcm_token, platform FROM fcm_tokens 
-       WHERE user_email = $1 
-       AND updated_at > NOW() - INTERVAL '30 days'
-       ORDER BY updated_at DESC
-       LIMIT 5`,
-      [userEmail.toLowerCase()]
-    );
-
-    if (result.rows.length === 0) {
-      console.log(`❌ Активных FCM токенов не найдено для: ${userEmail}`);
-      return false;
-    }
-
-    console.log(`✅ Найдено токенов: ${result.rows.length} для ${userEmail}`);
-
-    let successCount = 0;
-
-    // Отправляем уведомления на все активные токены пользователя
-    for (const tokenRow of result.rows) {
-      try {
-        const message = {
-          token: tokenRow.fcm_token,
-          notification: {
-            title: title,
-            body: body
-          },
-          data: {
-            ...data,
-            notification_foreground: 'true', // Для обработки в foreground
-            click_action: 'INCOMING_CALL_ACTION'
-          },
-          android: {
-            priority: 'high',
-            ttl: 60 * 1000, // 60 секунд
-            notification: {
-              sound: 'default',
-              channelId: 'calls_channel',
-              vibrateTimingsMillis: [0, 500, 250, 500],
-              priority: 'max',
-              visibility: 'public',
-              defaultSound: true,
-              lightSettings: {
-                color: '#FF0000',
-                lightOnDurationMillis: 1000,
-                lightOffDurationMillis: 1000
-              }
-            }
-          },
-          apns: {
-            payload: {
-              aps: {
-                sound: 'default',
-                badge: 1,
-                category: 'INCOMING_CALL',
-                'mutable-content': 1
-              }
-            }
-          }
-        };
-
-        console.log(`📤 Отправка на токен: ${tokenRow.fcm_token.substring(0, 20)}...`);
-        
-        const response = await admin.messaging().send(message);
-        console.log(`✅ Push-уведомление отправлено успешно: ${response}`);
-        successCount++;
-        
-      } catch (tokenError) {
-        console.error(`❌ Ошибка отправки на токен:`, tokenError.message);
-        
-        // Если токен невалидный, удаляем его из БД
-        if (tokenError.code === 'messaging/invalid-registration-token' || 
-            tokenError.code === 'messaging/registration-token-not-registered') {
-          await pool.query(
-            'DELETE FROM fcm_tokens WHERE fcm_token = $1',
-            [tokenRow.fcm_token]
-          );
-          console.log(`🗑️  Невалидный токен удален: ${tokenRow.fcm_token.substring(0, 20)}...`);
-        }
-      }
-    }
-
-    console.log(`📊 Итог: успешно отправлено ${successCount} из ${result.rows.length} уведомлений`);
-    return successCount > 0;
-
-  } catch (error) {
-    console.error('❌ Критическая ошибка отправки push-уведомления:', error);
-    return false;
-  }
-}
-
-// ПОЛУЧЕНИЕ ИНФОРМАЦИИ О FCM ТОКЕНАХ ПОЛЬЗОВАТЕЛЯ
-app.get('/fcm-tokens/:userEmail', async (req, res) => {
-  try {
-    const userEmail = req.params.userEmail.toLowerCase();
-
-    const result = await pool.query(
-      `SELECT fcm_token, platform, created_at, updated_at 
-       FROM fcm_tokens 
-       WHERE user_email = $1 
-       ORDER BY updated_at DESC`,
-      [userEmail]
-    );
-
-    res.json({
-      success: true,
-      tokens: result.rows,
-      count: result.rows.length
-    });
-
-  } catch (error) {
-    console.error('❌ Ошибка получения FCM токенов:', error);
-    res.status(500).json({ success: false, error: 'Internal server error' });
-  }
-});
-
-// ЭНДПОИНТ ДЛЯ УДАЛЕНИЯ FCM ТОКЕНА (при выходе)
-app.post('/remove-fcm-token', async (req, res) => {
-  try {
-    const { userEmail, fcmToken } = req.body;
-
-    await pool.query(
-      'DELETE FROM fcm_tokens WHERE user_email = $1 AND fcm_token = $2',
-      [userEmail.toLowerCase(), fcmToken]
-    );
-
-    res.json({ success: true, message: 'FCM токен удален' });
-  } catch (error) {
-    console.error('❌ Ошибка удаления FCM токена:', error);
-    res.status(500).json({ success: false, error: 'Internal server error' });
-  }
 });
 
 // WebSocket соединения
