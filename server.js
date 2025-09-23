@@ -417,6 +417,62 @@ async function updateDownloadStatus(messageId, userEmail, isSender) {
     }
 }
 
+// ФУНКЦИЯ ОТПРАВКИ PUSH-УВЕДОМЛЕНИЙ О ЗВОНКАХ
+async function sendCallNotification(userEmail, callerEmail, channelName, callType) {
+  try {
+    const result = await pool.query(
+      'SELECT fcm_token FROM fcm_tokens WHERE user_email = $1',
+      [userEmail.toLowerCase()]
+    );
+
+    if (result.rows.length === 0) {
+      console.log(`❌ FCM токен не найден для пользователя: ${userEmail}`);
+      return false;
+    }
+
+    const fcmToken = result.rows[0].fcm_token;
+
+    const message = {
+      token: fcmToken,
+      notification: {
+        title: 'Входящий звонок',
+        body: `${callerEmail} вызывает вас`
+      },
+      data: {
+        type: 'incoming_call',
+        channelName: channelName,
+        callerEmail: callerEmail,
+        callType: callType,
+        timestamp: new Date().toISOString(),
+        click_action: 'ACCEPT_CALL' // Важно для открытия приложения
+      },
+      android: {
+        priority: 'high',
+        notification: {
+          sound: 'default',
+          channelId: 'calls_channel'
+        }
+      },
+      apns: {
+        payload: {
+          aps: {
+            sound: 'default',
+            badge: 1,
+            category: 'INCOMING_CALL'
+          }
+        }
+      }
+    };
+
+    const response = await admin.messaging().send(message);
+    console.log(`✅ Push-уведомление о звонке отправлено: ${response}`);
+    return true;
+  } catch (error) {
+    console.error('❌ Ошибка отправки push-уведомления о звонке:', error);
+    return false;
+  }
+}
+
 // Функция автоматического добавления в чаты
 async function addToChatsAutomatically(user1, user2) {
     try {
