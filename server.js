@@ -14,6 +14,7 @@ const activeCalls = new Map();
 const Agora = require('agora-access-token');
 const http = require('http');
 const socketIo = require('socket.io');
+const activeUsers = new Map();
 
 const app = express();
 const PORT = process.env.PORT || 3000;
