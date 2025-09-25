@@ -1338,16 +1338,19 @@ app.get('/agora/token/:channelName/:userId', (req, res) => {
     }
 });
 
-// Создание Agora звонка
 app.post('/agora/create-call', async (req, res) => {
     try {
+        console.log('📞 Данные создания звонка:', req.body);
+        
         const { callerEmail, receiverEmail, callType, channelName } = req.body;
 
         if (!callerEmail || !receiverEmail || !channelName) {
+            console.log('❌ Отсутствуют обязательные поля');
             return res.status(400).json({ success: false, error: 'Все поля обязательны' });
         }
 
         if (!isValidChannelName(channelName)) {
+            console.log('❌ Невалидное имя канала:', channelName);
             return res.status(400).json({ 
                 success: false, 
                 error: 'Недопустимое имя канала' 
@@ -1360,6 +1363,8 @@ app.post('/agora/create-call', async (req, res) => {
             [channelName, callerEmail.toLowerCase(), receiverEmail.toLowerCase(), callType || 'audio']
         );
 
+        console.log('✅ Запись звонка создана:', result.rows[0]);
+        
         res.json({
             success: true,
             callId: result.rows[0].id,
