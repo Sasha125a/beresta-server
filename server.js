@@ -1708,6 +1708,25 @@ io.on('connection', (socket) => {
   });
 });
 
+// Явная обработка WebSocket соединений
+io.engine.on("connection", (rawSocket) => {
+  console.log('🔗 Raw WebSocket connection established');
+});
+
+// Добавьте обработку upgrade запросов
+server.on('upgrade', (req, socket, head) => {
+  console.log('🔄 HTTP upgrade request for WebSocket');
+  
+  // Явно обрабатываем upgrade для WebSocket
+  if (req.url === '/ws' || req.url.startsWith('/socket.io')) {
+    io.engine.handleUpgrade(req, socket, head, (ws) => {
+      io.engine.emit('connection', ws, req);
+    });
+  } else {
+    socket.destroy();
+  }
+});
+
 // Эндпоинт для проверки статуса WebSocket
 app.get('/websocket-status', (req, res) => {
   res.json({
