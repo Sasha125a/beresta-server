@@ -1291,16 +1291,20 @@ app.post('/update-profile', upload.single('avatar'), async (req, res) => {
     }
 });
 
-// Agora токен
+// Agora токен - ДОБАВЬТЕ логирование
 app.get('/agora/token/:channelName/:userId', (req, res) => {
     try {
         const { channelName, userId } = req.params;
 
+        console.log(`🔑 Запрос токена: channel=${channelName}, userId=${userId}`);
+
         if (!channelName) {
+            console.log('❌ Пустое имя канала');
             return res.status(400).json({ success: false, error: 'Channel name обязателен' });
         }
 
         if (!isValidChannelName(channelName)) {
+            console.log(`❌ Недопустимое имя канала: ${channelName}`);
             return res.status(400).json({ 
                 success: false, 
                 error: 'Недопустимое имя канала' 
@@ -1316,6 +1320,8 @@ app.get('/agora/token/:channelName/:userId', (req, res) => {
 
         const uid = Math.abs(parseInt(userId) || 0);
         
+        console.log(`🛠️ Генерация токена: appId=${appId}, uid=${uid}, channel=${channelName}`);
+        
         const token = Agora.RtcTokenBuilder.buildTokenWithUid(
             appId,
             appCertificate,
@@ -1324,6 +1330,8 @@ app.get('/agora/token/:channelName/:userId', (req, res) => {
             Agora.RtcRole.PUBLISHER,
             privilegeExpiredTs
         );
+
+        console.log(`✅ Токен сгенерирован успешно для канала: ${channelName}`);
 
         res.json({
             success: true,
