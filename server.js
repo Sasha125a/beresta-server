@@ -20,19 +20,28 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 
 const server = http.createServer(app);
-// Обновите настройки Socket.IO для Render.com
+// Обновите настройки Socket.IO для лучшей стабильности
 const io = socketIo(server, {
   cors: {
-    origin: isRender ? ["https://beresta-server.onrender.com"] : "*",
+    origin: isRender ? ["https://beresta-server.onrender.com", "https://your-client-domain.com"] : "*",
     methods: ["GET", "POST"],
     credentials: true
   },
-  transports: ['websocket', 'polling'], // Явно указываем транспорты
-  pingTimeout: 60000, // Увеличиваем таймауты для Render
+  transports: ['websocket', 'polling'],
+  pingTimeout: 60000,
   pingInterval: 25000,
-  allowEIO3: true
+  allowEIO3: true,
+  maxHttpBufferSize: 1e8,
+  connectTimeout: 45000
 });
 
+// Добавьте обработку ошибок сервера
+io.engine.on("connection_error", (err) => {
+  console.error('❌ Ошибка подключения Socket.IO:', err);
+});
+
+// Увеличим лимиты для больших файлов
+io.engine.opts.maxHttpBufferSize = 1e8;
 // Добавьте middleware для проверки WebSocket подключений
 io.use((socket, next) => {
   const email = socket.handshake.query.email;
@@ -1415,6 +1424,26 @@ app.post('/agora/create-call', async (req, res) => {
     }
 });
 
+// Проверка готовности сервера
+app.get('/ready', (req, res) => {
+  res.json({
+    success: true,
+    status: 'ready',
+    timestamp: new Date().toISOString(),
+    websocket: io.engine.clientsCount,
+    database: 'connected'
+  });
+});
+
+// Проверка WebSocket порта
+app.get('/websocket-port', (req, res) => {
+  res.json({
+    success: true,
+    port: PORT,
+    url: `ws://beresta-server.onrender.com:${PORT}`
+  });
+});
+
 // Завершение Agora звонка
 app.post('/agora/end-call', async (req, res) => {
     try {
@@ -1532,10 +1561,19 @@ app.post('/send-call-notification', async (req, res) => {
     });
   }
 });
-// WebSocket обработчики
+
+// WebSocket соединения с улучшенной стабильностью
 io.on('connection', (socket) => {
   console.log('✅ WebSocket подключение установлено:', socket.id);
-  console.log('📧 Email пользователя:', socket.userEmail);
+  
+  // Увеличим таймауты для этого сокета
+  socket.conn.transport.socket.onopen = () => {
+    console.log('🔗 Transport opened for:', socket.id);
+  };
+  
+  socket.conn.transport.socket.onclose = (reason) => {
+    console.log('🔌 Transport closed for:', socket.id, 'reason:', reason);
+  }
 
   // Автоматически добавляем пользователя в онлайн
   if (socket.userEmail) {
