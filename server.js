@@ -23,7 +23,7 @@ const server = http.createServer(app);
 // Обновите настройки Socket.IO для Render.com
 const io = socketIo(server, {
   cors: {
-    origin: isRender ? ["https://your-frontend-domain.com"] : "*",
+    origin: isRender ? ["https://beresta-server.onrender.com"] : "*",
     methods: ["GET", "POST"],
     credentials: true
   },
