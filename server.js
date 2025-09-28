@@ -14,16 +14,41 @@ const activeCalls = new Map();
 const Agora = require('agora-access-token');
 const http = require('http');
 const socketIo = require('socket.io');
+const isRender = process.env.NODE_ENV === 'production';
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
 const server = http.createServer(app);
+// Обновите настройки Socket.IO для Render.com
 const io = socketIo(server, {
   cors: {
-    origin: "*",
-    methods: ["GET", "POST"]
+    origin: isRender ? ["https://your-frontend-domain.com"] : "*",
+    methods: ["GET", "POST"],
+    credentials: true
+  },
+  transports: ['websocket', 'polling'], // Явно указываем транспорты
+  pingTimeout: 60000, // Увеличиваем таймауты для Render
+  pingInterval: 25000,
+  allowEIO3: true
+});
+
+// Добавьте middleware для проверки WebSocket подключений
+io.use((socket, next) => {
+  const email = socket.handshake.query.email;
+  if (email) {
+    socket.userEmail = email.toLowerCase();
+    return next();
   }
+  
+  // Для других событий тоже разрешаем
+  if (socket.handshake.auth?.email) {
+    socket.userEmail = socket.handshake.auth.email.toLowerCase();
+    return next();
+  }
+  
+  console.log('⚠️ WebSocket подключение без email');
+  next();
 });
 
 // PostgreSQL подключение
@@ -1508,69 +1533,74 @@ app.post('/send-call-notification', async (req, res) => {
   }
 });
 // WebSocket обработчики
-// В разделе WebSocket обработчиков добавьте:
 io.on('connection', (socket) => {
   console.log('✅ WebSocket подключение установлено:', socket.id);
+  console.log('📧 Email пользователя:', socket.userEmail);
 
-  // Обработка параметров подключения (email из query string)
-  const email = socket.handshake.query.email;
-  if (email) {
-    const normalizedEmail = email.toLowerCase();
-    activeUsers.set(normalizedEmail, socket.id);
-    console.log(`👤 Пользователь онлайн: ${normalizedEmail} (socket: ${socket.id})`);
+  // Автоматически добавляем пользователя в онлайн
+  if (socket.userEmail) {
+    activeUsers.set(socket.userEmail, socket.id);
     
-    // Отправляем подтверждение
+    console.log(`👤 Пользователь онлайн: ${socket.userEmail} (socket: ${socket.id})`);
+    console.log(`📊 Всего онлайн: ${activeUsers.size} пользователей`);
+
+    // Отправляем подтверждение подключения
     socket.emit('connection_established', {
       status: 'connected',
-      email: normalizedEmail,
+      email: socket.userEmail,
+      socketId: socket.id,
+      timestamp: new Date().toISOString()
+    });
+
+    // Уведомляем других пользователей
+    socket.broadcast.emit('user_status_changed', {
+      email: socket.userEmail,
+      status: 'online',
       timestamp: new Date().toISOString()
     });
   }
 
-  // Обработка аутентификации пользователя
+  // Обработка ping/pong для поддержания соединения
+  socket.on('ping', (data) => {
+    socket.emit('pong', {
+      ...data,
+      serverTime: new Date().toISOString()
+    });
+  });
+
+  socket.on('pong', (data) => {
+    console.log('🏓 Получен pong от клиента');
+  });
+
+  // Явная обработка user_online (для обратной совместимости)
   socket.on('user_online', (data) => {
     try {
-      if (!data || !data.email) {
-        console.log('❌ Неверные данные для user_online');
-        socket.emit('error', { message: 'Invalid data' });
-        return;
+      if (data && data.email) {
+        const email = data.email.toLowerCase();
+        activeUsers.set(email, socket.id);
+        socket.userEmail = email;
+        
+        console.log(`👤 Явный user_online: ${email}`);
+        
+        socket.emit('user_online_confirmed', {
+          status: 'confirmed',
+          email: email,
+          timestamp: new Date().toISOString()
+        });
       }
-      
-      const email = data.email.toLowerCase();
-      activeUsers.set(email, socket.id);
-      
-      console.log(`👤 Пользователь онлайн: ${email} (socket: ${socket.id})`);
-      
-      // Отправляем подтверждение подключения
-      socket.emit('connection_established', {
-        status: 'connected',
-        socketId: socket.id,
-        timestamp: new Date().toISOString()
-      });
-
-      // Уведомляем о статусе пользователя
-      socket.broadcast.emit('user_status_changed', {
-        email: email,
-        status: 'online',
-        timestamp: new Date().toISOString()
-      });
-
     } catch (error) {
       console.error('❌ Ошибка в user_online:', error);
-      socket.emit('error', { message: 'Internal server error' });
     }
   });
 
-  // Обработка уведомлений о звонках
+  // Обработка входящих звонков
   socket.on('call_notification', (data) => {
     try {
-      console.log('📞 Получен запрос на уведомление о звонке:', data);
+      console.log('📞 Получен call_notification:', data);
       
-      if (!data || !data.receiverEmail || !data.channelName || !data.callerEmail) {
-        console.log('❌ Неверные данные для call_notification');
+      if (!data || !data.receiverEmail) {
         socket.emit('call_notification_failed', {
-          error: 'Invalid data',
-          data: data
+          error: 'No receiver email'
         });
         return;
       }
@@ -1578,150 +1608,71 @@ io.on('connection', (socket) => {
       const receiverEmail = data.receiverEmail.toLowerCase();
       const receiverSocketId = activeUsers.get(receiverEmail);
       
-      console.log(`🔍 Поиск пользователя: ${receiverEmail}, socket: ${receiverSocketId}`);
-      console.log(`📊 Активные пользователи:`, Array.from(activeUsers.entries()));
+      console.log(`🔍 Поиск получателя: ${receiverEmail} -> ${receiverSocketId}`);
 
       if (receiverSocketId && io.sockets.sockets.has(receiverSocketId)) {
-        console.log(`📞 Отправляем уведомление о звонке: ${data.channelName} -> ${receiverEmail}`);
-        
-        io.to(receiverSocketId).emit('incoming_call', {
+        const callData = {
+          type: 'incoming_call',
           channelName: data.channelName,
           callerEmail: data.callerEmail,
           callerName: data.callerName || data.callerEmail,
           callType: data.callType || 'audio',
-          timestamp: new Date().toISOString()
-        });
+          timestamp: new Date().toISOString(),
+          callId: data.callId || Date.now().toString()
+        };
+
+        io.to(receiverSocketId).emit('incoming_call', callData);
         
-        // Подтверждение отправителю
+        console.log(`✅ Уведомление отправлено: ${receiverEmail}`);
+        
         socket.emit('call_notification_sent', {
           success: true,
           receiver: receiverEmail,
           timestamp: new Date().toISOString()
         });
-
-        console.log(`✅ Уведомление отправлено успешно`);
       } else {
-        console.log(`❌ Пользователь оффлайн или не найден: ${receiverEmail}`);
+        console.log(`❌ Пользователь оффлайн: ${receiverEmail}`);
         
         socket.emit('call_notification_failed', {
           success: false,
-          error: 'Пользователь оффлайн',
-          receiver: receiverEmail,
-          activeUsers: Array.from(activeUsers.keys())
+          error: 'USER_OFFLINE',
+          receiver: receiverEmail
         });
       }
     } catch (error) {
       console.error('❌ Ошибка в call_notification:', error);
       socket.emit('call_notification_failed', {
-        error: 'Internal server error',
+        error: 'INTERNAL_ERROR',
         details: error.message
       });
     }
-  });
-
-  // Обработка принятия звонка
-  socket.on('call_accepted', (data) => {
-    try {
-      console.log('✅ Звонок принят:', data);
-      
-      if (data.callerEmail) {
-        const callerSocketId = activeUsers.get(data.callerEmail.toLowerCase());
-        if (callerSocketId) {
-          io.to(callerSocketId).emit('call_accepted', {
-            channelName: data.channelName,
-            receiverEmail: data.receiverEmail
-          });
-        }
-      }
-    } catch (error) {
-      console.error('❌ Ошибка в call_accepted:', error);
-    }
-  });
-
-  // Обработка завершения звонка
-  socket.on('end_call', (data) => {
-    try {
-      console.log('📞 Завершение звонка:', data);
-      
-      if (data.receiverEmail) {
-        const receiverSocketId = activeUsers.get(data.receiverEmail.toLowerCase());
-        if (receiverSocketId) {
-          io.to(receiverSocketId).emit('call_ended', {
-            channelName: data.channelName,
-            reason: data.reason || 'call_ended'
-          });
-        }
-      }
-
-      // Также уведомляем всех в канале
-      if (data.channelName) {
-        socket.to(data.channelName).emit('call_ended', {
-          channelName: data.channelName,
-          reason: data.reason || 'call_ended'
-        });
-      }
-    } catch (error) {
-      console.error('❌ Ошибка в end_call:', error);
-    }
-  });
-
-  // Обработка сообщений в реальном времени
-  socket.on('send_message', (data) => {
-    try {
-      console.log('💬 Новое сообщение:', data);
-      
-      if (data.receiverEmail) {
-        const receiverSocketId = activeUsers.get(data.receiverEmail.toLowerCase());
-        if (receiverSocketId) {
-          io.to(receiverSocketId).emit('new_message', data);
-        }
-      }
-    } catch (error) {
-      console.error('❌ Ошибка в send_message:', error);
-    }
-  });
-
-  // Пинг-понг для поддержания соединения
-  socket.on('ping', () => {
-    socket.emit('pong', { timestamp: new Date().toISOString() });
-  });
-
-  // Обработка ошибок
-  socket.on('error', (error) => {
-    console.error('💥 WebSocket ошибка:', error);
   });
 
   // Обработка отключения
   socket.on('disconnect', (reason) => {
     console.log(`❌ WebSocket отключен: ${socket.id}, причина: ${reason}`);
     
-    // Находим и удаляем пользователя
-    for (let [email, socketId] of activeUsers.entries()) {
-      if (socketId === socket.id) {
-        activeUsers.delete(email);
-        console.log(`👤 Пользователь отключился: ${email}`);
-        
-        // Уведомляем других пользователей
-        socket.broadcast.emit('user_status_changed', {
-          email: email,
-          status: 'offline',
-          timestamp: new Date().toISOString()
-        });
-        break;
-      }
+    if (socket.userEmail) {
+      activeUsers.delete(socket.userEmail);
+      console.log(`👤 Удален из онлайн: ${socket.userEmail}`);
+      
+      // Уведомляем других пользователей
+      socket.broadcast.emit('user_status_changed', {
+        email: socket.userEmail,
+        status: 'offline',
+        timestamp: new Date().toISOString(),
+        reason: reason
+      });
     }
     
-    console.log(`📊 Осталось активных пользователей: ${activeUsers.size}`);
+    console.log(`📊 Осталось онлайн: ${activeUsers.size} пользователей`);
   });
 
-  // Приветственное сообщение
-  socket.emit('welcome', {
-    message: 'WebSocket подключен успешно',
-    socketId: socket.id,
-    timestamp: new Date().toISOString()
+  // Обработка ошибок
+  socket.on('error', (error) => {
+    console.error('💥 WebSocket ошибка:', error);
   });
 });
-
 // Явная обработка WebSocket соединений
 io.engine.on("connection", (rawSocket) => {
   console.log('🔗 Raw WebSocket connection established');
@@ -1739,6 +1690,33 @@ server.on('upgrade', (req, socket, head) => {
   } else {
     socket.destroy();
   }
+});
+
+// Эндпоинт для проверки WebSocket подключения
+app.get('/websocket/debug', (req, res) => {
+  const userEmail = req.query.email;
+  
+  if (userEmail) {
+    const normalizedEmail = userEmail.toLowerCase();
+    const socketId = activeUsers.get(normalizedEmail);
+    const isOnline = !!(socketId && io.sockets.sockets.has(socketId));
+    
+    return res.json({
+      success: true,
+      email: normalizedEmail,
+      isOnline: isOnline,
+      socketId: socketId,
+      activeUsers: Array.from(activeUsers.entries()),
+      totalConnections: io.engine.clientsCount
+    });
+  }
+  
+  res.json({
+    success: true,
+    activeUsers: Array.from(activeUsers.entries()),
+    totalConnections: io.engine.clientsCount,
+    timestamp: new Date().toISOString()
+  });
 });
 
 // Эндпоинт для проверки статуса WebSocket
