@@ -15,6 +15,7 @@ const Agora = require('agora-access-token');
 const http = require('http');
 const socketIo = require('socket.io');
 const isRender = process.env.NODE_ENV === 'production';
+const pendingCalls = new Map();
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -1884,10 +1885,177 @@ app.get('/check-calls/:userEmail', async (req, res) => {
     }
 });
 
-// Эндпоинт для завершения звонка
+// Эндпоинт для проверки входящих звонков (лонг-поллинг)
+app.get('/check-incoming-calls/:userEmail', async (req, res) => {
+    try {
+        const userEmail = req.params.userEmail.toLowerCase();
+        const timeout = parseInt(req.query.timeout) || 30000; // 30 секунд таймаут
+        
+        console.log(`🔍 Проверка звонков для: ${userEmail}, timeout: ${timeout}ms`);
+
+        // Проверяем есть ли уже ожидающие звонки
+        const existingCall = pendingCalls.get(userEmail);
+        if (existingCall) {
+            pendingCalls.delete(userEmail);
+            return res.json({
+                success: true,
+                hasCall: true,
+                call: existingCall
+            });
+        }
+
+        // Ждем новый звонок
+        const checkCall = () => {
+            const call = pendingCalls.get(userEmail);
+            if (call) {
+                pendingCalls.delete(userEmail);
+                res.json({
+                    success: true,
+                    hasCall: true,
+                    call: call
+                });
+                return true;
+            }
+            return false;
+        };
+
+        // Проверяем сразу
+        if (checkCall()) return;
+
+        // Устанавливаем интервал проверки
+        const interval = setInterval(() => {
+            if (checkCall()) {
+                clearInterval(interval);
+            }
+        }, 1000);
+
+        // Таймаут
+        setTimeout(() => {
+            clearInterval(interval);
+            if (!res.headersSent) {
+                res.json({
+                    success: true,
+                    hasCall: false,
+                    message: 'No incoming calls'
+                });
+            }
+        }, timeout);
+
+    } catch (error) {
+        console.error('❌ Ошибка проверки звонков:', error);
+        if (!res.headersSent) {
+            res.status(500).json({ 
+                success: false, 
+                error: 'Internal server error' 
+            });
+        }
+    }
+});
+
+// Эндпоинт для отправки звонка
+app.post('/send-call', async (req, res) => {
+    try {
+        const { channelName, callerEmail, receiverEmail, callType, callerName } = req.body;
+
+        console.log('📞 Отправка звонка:', { channelName, callerEmail, receiverEmail, callType });
+
+        if (!channelName || !callerEmail || !receiverEmail) {
+            return res.status(400).json({ 
+                success: false, 
+                error: 'channelName, callerEmail, receiverEmail обязательны' 
+            });
+        }
+
+        const normalizedReceiver = receiverEmail.toLowerCase();
+        
+        // Сохраняем информацию о звонке
+        const callData = {
+            channelName: channelName,
+            callerEmail: callerEmail,
+            receiverEmail: normalizedReceiver,
+            callType: callType || 'audio',
+            callerName: callerName || callerEmail,
+            timestamp: new Date().toISOString(),
+            callId: Date.now().toString()
+        };
+
+        // Сохраняем в базу для истории
+        await pool.query(
+            `INSERT INTO agora_calls (channel_name, caller_email, receiver_email, call_type, status)
+             VALUES ($1, $2, $3, $4, 'ringing') 
+             ON CONFLICT (channel_name) 
+             DO UPDATE SET status = 'ringing', created_at = CURRENT_TIMESTAMP`,
+            [channelName, callerEmail, normalizedReceiver, callType || 'audio']
+        );
+
+        // Добавляем в ожидающие звонки
+        pendingCalls.set(normalizedReceiver, callData);
+        
+        // Очищаем через 1 минуту если не забрали
+        setTimeout(() => {
+            if (pendingCalls.get(normalizedReceiver)?.callId === callData.callId) {
+                pendingCalls.delete(normalizedReceiver);
+                console.log(`🗑️  Очищен ожидающий звонок для: ${normalizedReceiver}`);
+            }
+        }, 60000);
+
+        console.log(`✅ Звонок отправлен: ${callerEmail} -> ${normalizedReceiver}`);
+
+        res.json({
+            success: true,
+            message: 'Call sent successfully',
+            callId: callData.callId
+        });
+
+    } catch (error) {
+        console.error('❌ Ошибка отправки звонка:', error);
+        res.status(500).json({ 
+            success: false, 
+            error: 'Internal server error',
+            details: error.message 
+        });
+    }
+});
+
+// Эндпоинт для принятия звонка
+app.post('/accept-call', async (req, res) => {
+    try {
+        const { channelName, receiverEmail } = req.body;
+
+        if (!channelName || !receiverEmail) {
+            return res.status(400).json({ 
+                success: false, 
+                error: 'channelName и receiverEmail обязательны' 
+            });
+        }
+
+        // Удаляем из ожидающих
+        pendingCalls.delete(receiverEmail.toLowerCase());
+
+        // Обновляем статус в базе
+        await pool.query(
+            "UPDATE agora_calls SET status = 'accepted' WHERE channel_name = $1",
+            [channelName]
+        );
+
+        res.json({
+            success: true,
+            message: 'Call accepted'
+        });
+
+    } catch (error) {
+        console.error('❌ Ошибка принятия звонка:', error);
+        res.status(500).json({ 
+            success: false, 
+            error: 'Internal server error' 
+        });
+    }
+});
+
+// Эндпоинт для отклонения/завершения звонка
 app.post('/end-call', async (req, res) => {
     try {
-        const { channelName } = req.body;
+        const { channelName, receiverEmail } = req.body;
 
         if (!channelName) {
             return res.status(400).json({ 
@@ -1896,6 +2064,12 @@ app.post('/end-call', async (req, res) => {
             });
         }
 
+        // Удаляем из ожидающих
+        if (receiverEmail) {
+            pendingCalls.delete(receiverEmail.toLowerCase());
+        }
+
+        // Обновляем статус в базе
         await pool.query(
             "UPDATE agora_calls SET status = 'ended', ended_at = CURRENT_TIMESTAMP WHERE channel_name = $1",
             [channelName]
@@ -1903,11 +2077,48 @@ app.post('/end-call', async (req, res) => {
 
         res.json({
             success: true,
-            message: 'Звонок завершен'
+            message: 'Call ended'
         });
 
     } catch (error) {
         console.error('❌ Ошибка завершения звонка:', error);
+        res.status(500).json({ 
+            success: false, 
+            error: 'Internal server error' 
+        });
+    }
+});
+
+// Эндпоинт для проверки активных звонков
+app.get('/active-calls/:userEmail', async (req, res) => {
+    try {
+        const userEmail = req.params.userEmail.toLowerCase();
+        
+        // Проверяем в базе
+        const dbResult = await pool.query(`
+            SELECT channel_name as "channelName", caller_email as "callerEmail", 
+                   receiver_email as "receiverEmail", call_type as "callType", 
+                   status, created_at as "createdAt"
+            FROM agora_calls 
+            WHERE (caller_email = $1 OR receiver_email = $1) 
+            AND status = 'ringing'
+            AND created_at > NOW() - INTERVAL '2 minutes'
+            ORDER BY created_at DESC
+            LIMIT 5
+        `, [userEmail]);
+
+        // Проверяем в памяти
+        const memoryCall = pendingCalls.get(userEmail);
+
+        res.json({
+            success: true,
+            calls: dbResult.rows,
+            pendingCall: memoryCall,
+            hasCall: !!memoryCall || dbResult.rows.length > 0
+        });
+
+    } catch (error) {
+        console.error('❌ Ошибка проверки активных звонков:', error);
         res.status(500).json({ 
             success: false, 
             error: 'Internal server error' 
