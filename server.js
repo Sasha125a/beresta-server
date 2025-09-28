@@ -1508,10 +1508,24 @@ app.post('/send-call-notification', async (req, res) => {
   }
 });
 // WebSocket обработчики
-// Улучшенные WebSocket обработчики
+// В разделе WebSocket обработчиков добавьте:
 io.on('connection', (socket) => {
   console.log('✅ WebSocket подключение установлено:', socket.id);
-  console.log('📊 Активные подключения:', io.engine.clientsCount);
+
+  // Обработка параметров подключения (email из query string)
+  const email = socket.handshake.query.email;
+  if (email) {
+    const normalizedEmail = email.toLowerCase();
+    activeUsers.set(normalizedEmail, socket.id);
+    console.log(`👤 Пользователь онлайн: ${normalizedEmail} (socket: ${socket.id})`);
+    
+    // Отправляем подтверждение
+    socket.emit('connection_established', {
+      status: 'connected',
+      email: normalizedEmail,
+      timestamp: new Date().toISOString()
+    });
+  }
 
   // Обработка аутентификации пользователя
   socket.on('user_online', (data) => {
