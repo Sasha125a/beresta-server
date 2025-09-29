@@ -1708,6 +1708,245 @@ app.delete('/delete-account/:userEmail', async (req, res) => {
     }
 });
 
+// ДОБАВЬТЕ ПОСЛЕ СУЩЕСТВУЮЩИХ ENDPOINTS:
+
+// Загрузка файла в группу
+app.post('/upload-group', upload.single('file'), async (req, res) => {
+    try {
+        if (!req.file) {
+            return res.status(400).json({ success: false, error: 'Файл не загружен' });
+        }
+
+        const { groupId, senderEmail, message } = req.body;
+
+        if (!groupId || !senderEmail) {
+            fs.unlinkSync(req.file.path);
+            return res.status(400).json({ success: false, error: 'Группа и отправитель обязательны' });
+        }
+
+        const senderInfo = await getUserTableAndType(senderEmail);
+        if (!senderInfo) {
+            fs.unlinkSync(req.file.path);
+            return res.status(404).json({ success: false, error: 'Отправитель не найден' });
+        }
+
+        const fileType = getFileType(req.file.mimetype, req.file.originalname);
+        let thumbnailFilename = '';
+        let videoDuration = 0;
+
+        const completeFileUpload = async (thumbnail = '') => {
+            try {
+                const result = await pool.query(
+                    `INSERT INTO group_messages 
+                     (group_id, sender_email, sender_type, message, attachment_type, 
+                      attachment_filename, attachment_original_name, attachment_mime_type, 
+                      attachment_size, duration, thumbnail) 
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) RETURNING *`,
+                    [
+                        groupId,
+                        senderEmail.toLowerCase(),
+                        senderInfo.type,
+                        message || '',
+                        fileType,
+                        req.file.filename,
+                        req.file.originalname,
+                        req.file.mimetype,
+                        req.file.size,
+                        videoDuration,
+                        thumbnail
+                    ]
+                );
+
+                if (moveFileToPermanent(req.file.filename)) {
+                    res.json({
+                        success: true,
+                        messageId: result.rows[0].id,
+                        filename: req.file.filename,
+                        thumbnail: thumbnail
+                    });
+                } else {
+                    throw new Error('Ошибка перемещения файла');
+                }
+            } catch (error) {
+                fs.unlinkSync(req.file.path);
+                if (thumbnail) {
+                    fs.unlinkSync(path.join(thumbnailsDir, thumbnail));
+                }
+                throw error;
+            }
+        };
+
+        if (fileType === 'image' || fileType === 'video') {
+            const previewName = `preview_${path.parse(req.file.filename).name}.jpg`;
+            const previewPath = path.join(thumbnailsDir, previewName);
+
+            if (fileType === 'video') {
+                getVideoDuration(req.file.path, (err, duration) => {
+                    if (!err && duration > 0) videoDuration = duration;
+                    
+                    createMediaPreview(req.file.path, previewPath, fileType, (err) => {
+                        if (!err) thumbnailFilename = previewName;
+                        completeFileUpload(thumbnailFilename);
+                    });
+                });
+            } else {
+                createMediaPreview(req.file.path, previewPath, fileType, (err) => {
+                    if (!err) thumbnailFilename = previewName;
+                    completeFileUpload(thumbnailFilename);
+                });
+            }
+        } else {
+            await completeFileUpload();
+        }
+    } catch (error) {
+        console.error('❌ Ошибка загрузки группового файла:', error);
+        if (req.file && fs.existsSync(req.file.path)) {
+            fs.unlinkSync(req.file.path);
+        }
+        res.status(500).json({ success: false, error: 'Internal server error' });
+    }
+});
+
+// Информация о групповом файле
+app.get('/group-file-info/:filename', async (req, res) => {
+    try {
+        const filename = req.params.filename;
+
+        const result = await pool.query(
+            `SELECT attachment_filename, attachment_original_name, 
+                    attachment_mime_type, attachment_size, attachment_type
+             FROM group_messages WHERE attachment_filename = $1`,
+            [filename]
+        );
+
+        if (result.rows.length === 0 || !result.rows[0].attachment_filename) {
+            return res.status(404).json({ success: false, error: 'Файл не найден' });
+        }
+
+        const filePath = path.join(permanentDir, result.rows[0].attachment_filename);
+        const exists = fs.existsSync(filePath);
+
+        res.json({
+            success: true,
+            exists: exists,
+            filename: result.rows[0].attachment_filename,
+            originalName: result.rows[0].attachment_original_name,
+            mimeType: result.rows[0].attachment_mime_type,
+            size: result.rows[0].attachment_size,
+            type: result.rows[0].attachment_type
+        });
+    } catch (error) {
+        console.error('❌ Ошибка получения информации о групповом файле:', error);
+        res.status(500).json({ success: false, error: 'Internal server error' });
+    }
+});
+
+// Проверка активных звонков
+app.get('/check-calls/:userEmail', async (req, res) => {
+    try {
+        const userEmail = req.params.userEmail.toLowerCase();
+        
+        console.log(`🔍 Проверка звонков для: ${userEmail}`);
+        
+        const result = await pool.query(`
+            SELECT channel_name as "channelName", caller_email as "callerEmail", 
+                   receiver_email as "receiverEmail", call_type as "callType", 
+                   status, created_at as "createdAt"
+            FROM agora_calls 
+            WHERE receiver_email = $1 
+            AND status = 'ringing'
+            AND created_at > NOW() - INTERVAL '5 minutes'
+            ORDER BY created_at DESC
+            LIMIT 5
+        `, [userEmail]);
+
+        console.log(`📞 Найдено активных звонков: ${result.rows.length}`);
+        
+        res.json({
+            success: true,
+            calls: result.rows,
+            timestamp: new Date().toISOString()
+        });
+
+    } catch (error) {
+        console.error('❌ Ошибка проверки звонков:', error);
+        res.status(500).json({ 
+            success: false, 
+            error: 'Internal server error' 
+        });
+    }
+});
+
+// Добавление участника в группу
+app.post('/add-group-member', async (req, res) => {
+    try {
+        const { groupId, userEmail } = req.body;
+
+        if (!groupId || !userEmail) {
+            return res.status(400).json({ success: false, error: 'Группа и пользователь обязательны' });
+        }
+
+        const userInfo = await getUserTableAndType(userEmail);
+        if (!userInfo) {
+            return res.status(404).json({ success: false, error: 'Пользователь не найден' });
+        }
+
+        await pool.query(
+            "INSERT INTO group_members (group_id, user_email, user_type) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
+            [groupId, userEmail.toLowerCase(), userInfo.type]
+        );
+
+        res.json({
+            success: true,
+            message: 'Участник добавлен'
+        });
+    } catch (error) {
+        console.error('❌ Ошибка добавления участника:', error);
+        res.status(500).json({ success: false, error: 'Internal server error' });
+    }
+});
+
+// Удаление участника из группы
+app.post('/remove-group-member', async (req, res) => {
+    try {
+        const { groupId, userEmail } = req.body;
+
+        if (!groupId || !userEmail) {
+            return res.status(400).json({ success: false, error: 'Группа и пользователь обязательны' });
+        }
+
+        await pool.query(
+            "DELETE FROM group_members WHERE group_id = $1 AND user_email = $2",
+            [groupId, userEmail.toLowerCase()]
+        );
+
+        res.json({
+            success: true,
+            message: 'Участник удален'
+        });
+    } catch (error) {
+        console.error('❌ Ошибка удаления участника:', error);
+        res.status(500).json({ success: false, error: 'Internal server error' });
+    }
+});
+
+// Удаление группы
+app.delete('/group/:groupId', async (req, res) => {
+    try {
+        const groupId = req.params.groupId;
+
+        await pool.query("DELETE FROM groups WHERE id = $1", [groupId]);
+
+        res.json({
+            success: true,
+            message: 'Группа удалена'
+        });
+    } catch (error) {
+        console.error('❌ Ошибка удаления группы:', error);
+        res.status(500).json({ success: false, error: 'Internal server error' });
+    }
+});
+
 // Статические файлы
 app.use('/uploads', express.static(uploadDir));
 
