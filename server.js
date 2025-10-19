@@ -151,13 +151,11 @@ async function createTables() {
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       )`,
 
-      // ОБЩИЕ ТАБЛИЦЫ
+      // ОБЩИЕ ТАБЛИЦЫ - УПРОЩЕННАЯ версия БЕЗ user_type/friend_type
       `CREATE TABLE IF NOT EXISTS friends (
         id SERIAL PRIMARY KEY,
         user_email TEXT NOT NULL,
         friend_email TEXT NOT NULL,
-        user_type TEXT DEFAULT 'regular',
-        friend_type TEXT DEFAULT 'regular',
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         UNIQUE(user_email, friend_email)
       )`,
@@ -165,9 +163,7 @@ async function createTables() {
       `CREATE TABLE IF NOT EXISTS messages (
         id SERIAL PRIMARY KEY,
         sender_email TEXT NOT NULL,
-        sender_type TEXT DEFAULT 'regular',
         receiver_email TEXT NOT NULL,
-        receiver_type TEXT DEFAULT 'regular',
         message TEXT DEFAULT '',
         attachment_type TEXT DEFAULT '',
         attachment_filename TEXT DEFAULT '',
@@ -188,7 +184,6 @@ async function createTables() {
         name TEXT NOT NULL,
         description TEXT DEFAULT '',
         created_by TEXT NOT NULL,
-        created_by_type TEXT DEFAULT 'regular',
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       )`,
 
@@ -196,7 +191,6 @@ async function createTables() {
         id SERIAL PRIMARY KEY,
         group_id INTEGER NOT NULL,
         user_email TEXT NOT NULL,
-        user_type TEXT DEFAULT 'regular',
         role TEXT DEFAULT 'member',
         joined_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         UNIQUE(group_id, user_email)
@@ -206,7 +200,6 @@ async function createTables() {
         id SERIAL PRIMARY KEY,
         group_id INTEGER NOT NULL,
         sender_email TEXT NOT NULL,
-        sender_type TEXT DEFAULT 'regular',
         message TEXT DEFAULT '',
         attachment_type TEXT DEFAULT '',
         attachment_filename TEXT DEFAULT '',
@@ -222,9 +215,7 @@ async function createTables() {
         id SERIAL PRIMARY KEY,
         channel_name TEXT UNIQUE NOT NULL,
         caller_email TEXT NOT NULL,
-        caller_type TEXT DEFAULT 'regular',
         receiver_email TEXT NOT NULL,
-        receiver_type TEXT DEFAULT 'regular',
         call_type TEXT DEFAULT 'audio',
         status TEXT DEFAULT 'ringing',
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -258,7 +249,7 @@ async function createTables() {
   }
 }
 
-// Функция для определения типа файла
+// Функция определения типа файла
 function getFileType(mimetype, filename) {
     if (mimetype.startsWith('image/')) return 'image';
     if (mimetype.startsWith('video/')) return 'video';
@@ -408,18 +399,18 @@ async function addToChatsAutomatically(user1, user2) {
         }
 
         await pool.query(
-            `INSERT INTO friends (user_email, friend_email, user_type, friend_type) 
-             VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING`,
-            [user1.toLowerCase(), user2.toLowerCase(), user1Info.type, user2Info.type]
+            `INSERT INTO friends (user_email, friend_email) 
+             VALUES ($1, $2) ON CONFLICT DO NOTHING`,
+            [user1.toLowerCase(), user2.toLowerCase()]
         );
 
         await pool.query(
-            `INSERT INTO friends (user_email, friend_email, user_type, friend_type) 
-             VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING`,
-            [user2.toLowerCase(), user1.toLowerCase(), user2Info.type, user1Info.type]
+            `INSERT INTO friends (user_email, friend_email) 
+             VALUES ($1, $2) ON CONFLICT DO NOTHING`,
+            [user2.toLowerCase(), user1.toLowerCase()]
         );
 
-        console.log(`✅ Автоматически добавлены чаты: ${user1} (${user1Info.type}) ↔️ ${user2} (${user2Info.type})`);
+        console.log(`✅ Автоматически добавлены чаты: ${user1} ↔️ ${user2}`);
     } catch (error) {
         console.error('❌ Ошибка автоматического добавления в чаты:', error);
     }
@@ -474,8 +465,7 @@ app.post('/register', async (req, res) => {
         res.json({
             success: true,
             message: 'Пользователь успешно зарегистрирован',
-            userId: result.rows[0].id,
-            userType: 'regular'
+            userId: result.rows[0].id
         });
 
     } catch (error) {
@@ -512,8 +502,7 @@ app.post('/register-beresta', async (req, res) => {
         res.json({
             success: true,
             message: 'Beresta ID пользователь зарегистрирован',
-            userId: result.rows[0].id,
-            userType: 'beresta'
+            userId: result.rows[0].id
         });
 
     } catch (error) {
@@ -587,45 +576,55 @@ app.get('/user/:email', async (req, res) => {
     }
 });
 
-// Добавление в друзья
+// Добавление в друзья - УПРОЩЕННАЯ версия БЕЗ типов
 app.post('/add-friend', async (req, res) => {
     try {
         const { userEmail, friendEmail } = req.body;
 
-        console.log('🔄 Попытка добавления друга:', { userEmail, friendEmail });
+        console.log('🔄 Добавление друга:', { userEmail, friendEmail });
 
         if (!userEmail || !friendEmail) {
-            console.log('❌ Отсутствуют email');
             return res.status(400).json({ success: false, error: 'Email обязательны' });
         }
 
-        const userInfo = await getUserTableAndType(userEmail);
-        const friendInfo = await getUserTableAndType(friendEmail);
+        const normalizedUserEmail = userEmail.toLowerCase().trim();
+        const normalizedFriendEmail = friendEmail.toLowerCase().trim();
 
-        console.log('👤 Информация о пользователях:', { userInfo, friendInfo });
+        // Проверка на добавление самого себя
+        if (normalizedUserEmail === normalizedFriendEmail) {
+            return res.status(400).json({ 
+                success: false, 
+                error: 'Нельзя добавить самого себя' 
+            });
+        }
 
-        if (!userInfo || !friendInfo) {
-            console.log('❌ Пользователи не найдены');
+        // Проверка существования пользователей
+        const userExists = await userExists(normalizedUserEmail);
+        const friendExists = await userExists(normalizedFriendEmail);
+
+        if (!userExists || !friendExists) {
             return res.status(404).json({ 
                 success: false, 
                 error: 'Пользователи не найдены' 
             });
         }
 
-        console.log('📝 Вставка в таблицу friends:', {
-            userEmail: userEmail.toLowerCase(),
-            friendEmail: friendEmail.toLowerCase(), 
-            userType: userInfo.type,
-            friendType: friendInfo.type
-        });
-
+        // ПРОСТАЯ вставка БЕЗ типов
         const result = await pool.query(
-            `INSERT INTO friends (user_email, friend_email, user_type, friend_type) 
-             VALUES ($1, $2, $3, $4) ON CONFLICT (user_email, friend_email) DO NOTHING`,
-            [userEmail.toLowerCase(), friendEmail.toLowerCase(), userInfo.type, friendInfo.type]
+            `INSERT INTO friends (user_email, friend_email) 
+             VALUES ($1, $2) 
+             ON CONFLICT (user_email, friend_email) DO NOTHING 
+             RETURNING *`,
+            [normalizedUserEmail, normalizedFriendEmail]
         );
 
-        console.log('✅ Результат вставки:', result.rowCount);
+        // Обратная связь БЕЗ типов
+        await pool.query(
+            `INSERT INTO friends (user_email, friend_email) 
+             VALUES ($1, $2) 
+             ON CONFLICT (user_email, friend_email) DO NOTHING`,
+            [normalizedFriendEmail, normalizedUserEmail]
+        );
 
         res.json({
             success: true,
@@ -638,7 +637,7 @@ app.post('/add-friend', async (req, res) => {
         res.status(500).json({ 
             success: false, 
             error: 'Internal server error',
-            details: error.message 
+            details: error.message
         });
     }
 });
@@ -668,60 +667,33 @@ app.post('/remove-friend', async (req, res) => {
     }
 });
 
-// Получение чатов пользователя
+// Получение чатов пользователя - ИСПРАВЛЕННАЯ версия БЕЗ friend_type
 app.get('/chats/:userEmail', async (req, res) => {
     try {
         const userEmail = req.params.userEmail.toLowerCase();
 
+        console.log('🔄 Получение чатов для:', userEmail);
+
         const result = await pool.query(`
             SELECT 
-                u.email as "contactEmail",
-                u.first_name as "firstName",
-                u.last_name as "lastName",
-                'friend' as type,
-                MAX(m.timestamp) as "lastMessageTime"
-            FROM friends f
-            LEFT JOIN regular_users u ON u.email = f.friend_email AND f.friend_type = 'regular'
-            LEFT JOIN beresta_users u2 ON u2.email = f.friend_email AND f.friend_type = 'beresta'
-            LEFT JOIN messages m ON 
-                (m.sender_email = f.user_email AND m.receiver_email = f.friend_email) OR
-                (m.sender_email = f.friend_email AND m.receiver_email = f.user_email)
-            WHERE f.user_email = $1
-            GROUP BY u.email, u.first_name, u.last_name, u2.email, u2.first_name, u2.last_name
-            
-            UNION
-            
-            SELECT 
-                CASE 
-                    WHEN m.sender_email = $2 THEN m.receiver_email
-                    ELSE m.sender_email
-                END as "contactEmail",
+                f.friend_email as "contactEmail",
                 COALESCE(ru.first_name, bu.first_name) as "firstName",
                 COALESCE(ru.last_name, bu.last_name) as "lastName",
-                'chat' as type,
-                MAX(m.timestamp) as "lastMessageTime"
-            FROM messages m
-            LEFT JOIN regular_users ru ON ru.email = CASE 
-                WHEN m.sender_email = $2 THEN m.receiver_email
-                ELSE m.sender_email
-            END
-            LEFT JOIN beresta_users bu ON bu.email = CASE 
-                WHEN m.sender_email = $2 THEN m.receiver_email
-                ELSE m.sender_email
-            END
-            WHERE (m.sender_email = $2 OR m.receiver_email = $2)
-            AND NOT EXISTS (
-                SELECT 1 FROM friends f 
-                WHERE f.user_email = $2 
-                AND f.friend_email = CASE 
-                    WHEN m.sender_email = $2 THEN m.receiver_email
-                    ELSE m.sender_email
-                END
-            )
-            GROUP BY "contactEmail", ru.first_name, ru.last_name, bu.first_name, bu.last_name
-            
-            ORDER BY "lastMessageTime" DESC NULLS LAST, "firstName", "lastName"
-        `, [userEmail, userEmail]);
+                'friend' as type,
+                COALESCE(
+                    (SELECT MAX(timestamp) FROM messages m 
+                     WHERE (m.sender_email = f.user_email AND m.receiver_email = f.friend_email)
+                     OR (m.sender_email = f.friend_email AND m.receiver_email = f.user_email)),
+                    f.created_at
+                ) as "lastMessageTime"
+            FROM friends f
+            LEFT JOIN regular_users ru ON f.friend_email = ru.email
+            LEFT JOIN beresta_users bu ON f.friend_email = bu.email
+            WHERE f.user_email = $1
+            ORDER BY "lastMessageTime" DESC
+        `, [userEmail]);
+
+        console.log('✅ Найдено чатов:', result.rows.length);
 
         res.json({
             success: true,
@@ -760,7 +732,7 @@ app.get('/messages/:userEmail/:friendEmail', async (req, res) => {
     }
 });
 
-// Отправка текстового сообщения
+// Отправка текстового сообщения - УПРОЩЕННАЯ версия
 app.post('/send-message', async (req, res) => {
     try {
         const { senderEmail, receiverEmail, message, duration } = req.body;
@@ -777,13 +749,11 @@ app.post('/send-message', async (req, res) => {
         }
 
         const result = await pool.query(
-            `INSERT INTO messages (sender_email, receiver_email, sender_type, receiver_type, message, duration) 
-             VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
+            `INSERT INTO messages (sender_email, receiver_email, message, duration) 
+             VALUES ($1, $2, $3, $4) RETURNING *`,
             [
                 senderEmail.toLowerCase(), 
                 receiverEmail.toLowerCase(),
-                senderInfo.type,
-                receiverInfo.type,
                 message || '', 
                 duration || 0
             ]
@@ -835,7 +805,7 @@ app.post('/upload-file', upload.single('file'), async (req, res) => {
     }
 });
 
-// Загрузка файла с сообщением
+// Загрузка файла с сообщением - УПРОЩЕННАЯ версия
 app.post('/upload', upload.single('file'), async (req, res) => {
     try {
         if (!req.file) {
@@ -865,15 +835,13 @@ app.post('/upload', upload.single('file'), async (req, res) => {
             try {
                 const result = await pool.query(
                     `INSERT INTO messages 
-                     (sender_email, receiver_email, sender_type, receiver_type, message, attachment_type, 
+                     (sender_email, receiver_email, message, attachment_type, 
                       attachment_filename, attachment_original_name, attachment_mime_type, 
                       attachment_size, duration, thumbnail) 
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) RETURNING *`,
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING *`,
                     [
                         senderEmail.toLowerCase(),
                         receiverEmail.toLowerCase(),
-                        senderInfo.type,
-                        receiverInfo.type,
                         message || '',
                         fileType,
                         req.file.filename,
@@ -937,7 +905,7 @@ app.post('/upload', upload.single('file'), async (req, res) => {
     }
 });
 
-// Отправка сообщения с информацией о файле
+// Отправка сообщения с информацией о файле - УПРОЩЕННАЯ версия
 app.post('/send-message-with-attachment', async (req, res) => {
     try {
         const { senderEmail, receiverEmail, message, attachmentType, 
@@ -956,14 +924,12 @@ app.post('/send-message-with-attachment', async (req, res) => {
 
         const result = await pool.query(
             `INSERT INTO messages 
-             (sender_email, receiver_email, sender_type, receiver_type, message, attachment_type, 
+             (sender_email, receiver_email, message, attachment_type, 
               attachment_filename, attachment_original_name, attachment_url) 
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING *`,
+             VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *`,
             [
                 senderEmail.toLowerCase(),
                 receiverEmail.toLowerCase(),
-                senderInfo.type,
-                receiverInfo.type,
                 message || '',
                 attachmentType || '',
                 attachmentFilename || '',
@@ -1052,7 +1018,7 @@ app.get('/file-info/:messageId', async (req, res) => {
     }
 });
 
-// Создание группы
+// Создание группы - УПРОЩЕННАЯ версия
 app.post('/create-group', async (req, res) => {
     try {
         const { name, description, createdBy, members } = req.body;
@@ -1072,15 +1038,15 @@ app.post('/create-group', async (req, res) => {
             await client.query('BEGIN');
 
             const groupResult = await client.query(
-                "INSERT INTO groups (name, description, created_by, created_by_type) VALUES ($1, $2, $3, $4) RETURNING id",
-                [name, description || '', createdBy.toLowerCase(), createdByInfo.type]
+                "INSERT INTO groups (name, description, created_by) VALUES ($1, $2, $3) RETURNING id",
+                [name, description || '', createdBy.toLowerCase()]
             );
 
             const groupId = groupResult.rows[0].id;
 
             await client.query(
-                "INSERT INTO group_members (group_id, user_email, user_type, role) VALUES ($1, $2, $3, 'admin')",
-                [groupId, createdBy.toLowerCase(), createdByInfo.type]
+                "INSERT INTO group_members (group_id, user_email, role) VALUES ($1, $2, 'admin')",
+                [groupId, createdBy.toLowerCase()]
             );
 
             if (members && members.length > 0) {
@@ -1089,8 +1055,8 @@ app.post('/create-group', async (req, res) => {
                         const memberInfo = await getUserTableAndType(member);
                         if (memberInfo) {
                             await client.query(
-                                "INSERT INTO group_members (group_id, user_email, user_type) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
-                                [groupId, member.toLowerCase(), memberInfo.type]
+                                "INSERT INTO group_members (group_id, user_email) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+                                [groupId, member.toLowerCase()]
                             );
                         }
                     }
@@ -1116,7 +1082,7 @@ app.post('/create-group', async (req, res) => {
     }
 });
 
-// Получение списка групп пользователя
+// Получение списка групп пользователя - УПРОЩЕННАЯ версия
 app.get('/groups/:userEmail', async (req, res) => {
     try {
         const userEmail = req.params.userEmail.toLowerCase();
@@ -1150,8 +1116,8 @@ app.get('/group-members/:groupId', async (req, res) => {
         const result = await pool.query(`
             SELECT u.email, u.first_name, u.last_name, gm.role, gm.joined_at
             FROM group_members gm
-            LEFT JOIN regular_users u ON gm.user_email = u.email AND gm.user_type = 'regular'
-            LEFT JOIN beresta_users u2 ON gm.user_email = u2.email AND gm.user_type = 'beresta'
+            LEFT JOIN regular_users u ON gm.user_email = u.email
+            LEFT JOIN beresta_users u2 ON gm.user_email = u2.email
             WHERE gm.group_id = $1
             ORDER BY gm.role DESC, u.first_name, u.last_name
         `, [groupId]);
@@ -1166,7 +1132,7 @@ app.get('/group-members/:groupId', async (req, res) => {
     }
 });
 
-// Отправка сообщения в группу
+// Отправка сообщения в группу - УПРОЩЕННАЯ версия
 app.post('/send-group-message', async (req, res) => {
     try {
         const { groupId, senderEmail, message, duration } = req.body;
@@ -1181,9 +1147,9 @@ app.post('/send-group-message', async (req, res) => {
         }
 
         const result = await pool.query(
-            `INSERT INTO group_messages (group_id, sender_email, sender_type, message, duration) 
-             VALUES ($1, $2, $3, $4, $5) RETURNING *`,
-            [groupId, senderEmail.toLowerCase(), senderInfo.type, message || '', duration || 0]
+            `INSERT INTO group_messages (group_id, sender_email, message, duration) 
+             VALUES ($1, $2, $3, $4) RETURNING *`,
+            [groupId, senderEmail.toLowerCase(), message || '', duration || 0]
         );
 
         res.json({
@@ -1209,8 +1175,8 @@ app.get('/group-messages/:groupId', async (req, res) => {
                    COALESCE(ru.first_name, bu.first_name) as first_name,
                    COALESCE(ru.last_name, bu.last_name) as last_name
             FROM group_messages gm
-            LEFT JOIN regular_users ru ON gm.sender_email = ru.email AND gm.sender_type = 'regular'
-            LEFT JOIN beresta_users bu ON gm.sender_email = bu.email AND gm.sender_type = 'beresta'
+            LEFT JOIN regular_users ru ON gm.sender_email = ru.email
+            LEFT JOIN beresta_users bu ON gm.sender_email = bu.email
             WHERE gm.group_id = $1
             ORDER BY gm.timestamp ASC
         `, [groupId]);
@@ -1335,7 +1301,7 @@ app.get('/agora/token/:channelName/:userId', (req, res) => {
     }
 });
 
-// Создание Agora звонка
+// Создание Agora звонка - УПРОЩЕННАЯ версия
 app.post('/agora/create-call', async (req, res) => {
     try {
         console.log('📞 Данные создания звонка:', req.body);
@@ -1363,9 +1329,9 @@ app.post('/agora/create-call', async (req, res) => {
         }
 
         const result = await pool.query(
-            `INSERT INTO agora_calls (channel_name, caller_email, caller_type, receiver_email, receiver_type, call_type, status)
-             VALUES ($1, $2, $3, $4, $5, $6, 'ringing') RETURNING *`,
-            [channelName, callerEmail.toLowerCase(), callerInfo.type, receiverEmail.toLowerCase(), receiverInfo.type, callType || 'audio']
+            `INSERT INTO agora_calls (channel_name, caller_email, receiver_email, call_type, status)
+             VALUES ($1, $2, $3, $4, 'ringing') RETURNING *`,
+            [channelName, callerEmail.toLowerCase(), receiverEmail.toLowerCase(), callType || 'audio']
         );
 
         console.log('✅ Запись звонка создана:', result.rows[0]);
@@ -1546,11 +1512,11 @@ app.post('/send-call', async (req, res) => {
         };
 
         await pool.query(
-            `INSERT INTO agora_calls (channel_name, caller_email, caller_type, receiver_email, receiver_type, call_type, status)
-             VALUES ($1, $2, $3, $4, $5, $6, 'ringing') 
+            `INSERT INTO agora_calls (channel_name, caller_email, receiver_email, call_type, status)
+             VALUES ($1, $2, $3, $4, 'ringing') 
              ON CONFLICT (channel_name) 
              DO UPDATE SET status = 'ringing', created_at = CURRENT_TIMESTAMP`,
-            [channelName, callerEmail, callerInfo.type, normalizedReceiver, receiverInfo.type, callType || 'audio']
+            [channelName, callerEmail, normalizedReceiver, callType || 'audio']
         );
 
         pendingCalls.set(normalizedReceiver, callData);
@@ -1728,9 +1694,7 @@ app.delete('/delete-account/:userEmail', async (req, res) => {
     }
 });
 
-// ДОБАВЬТЕ ПОСЛЕ СУЩЕСТВУЮЩИХ ENDPOINTS:
-
-// Загрузка файла в группу
+// Загрузка файла в группу - УПРОЩЕННАЯ версия
 app.post('/upload-group', upload.single('file'), async (req, res) => {
     try {
         if (!req.file) {
@@ -1758,14 +1722,13 @@ app.post('/upload-group', upload.single('file'), async (req, res) => {
             try {
                 const result = await pool.query(
                     `INSERT INTO group_messages 
-                     (group_id, sender_email, sender_type, message, attachment_type, 
+                     (group_id, sender_email, message, attachment_type, 
                       attachment_filename, attachment_original_name, attachment_mime_type, 
                       attachment_size, duration, thumbnail) 
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) RETURNING *`,
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING *`,
                     [
                         groupId,
                         senderEmail.toLowerCase(),
-                        senderInfo.type,
                         message || '',
                         fileType,
                         req.file.filename,
@@ -1912,8 +1875,8 @@ app.post('/add-group-member', async (req, res) => {
         }
 
         await pool.query(
-            "INSERT INTO group_members (group_id, user_email, user_type) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
-            [groupId, userEmail.toLowerCase(), userInfo.type]
+            "INSERT INTO group_members (group_id, user_email) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+            [groupId, userEmail.toLowerCase()]
         );
 
         res.json({
@@ -1967,24 +1930,6 @@ app.delete('/group/:groupId', async (req, res) => {
     }
 });
 
-// Принудительное создание таблиц
-app.post('/debug/create-tables', async (req, res) => {
-    try {
-        console.log('🔄 Принудительное создание таблиц...');
-        await createTables();
-        res.json({
-            success: true,
-            message: 'Таблицы созданы/проверены'
-        });
-    } catch (error) {
-        console.error('❌ Ошибка создания таблиц:', error);
-        res.status(500).json({ 
-            success: false, 
-            error: error.message 
-        });
-    }
-});
-
 // Статические файлы
 app.use('/uploads', express.static(uploadDir));
 
@@ -1995,12 +1940,12 @@ server.listen(PORT, '0.0.0.0', async () => {
     console.log(`📡 WebSocket сервер активен: ws://0.0.0.0:${PORT}`);
     console.log(`🔧 Режим: ${process.env.NODE_ENV || 'development'}`);
     
-    // Принудительное создание таблиц с таймаутом
+    // Принудительное создание таблиц с задержкой
     setTimeout(async () => {
         console.log('🔄 Принудительное создание таблиц...');
         await createTables();
         console.log('✅ Таблицы созданы/проверены');
-    }, 3000); // Задержка 3 секунды
+    }, 5000);
     
     console.log('✅ Сервер готов к работе');
 });
