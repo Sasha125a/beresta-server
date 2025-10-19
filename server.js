@@ -1967,6 +1967,24 @@ app.delete('/group/:groupId', async (req, res) => {
     }
 });
 
+// Принудительное создание таблиц
+app.post('/debug/create-tables', async (req, res) => {
+    try {
+        console.log('🔄 Принудительное создание таблиц...');
+        await createTables();
+        res.json({
+            success: true,
+            message: 'Таблицы созданы/проверены'
+        });
+    } catch (error) {
+        console.error('❌ Ошибка создания таблиц:', error);
+        res.status(500).json({ 
+            success: false, 
+            error: error.message 
+        });
+    }
+});
+
 // Статические файлы
 app.use('/uploads', express.static(uploadDir));
 
@@ -1977,7 +1995,12 @@ server.listen(PORT, '0.0.0.0', async () => {
     console.log(`📡 WebSocket сервер активен: ws://0.0.0.0:${PORT}`);
     console.log(`🔧 Режим: ${process.env.NODE_ENV || 'development'}`);
     
-    await createTables();
+    // Принудительное создание таблиц с таймаутом
+    setTimeout(async () => {
+        console.log('🔄 Принудительное создание таблиц...');
+        await createTables();
+        console.log('✅ Таблицы созданы/проверены');
+    }, 3000); // Задержка 3 секунды
     
     console.log('✅ Сервер готов к работе');
 });
