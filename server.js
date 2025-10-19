@@ -592,34 +592,54 @@ app.post('/add-friend', async (req, res) => {
     try {
         const { userEmail, friendEmail } = req.body;
 
+        console.log('🔄 Попытка добавления друга:', { userEmail, friendEmail });
+
         if (!userEmail || !friendEmail) {
+            console.log('❌ Отсутствуют email');
             return res.status(400).json({ success: false, error: 'Email обязательны' });
         }
 
         const userInfo = await getUserTableAndType(userEmail);
         const friendInfo = await getUserTableAndType(friendEmail);
 
+        console.log('👤 Информация о пользователях:', { userInfo, friendInfo });
+
         if (!userInfo || !friendInfo) {
+            console.log('❌ Пользователи не найдены');
             return res.status(404).json({ 
                 success: false, 
                 error: 'Пользователи не найдены' 
             });
         }
 
-        await pool.query(
+        console.log('📝 Вставка в таблицу friends:', {
+            userEmail: userEmail.toLowerCase(),
+            friendEmail: friendEmail.toLowerCase(), 
+            userType: userInfo.type,
+            friendType: friendInfo.type
+        });
+
+        const result = await pool.query(
             `INSERT INTO friends (user_email, friend_email, user_type, friend_type) 
              VALUES ($1, $2, $3, $4) ON CONFLICT (user_email, friend_email) DO NOTHING`,
             [userEmail.toLowerCase(), friendEmail.toLowerCase(), userInfo.type, friendInfo.type]
         );
 
+        console.log('✅ Результат вставки:', result.rowCount);
+
         res.json({
             success: true,
-            message: 'Друг добавлен'
+            message: 'Друг добавлен',
+            inserted: result.rowCount > 0
         });
 
     } catch (error) {
         console.error('❌ Ошибка добавления друга:', error);
-        res.status(500).json({ success: false, error: 'Internal server error' });
+        res.status(500).json({ 
+            success: false, 
+            error: 'Internal server error',
+            details: error.message 
+        });
     }
 });
 
