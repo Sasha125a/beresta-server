@@ -6,6 +6,7 @@
   "type": "commonjs",
   "scripts": {
     "start": "node server.js",
+    "ping": "curl -f https://your-app-name.onrender.com/health || exit 1",
     "dev": "nodemon server.js",
     "setup": "node -e \"console.log('Running initial setup...'); require('./server.js');\"",
     "backup": "node -e \"require('./fileStorage.js').createBackup()\"",
@@ -61,6 +62,7 @@
     "ffprobe-static": "^3.1.0"
   }
 }
+
 
 
 
