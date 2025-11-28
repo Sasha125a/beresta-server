@@ -35,6 +35,48 @@ const io = socketIo(server, {
   connectTimeout: 45000
 });
 
+// Функция само-пинга для Render.com
+function startSelfPing() {
+    const selfPingUrl = process.env.RENDER_SELF_PING_URL || `http://localhost:${PORT}`;
+    
+    if (isRender && selfPingUrl.includes('onrender.com')) {
+        console.log('🔔 Активирован само-пинг для Render.com');
+        
+        const pingInterval = setInterval(() => {
+            const http = require('http');
+            
+            http.get(`${selfPingUrl}/health`, (res) => {
+                let data = '';
+                res.on('data', chunk => data += chunk);
+                res.on('end', () => {
+                    console.log('✅ Само-пинг успешен:', {
+                        timestamp: new Date().toISOString(),
+                        statusCode: res.statusCode
+                    });
+                });
+            }).on('error', (err) => {
+                console.error('❌ Ошибка само-пинга:', err.message);
+            });
+        }, 4 * 60 * 1000); // Пинг каждые 4 минуты (меньше 5-минутного таймаута Render)
+
+        // Очистка при завершении
+        process.on('SIGINT', () => {
+            clearInterval(pingInterval);
+            console.log('🛑 Само-пинг остановлен');
+        });
+        
+        process.on('SIGTERM', () => {
+            clearInterval(pingInterval);
+            console.log('🛑 Само-пинг остановлен');
+        });
+        
+        return pingInterval;
+    } else {
+        console.log('ℹ️ Само-пинг отключен (не продакшен режим)');
+        return null;
+    }
+}
+
 // PostgreSQL подключение
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
@@ -422,18 +464,43 @@ function isValidChannelName(channelName) {
     return pattern.test(channelName) && channelName.length <= 64;
 }
 
-// Health check
+// Улучшенный health check эндпоинт
 app.get('/health', async (req, res) => {
     try {
+        // Проверка базы данных
         await pool.query('SELECT 1');
+        
+        // Проверка доступности директорий
+        const dirs = [uploadDir, tempDir, permanentDir, thumbnailsDir];
+        const dirStatus = {};
+        dirs.forEach(dir => {
+            dirStatus[dir] = fs.existsSync(dir);
+        });
+        
+        // Статистика активных подключений
+        const stats = {
+            activeUsers: activeUsers.size,
+            activeCalls: activeCalls.size,
+            pendingCalls: pendingCalls.size,
+            timestamp: new Date().toISOString(),
+            uptime: process.uptime(),
+            memory: process.memoryUsage(),
+            database: 'PostgreSQL',
+            directories: dirStatus
+        };
+        
         res.json({ 
             success: true, 
-            status: 'Server is running',
-            timestamp: new Date().toISOString(),
-            database: 'PostgreSQL'
+            status: 'Server is running optimally',
+            ...stats
         });
     } catch (error) {
-        res.status(500).json({ success: false, error: 'Database error' });
+        console.error('❌ Health check failed:', error);
+        res.status(500).json({ 
+            success: false, 
+            error: 'Health check failed',
+            details: error.message 
+        });
     }
 });
 
@@ -1939,6 +2006,11 @@ server.listen(PORT, '0.0.0.0', async () => {
     console.log(`🌐 URL: http://0.0.0.0:${PORT}`);
     console.log(`📡 WebSocket сервер активен: ws://0.0.0.0:${PORT}`);
     console.log(`🔧 Режим: ${process.env.NODE_ENV || 'development'}`);
+    
+    // Запуск само-пинга для Render.com
+    if (isRender) {
+        startSelfPing();
+    }
     
     // Принудительное создание таблиц с задержкой
     setTimeout(async () => {
