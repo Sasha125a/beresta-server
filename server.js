@@ -35,6 +35,43 @@ const io = socketIo(server, {
   connectTimeout: 45000
 });
 
+// PostgreSQL подключение
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false
+});
+
+// Функции для работы с пользователями - ДОЛЖНЫ БЫТЬ ОБЪЯВЛЕНЫ ДО ИСПОЛЬЗОВАНИЯ
+async function getUserTableAndType(email) {
+  const normalizedEmail = email.toLowerCase();
+  
+  const berestaResult = await pool.query(
+    "SELECT 'beresta' as user_type FROM beresta_users WHERE email = $1",
+    [normalizedEmail]
+  );
+  
+  if (berestaResult.rows.length > 0) {
+    return { table: 'beresta_users', type: 'beresta' };
+  }
+  
+  const regularResult = await pool.query(
+    "SELECT 'regular' as user_type FROM regular_users WHERE email = $1",
+    [normalizedEmail]
+  );
+  
+  if (regularResult.rows.length > 0) {
+    return { table: 'regular_users', type: 'regular' };
+  }
+  
+  return null;
+}
+
+// Функция проверки существования пользователя
+async function userExists(email) {
+  const userInfo = await getUserTableAndType(email);
+  return userInfo !== null;
+}
+
 // Функция само-пинга для Render.com
 function startSelfPing() {
     const selfPingUrl = process.env.RENDER_SELF_PING_URL || `http://localhost:${PORT}`;
@@ -76,12 +113,6 @@ function startSelfPing() {
         return null;
     }
 }
-
-// PostgreSQL подключение
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false
-});
 
 // Middleware
 app.use(cors({
@@ -133,36 +164,6 @@ const upload = multer({
 // Устанавливаем пути к ffmpeg
 ffmpeg.setFfmpegPath(ffmpegPath);
 ffmpeg.setFfprobePath(ffprobePath);
-
-// Функции для работы с пользователями
-async function getUserTableAndType(email) {
-  const normalizedEmail = email.toLowerCase();
-  
-  const berestaResult = await pool.query(
-    "SELECT 'beresta' as user_type FROM beresta_users WHERE email = $1",
-    [normalizedEmail]
-  );
-  
-  if (berestaResult.rows.length > 0) {
-    return { table: 'beresta_users', type: 'beresta' };
-  }
-  
-  const regularResult = await pool.query(
-    "SELECT 'regular' as user_type FROM regular_users WHERE email = $1",
-    [normalizedEmail]
-  );
-  
-  if (regularResult.rows.length > 0) {
-    return { table: 'regular_users', type: 'regular' };
-  }
-  
-  return null;
-}
-
-async function userExists(email) {
-  const userInfo = await getUserTableAndType(email);
-  return userInfo !== null;
-}
 
 // Функция для создания таблиц
 async function createTables() {
@@ -478,6 +479,7 @@ app.get('/health', async (req, res) => {
         });
         
         // Статистика активных подключений
+        const activeUsers = new Map(); // Локальная переменная для этого эндпоинта
         const stats = {
             activeUsers: activeUsers.size,
             activeCalls: activeCalls.size,
@@ -665,11 +667,11 @@ app.post('/add-friend', async (req, res) => {
             });
         }
 
-        // Проверка существования пользователей
-        const userExists = await userExists(normalizedUserEmail);
-        const friendExists = await userExists(normalizedFriendEmail);
+        // Проверка существования пользователей - используем функцию userExists
+        const userExistsCheck = await userExists(normalizedUserEmail);
+        const friendExistsCheck = await userExists(normalizedFriendEmail);
 
-        if (!userExists || !friendExists) {
+        if (!userExistsCheck || !friendExistsCheck) {
             return res.status(404).json({ 
                 success: false, 
                 error: 'Пользователи не найдены' 
@@ -1367,48 +1369,6 @@ app.get('/agora/token/:channelName/:userId', (req, res) => {
         res.status(500).json({ success: false, error: 'Internal server error' });
     }
 });
-
-// Функция само-пинга для Render.com
-function startSelfPing() {
-    const selfPingUrl = process.env.RENDER_SELF_PING_URL || `http://localhost:${PORT}`;
-    
-    if (isRender && selfPingUrl.includes('onrender.com')) {
-        console.log('🔔 Активирован само-пинг для Render.com');
-        
-        const pingInterval = setInterval(() => {
-            const http = require('http');
-            
-            http.get(`${selfPingUrl}/health`, (res) => {
-                let data = '';
-                res.on('data', chunk => data += chunk);
-                res.on('end', () => {
-                    console.log('✅ Само-пинг успешен:', {
-                        timestamp: new Date().toISOString(),
-                        statusCode: res.statusCode
-                    });
-                });
-            }).on('error', (err) => {
-                console.error('❌ Ошибка само-пинга:', err.message);
-            });
-        }, 4 * 60 * 1000); // Пинг каждые 4 минуты (меньше 5-минутного таймаута Render)
-
-        // Очистка при завершении
-        process.on('SIGINT', () => {
-            clearInterval(pingInterval);
-            console.log('🛑 Само-пинг остановлен');
-        });
-        
-        process.on('SIGTERM', () => {
-            clearInterval(pingInterval);
-            console.log('🛑 Само-пинг остановлен');
-        });
-        
-        return pingInterval;
-    } else {
-        console.log('ℹ️ Само-пинг отключен (не продакшен режим)');
-        return null;
-    }
-}
 
 // Новая функция: Само-пинг сайта по адресу https://beresta-server.onrender.com
 function startSitePing() {
