@@ -1368,6 +1368,94 @@ app.get('/agora/token/:channelName/:userId', (req, res) => {
     }
 });
 
+// Функция само-пинга для Render.com
+function startSelfPing() {
+    const selfPingUrl = process.env.RENDER_SELF_PING_URL || `http://localhost:${PORT}`;
+    
+    if (isRender && selfPingUrl.includes('onrender.com')) {
+        console.log('🔔 Активирован само-пинг для Render.com');
+        
+        const pingInterval = setInterval(() => {
+            const http = require('http');
+            
+            http.get(`${selfPingUrl}/health`, (res) => {
+                let data = '';
+                res.on('data', chunk => data += chunk);
+                res.on('end', () => {
+                    console.log('✅ Само-пинг успешен:', {
+                        timestamp: new Date().toISOString(),
+                        statusCode: res.statusCode
+                    });
+                });
+            }).on('error', (err) => {
+                console.error('❌ Ошибка само-пинга:', err.message);
+            });
+        }, 4 * 60 * 1000); // Пинг каждые 4 минуты (меньше 5-минутного таймаута Render)
+
+        // Очистка при завершении
+        process.on('SIGINT', () => {
+            clearInterval(pingInterval);
+            console.log('🛑 Само-пинг остановлен');
+        });
+        
+        process.on('SIGTERM', () => {
+            clearInterval(pingInterval);
+            console.log('🛑 Само-пинг остановлен');
+        });
+        
+        return pingInterval;
+    } else {
+        console.log('ℹ️ Само-пинг отключен (не продакшен режим)');
+        return null;
+    }
+}
+
+// Новая функция: Само-пинг сайта по адресу https://beresta-server.onrender.com
+function startSitePing() {
+    const siteUrl = 'https://beresta-server.onrender.com';
+    
+    if (isRender) {
+        console.log('🌐 Активирован само-пинг сайта:', siteUrl);
+        
+        const sitePingInterval = setInterval(() => {
+            const https = require('https');
+            
+            https.get(`${siteUrl}/health`, (res) => {
+                let data = '';
+                res.on('data', chunk => data += chunk);
+                res.on('end', () => {
+                    console.log('✅ Само-пинг сайта успешен:', {
+                        timestamp: new Date().toISOString(),
+                        statusCode: res.statusCode,
+                        url: siteUrl
+                    });
+                });
+            }).on('error', (err) => {
+                console.error('❌ Ошибка само-пинга сайта:', {
+                    url: siteUrl,
+                    error: err.message
+                });
+            });
+        }, 3.5 * 60 * 1000); // Пинг каждые 3.5 минуты (немного реже чем внутренний пинг)
+
+        // Очистка при завершении
+        process.on('SIGINT', () => {
+            clearInterval(sitePingInterval);
+            console.log('🛑 Само-пинг сайта остановлен');
+        });
+        
+        process.on('SIGTERM', () => {
+            clearInterval(sitePingInterval);
+            console.log('🛑 Само-пинг сайта остановлен');
+        });
+        
+        return sitePingInterval;
+    } else {
+        console.log('ℹ️ Само-пинг сайта отключен (не продакшен режим)');
+        return null;
+    }
+}
+
 // Создание Agora звонка - УПРОЩЕННАЯ версия
 app.post('/agora/create-call', async (req, res) => {
     try {
@@ -2000,16 +2088,31 @@ app.delete('/group/:groupId', async (req, res) => {
 // Статические файлы
 app.use('/uploads', express.static(uploadDir));
 
-// Запуск сервера
+// Обновленная часть запуска сервера:
 server.listen(PORT, '0.0.0.0', async () => {
     console.log(`🚀 Сервер запущен на порту ${PORT}`);
     console.log(`🌐 URL: http://0.0.0.0:${PORT}`);
     console.log(`📡 WebSocket сервер активен: ws://0.0.0.0:${PORT}`);
     console.log(`🔧 Режим: ${process.env.NODE_ENV || 'development'}`);
+    console.log(`🔗 Внешний URL: https://beresta-server.onrender.com`);
     
     // Запуск само-пинга для Render.com
     if (isRender) {
         startSelfPing();
+        startSitePing();
+        
+        // Первый немедленный пинг сайта
+        setTimeout(() => {
+            const https = require('https');
+            https.get('https://beresta-server.onrender.com/health', (res) => {
+                console.log('🚀 Первый пинг сайта:', {
+                    status: res.statusCode,
+                    timestamp: new Date().toISOString()
+                });
+            }).on('error', (err) => {
+                console.error('⚠️ Первый пинг сайта не удался:', err.message);
+            });
+        }, 3000);
     }
     
     // Принудительное создание таблиц с задержкой
