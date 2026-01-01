@@ -1385,6 +1385,57 @@ app.post('/update-profile', upload.single('avatar'), async (req, res) => {
     }
 });
 
+// Проверить статус звонка
+app.get('/check-call-status/:channelName', async (req, res) => {
+    try {
+        const { channelName } = req.params;
+        const { userEmail } = req.query;
+
+        if (!channelName) {
+            return res.status(400).json({ 
+                success: false, 
+                error: 'channelName обязателен' 
+            });
+        }
+
+        const result = await query(`
+            SELECT status, caller_email, receiver_email
+            FROM agora_calls 
+            WHERE channel_name = ?
+            LIMIT 1
+        `, [channelName]);
+
+        if (result.length === 0) {
+            return res.json({
+                success: true,
+                status: 'not_found',
+                message: 'Call not found'
+            });
+        }
+
+        const call = result[0];
+        
+        res.json({
+            success: true,
+            status: call.status,
+            channelName: channelName,
+            callerEmail: call.caller_email,
+            receiverEmail: call.receiver_email,
+            isParticipant: userEmail && (
+                userEmail.toLowerCase() === call.caller_email.toLowerCase() || 
+                userEmail.toLowerCase() === call.receiver_email.toLowerCase()
+            )
+        });
+
+    } catch (error) {
+        console.error('❌ Ошибка проверки статуса звонка:', error);
+        res.status(500).json({ 
+            success: false, 
+            error: 'Internal server error' 
+        });
+    }
+});
+
 // Agora токен
 app.get('/agora/token/:channelName/:userId', (req, res) => {
     try {
