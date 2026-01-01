@@ -876,6 +876,44 @@ app.post('/send-message', async (req, res) => {
     }
 });
 
+// Принять звонок
+app.post('/accept-call', async (req, res) => {
+    try {
+        const { channelName, receiverEmail } = req.body;
+
+        if (!channelName || !receiverEmail) {
+            return res.status(400).json({ 
+                success: false, 
+                error: 'channelName и receiverEmail обязательны' 
+            });
+        }
+
+        // Удаляем из ожидающих звонков
+        pendingCalls.delete(receiverEmail.toLowerCase());
+
+        // Обновляем статус в базе данных
+        await run(
+            "UPDATE agora_calls SET status = 'accepted' WHERE channel_name = ?",
+            [channelName]
+        );
+
+        console.log(`✅ Звонок принят: ${channelName} пользователем ${receiverEmail}`);
+
+        res.json({
+            success: true,
+            message: 'Call accepted',
+            channelName: channelName
+        });
+
+    } catch (error) {
+        console.error('❌ Ошибка принятия звонка:', error);
+        res.status(500).json({ 
+            success: false, 
+            error: 'Internal server error' 
+        });
+    }
+});
+
 // Загрузка файла
 app.post('/upload-file', upload.single('file'), async (req, res) => {
     try {
