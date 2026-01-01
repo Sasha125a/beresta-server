@@ -103,9 +103,12 @@ function startSelfPing() {
         console.log('🔔 Активирован само-пинг для Render.com');
         
         const pingInterval = setInterval(() => {
-            const http = require('http');
+            const url = new URL(selfPingUrl);
+            const isHttps = url.protocol === 'https:';
             
-            http.get(`${selfPingUrl}/health`, (res) => {
+            const httpModule = isHttps ? require('https') : require('http');
+            
+            httpModule.get(`${selfPingUrl}/health`, (res) => {
                 let data = '';
                 res.on('data', chunk => data += chunk);
                 res.on('end', () => {
