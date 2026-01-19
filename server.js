@@ -2196,7 +2196,7 @@ db = new sqlite3.Database(dbPath, (err) => {
             // Первый немедленный пинг сайта
             setTimeout(() => {
                 const https = require('https');
-                https.get('https://beresta-server.onrender.com/health', (res) => {
+                https.get('https://beresta-server-5udn.onrender.com/health', (res) => {
                     console.log('🚀 Первый пинг сайта:', {
                         status: res.statusCode,
                         timestamp: new Date().toISOString()
