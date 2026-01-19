@@ -23,7 +23,7 @@ const PORT = process.env.PORT || 3000;
 const server = http.createServer(app);
 const io = socketIo(server, {
   cors: {
-    origin: isRender ? ["https://beresta-server.onrender.com", "https://your-client-domain.com"] : "*",
+    origin: isRender ? ["https://beresta-server-5udn.onrender.com", "https://your-client-domain.com"] : "*",
     methods: ["GET", "POST"],
     credentials: true
   },
@@ -1491,9 +1491,9 @@ app.get('/agora/token/:channelName/:userId', (req, res) => {
     }
 });
 
-// Новая функция: Само-пинг сайта по адресу https://beresta-server.onrender.com
+// Новая функция: Само-пинг сайта по адресу https://beresta-server-5udn.onrender.com
 function startSitePing() {
-    const siteUrl = 'https://beresta-server.onrender.com';
+    const siteUrl = 'https://beresta-server-5udn.onrender.com';
     
     if (isRender) {
         console.log('🌐 Активирован само-пинг сайта:', siteUrl);
@@ -2185,7 +2185,7 @@ db = new sqlite3.Database(dbPath, (err) => {
         console.log(`🌐 URL: http://0.0.0.0:${PORT}`);
         console.log(`📡 WebSocket сервер активен: ws://0.0.0.0:${PORT}`);
         console.log(`🔧 Режим: ${process.env.NODE_ENV || 'development'}`);
-        console.log(`🔗 Внешний URL: https://beresta-server.onrender.com`);
+        console.log(`🔗 Внешний URL: https://beresta-server-5udn.onrender.com`);
         console.log(`💾 База данных: SQLite (${dbPath})`);
         
         // Запуск само-пинга для Render.com
