@@ -465,31 +465,109 @@ app.get('/users', async (req, res) => {
     }
 });
 
-// Получение информации о пользователе
-app.get('/user/:email', async (req, res) => {
+// Получение чатов пользователя
+app.get('/chats/:userEmail', async (req, res) => {
     try {
-        const email = decodeURIComponent(req.params.email).toLowerCase();
-        const user = await getUserInfo(email);
+        const userEmail = req.params.userEmail.toLowerCase();
 
-        if (!user) {
-            return res.status(404).json({ success: false, error: 'Пользователь не найден' });
+        console.log('🔄 Получение чатов для:', userEmail);
+
+        // Сначала получаем всех друзей пользователя
+        const { data: friends, error: friendsError } = await supabase
+            .from('friends')
+            .select('friend_email, created_at')
+            .eq('user_email', userEmail);
+
+        if (friendsError) {
+            console.error('❌ Ошибка получения friends:', friendsError);
+            throw friendsError;
         }
+
+        console.log(`📊 Найдено friends записей: ${friends?.length || 0}`);
+
+        if (!friends || friends.length === 0) {
+            return res.json({
+                success: true,
+                chats: []
+            });
+        }
+
+        // Получаем информацию о каждом друге отдельно из обеих таблиц
+        const chats = [];
+        
+        for (const friend of friends) {
+            const friendEmail = friend.friend_email;
+            
+            // Ищем в regular_users
+            const { data: regularUser, error: regularError } = await supabase
+                .from('regular_users')
+                .select('first_name, last_name')
+                .eq('email', friendEmail)
+                .maybeSingle();
+
+            if (regularError) {
+                console.error(`❌ Ошибка поиска regular_user ${friendEmail}:`, regularError);
+                continue;
+            }
+
+            // Ищем в beresta_users
+            const { data: berestaUser, error: berestaError } = await supabase
+                .from('beresta_users')
+                .select('first_name, last_name')
+                .eq('email', friendEmail)
+                .maybeSingle();
+
+            if (berestaError) {
+                console.error(`❌ Ошибка поиска beresta_user ${friendEmail}:`, berestaError);
+                continue;
+            }
+
+            // Выбираем найденного пользователя
+            const userData = regularUser || berestaUser;
+            
+            if (!userData) {
+                console.warn(`⚠️ Пользователь ${friendEmail} не найден ни в одной таблице`);
+                continue;
+            }
+
+            // Получаем последнее сообщение
+            const { data: messages, error: msgError } = await supabase
+                .from('messages')
+                .select('timestamp')
+                .or(`and(sender_email.eq.${userEmail},receiver_email.eq.${friendEmail}),and(sender_email.eq.${friendEmail},receiver_email.eq.${userEmail})`)
+                .order('timestamp', { ascending: false })
+                .limit(1);
+
+            if (msgError) {
+                console.error(`❌ Ошибка получения сообщений для ${friendEmail}:`, msgError);
+            }
+
+            chats.push({
+                contactEmail: friendEmail,
+                firstName: userData.first_name || '',
+                lastName: userData.last_name || '',
+                type: 'friend',
+                lastMessageTime: messages?.[0]?.timestamp || friend.created_at || new Date().toISOString()
+            });
+        }
+
+        // Сортируем по времени последнего сообщения
+        chats.sort((a, b) => new Date(b.lastMessageTime) - new Date(a.lastMessageTime));
+
+        console.log('✅ Найдено чатов:', chats.length);
 
         res.json({
             success: true,
-            user: {
-                email: user.email,
-                firstName: user.first_name,
-                lastName: user.last_name,
-                avatarFilename: user.avatar_filename || '',
-                userType: user.userType,
-                berestaId: user.beresta_id
-            }
+            chats: chats
         });
-
+        
     } catch (error) {
-        console.error('❌ Ошибка получения пользователя:', error);
-        res.status(500).json({ success: false, error: 'Internal server error' });
+        console.error('❌ Ошибка получения чатов:', error);
+        res.status(500).json({ 
+            success: false, 
+            error: 'Internal server error',
+            details: error.message 
+        });
     }
 });
 
