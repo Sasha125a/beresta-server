@@ -92,12 +92,12 @@ const upload = multer({
 ffmpeg.setFfmpegPath(ffmpegPath);
 ffmpeg.setFfprobePath(ffprobePath);
 
-// Функция само-пинга для Render.com
+// Функция само-пинга для Render.com (только для поддержания активности сервера)
 function startSelfPing() {
     const selfPingUrl = process.env.RENDER_SELF_PING_URL || `http://localhost:${PORT}`;
     
     if (isRender && selfPingUrl.includes('onrender.com')) {
-        console.log('🔔 Активирован само-пинг для Render.com');
+        console.log('🔔 Активирован внутренний само-пинг для Render.com');
         
         const pingInterval = setInterval(() => {
             const url = new URL(selfPingUrl);
@@ -109,29 +109,29 @@ function startSelfPing() {
                 let data = '';
                 res.on('data', chunk => data += chunk);
                 res.on('end', () => {
-                    console.log('✅ Само-пинг успешен:', {
+                    console.log('✅ Внутренний само-пинг успешен:', {
                         timestamp: new Date().toISOString(),
                         statusCode: res.statusCode
                     });
                 });
             }).on('error', (err) => {
-                console.error('❌ Ошибка само-пинга:', err.message);
+                console.error('❌ Ошибка внутреннего само-пинга:', err.message);
             });
-        }, 4 * 60 * 1000);
+        }, 4 * 60 * 1000); // Пинг каждые 4 минуты
 
         process.on('SIGINT', () => {
             clearInterval(pingInterval);
-            console.log('🛑 Само-пинг остановлен');
+            console.log('🛑 Внутренний само-пинг остановлен');
         });
         
         process.on('SIGTERM', () => {
             clearInterval(pingInterval);
-            console.log('🛑 Само-пинг остановлен');
+            console.log('🛑 Внутренний само-пинг остановлен');
         });
         
         return pingInterval;
     } else {
-        console.log('ℹ️ Само-пинг отключен (не продакшен режим)');
+        console.log('ℹ️ Внутренний само-пинг отключен (не продакшен режим)');
         return null;
     }
 }
@@ -559,7 +559,7 @@ app.post('/add-friend', async (req, res) => {
         res.status(500).json({ 
             success: false, 
             error: 'Internal server error',
-            details: error.message
+            details: error.message 
         });
     }
 });
@@ -1351,51 +1351,6 @@ app.get('/agora/token/:channelName/:userId', (req, res) => {
     }
 });
 
-// Само-пинг сайта
-function startSitePing() {
-    const siteUrl = 'https://beresta-server-5udn.onrender.com';
-    
-    if (isRender) {
-        console.log('🌐 Активирован само-пинг сайта:', siteUrl);
-        
-        const sitePingInterval = setInterval(() => {
-            const https = require('https');
-            
-            https.get(`${siteUrl}/health`, (res) => {
-                let data = '';
-                res.on('data', chunk => data += chunk);
-                res.on('end', () => {
-                    console.log('✅ Само-пинг сайта успешен:', {
-                        timestamp: new Date().toISOString(),
-                        statusCode: res.statusCode,
-                        url: siteUrl
-                    });
-                });
-            }).on('error', (err) => {
-                console.error('❌ Ошибка само-пинга сайта:', {
-                    url: siteUrl,
-                    error: err.message
-                });
-            });
-        }, 3.5 * 60 * 1000);
-
-        process.on('SIGINT', () => {
-            clearInterval(sitePingInterval);
-            console.log('🛑 Само-пинг сайта остановлен');
-        });
-        
-        process.on('SIGTERM', () => {
-            clearInterval(sitePingInterval);
-            console.log('🛑 Само-пинг сайта остановлен');
-        });
-        
-        return sitePingInterval;
-    } else {
-        console.log('ℹ️ Само-пинг сайта отключен (не продакшен режим)');
-        return null;
-    }
-}
-
 // Создание Agora звонка
 app.post('/agora/create-call', async (req, res) => {
     try {
@@ -2077,23 +2032,10 @@ server.listen(PORT, '0.0.0.0', async () => {
     console.log(`🔗 Внешний URL: https://beresta-server-5udn.onrender.com`);
     console.log(`💾 База данных: Supabase (${supabaseUrl})`);
     
-    // Запуск само-пинга для Render.com
+    // Запуск только внутреннего само-пинга для Render.com
     if (isRender) {
         startSelfPing();
-        startSitePing();
-        
-        // Первый немедленный пинг сайта
-        setTimeout(() => {
-            const https = require('https');
-            https.get('https://beresta-server-5udn.onrender.com/health', (res) => {
-                console.log('🚀 Первый пинг сайта:', {
-                    status: res.statusCode,
-                    timestamp: new Date().toISOString()
-                });
-            }).on('error', (err) => {
-                console.error('⚠️ Первый пинг сайта не удался:', err.message);
-            });
-        }, 3000);
+        console.log('✅ Внутренний само-пинг активирован (только для поддержания активности сервера)');
     }
     
     console.log('✅ Сервер готов к работе');
