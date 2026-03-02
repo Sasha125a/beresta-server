@@ -1,7 +1,6 @@
 const express = require('express');
 const cors = require('cors');
 const bodyParser = require('body-parser');
-const sqlite3 = require('sqlite3').verbose();
 const path = require('path');
 const fs = require('fs');
 const multer = require('multer');
@@ -10,11 +9,13 @@ const { v4: uuidv4 } = require('uuid');
 const ffmpeg = require('fluent-ffmpeg');
 const ffmpegPath = require('ffmpeg-static');
 const ffprobePath = require('ffprobe-static').path;
-const activeCalls = new Map();
 const Agora = require('agora-access-token');
 const http = require('http');
 const socketIo = require('socket.io');
+const { createClient } = require('@supabase/supabase-js');
+
 const isRender = process.env.NODE_ENV === 'production';
+const activeCalls = new Map();
 const pendingCalls = new Map();
 
 const app = express();
@@ -35,110 +36,10 @@ const io = socketIo(server, {
   connectTimeout: 45000
 });
 
-// SQLite подключение - локальная база данных
-const dbPath = process.env.DB_PATH || path.join(__dirname, 'beresta.db');
-let db = null;
-
-// Функция для работы с базой данных
-async function query(sql, params = []) {
-  return new Promise((resolve, reject) => {
-    db.all(sql, params, (err, rows) => {
-      if (err) {
-        reject(err);
-      } else {
-        resolve(rows);
-      }
-    });
-  });
-}
-
-async function run(sql, params = []) {
-  return new Promise((resolve, reject) => {
-    db.run(sql, params, function(err) {
-      if (err) {
-        reject(err);
-      } else {
-        resolve({ lastID: this.lastID, changes: this.changes });
-      }
-    });
-  });
-}
-
-// Функции для работы с пользователями
-async function getUserTableAndType(email) {
-  const normalizedEmail = email.toLowerCase();
-  
-  const berestaResult = await query(
-    "SELECT 'beresta' as user_type FROM beresta_users WHERE email = ?",
-    [normalizedEmail]
-  );
-  
-  if (berestaResult.length > 0) {
-    return { table: 'beresta_users', type: 'beresta' };
-  }
-  
-  const regularResult = await query(
-    "SELECT 'regular' as user_type FROM regular_users WHERE email = ?",
-    [normalizedEmail]
-  );
-  
-  if (regularResult.length > 0) {
-    return { table: 'regular_users', type: 'regular' };
-  }
-  
-  return null;
-}
-
-// Функция проверки существования пользователя
-async function userExists(email) {
-  const userInfo = await getUserTableAndType(email);
-  return userInfo !== null;
-}
-
-// Функция само-пинга для Render.com
-function startSelfPing() {
-    const selfPingUrl = process.env.RENDER_SELF_PING_URL || `http://localhost:${PORT}`;
-    
-    if (isRender && selfPingUrl.includes('onrender.com')) {
-        console.log('🔔 Активирован само-пинг для Render.com');
-        
-        const pingInterval = setInterval(() => {
-            const url = new URL(selfPingUrl);
-            const isHttps = url.protocol === 'https:';
-            
-            const httpModule = isHttps ? require('https') : require('http');
-            
-            httpModule.get(`${selfPingUrl}/health`, (res) => {
-                let data = '';
-                res.on('data', chunk => data += chunk);
-                res.on('end', () => {
-                    console.log('✅ Само-пинг успешен:', {
-                        timestamp: new Date().toISOString(),
-                        statusCode: res.statusCode
-                    });
-                });
-            }).on('error', (err) => {
-                console.error('❌ Ошибка само-пинга:', err.message);
-            });
-        }, 4 * 60 * 1000); // Пинг каждые 4 минуты (меньше 5-минутного таймаута Render)
-
-        // Очистка при завершении
-        process.on('SIGINT', () => {
-            clearInterval(pingInterval);
-            console.log('🛑 Само-пинг остановлен');
-        });
-        
-        process.on('SIGTERM', () => {
-            clearInterval(pingInterval);
-            console.log('🛑 Само-пинг остановлен');
-        });
-        
-        return pingInterval;
-    } else {
-        console.log('ℹ️ Само-пинг отключен (не продакшен режим)');
-        return null;
-    }
-}
+// Инициализация Supabase
+const supabaseUrl = process.env.SUPABASE_URL;
+const supabaseKey = process.env.SUPABASE_SERVICE_KEY; // Используйте service_role key для сервера
+const supabase = createClient(supabaseUrl, supabaseKey);
 
 // Middleware
 app.use(cors({
@@ -191,138 +92,48 @@ const upload = multer({
 ffmpeg.setFfmpegPath(ffmpegPath);
 ffmpeg.setFfprobePath(ffprobePath);
 
-// Функция для создания таблиц
-async function createTables() {
-  try {
-    console.log('🔄 Создание/проверка таблиц в SQLite...');
+// Функция само-пинга для Render.com
+function startSelfPing() {
+    const selfPingUrl = process.env.RENDER_SELF_PING_URL || `http://localhost:${PORT}`;
+    
+    if (isRender && selfPingUrl.includes('onrender.com')) {
+        console.log('🔔 Активирован само-пинг для Render.com');
+        
+        const pingInterval = setInterval(() => {
+            const url = new URL(selfPingUrl);
+            const isHttps = url.protocol === 'https:';
+            
+            const httpModule = isHttps ? require('https') : require('http');
+            
+            httpModule.get(`${selfPingUrl}/health`, (res) => {
+                let data = '';
+                res.on('data', chunk => data += chunk);
+                res.on('end', () => {
+                    console.log('✅ Само-пинг успешен:', {
+                        timestamp: new Date().toISOString(),
+                        statusCode: res.statusCode
+                    });
+                });
+            }).on('error', (err) => {
+                console.error('❌ Ошибка само-пинга:', err.message);
+            });
+        }, 4 * 60 * 1000);
 
-    const queries = [
-      // ОБЫЧНЫЕ ПОЛЬЗОВАТЕЛИ
-      `CREATE TABLE IF NOT EXISTS regular_users (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        email TEXT UNIQUE NOT NULL,
-        first_name TEXT NOT NULL,
-        last_name TEXT NOT NULL,
-        avatar_filename TEXT DEFAULT '',
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-      )`,
-
-      // BERESTA ID ПОЛЬЗОВАТЕЛИ
-      `CREATE TABLE IF NOT EXISTS beresta_users (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        email TEXT UNIQUE NOT NULL,
-        first_name TEXT NOT NULL,
-        last_name TEXT NOT NULL,
-        avatar_filename TEXT DEFAULT '',
-        beresta_id TEXT UNIQUE,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-      )`,
-
-      // ОБЩИЕ ТАБЛИЦЫ - УПРОЩЕННАЯ версия БЕЗ user_type/friend_type
-      `CREATE TABLE IF NOT EXISTS friends (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_email TEXT NOT NULL,
-        friend_email TEXT NOT NULL,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        UNIQUE(user_email, friend_email)
-      )`,
-
-      `CREATE TABLE IF NOT EXISTS messages (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        sender_email TEXT NOT NULL,
-        receiver_email TEXT NOT NULL,
-        message TEXT DEFAULT '',
-        attachment_type TEXT DEFAULT '',
-        attachment_filename TEXT DEFAULT '',
-        attachment_original_name TEXT DEFAULT '',
-        attachment_mime_type TEXT DEFAULT '',
-        attachment_size INTEGER DEFAULT 0,
-        attachment_url TEXT DEFAULT '',
-        duration INTEGER DEFAULT 0,
-        thumbnail TEXT DEFAULT '',
-        timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        status TEXT DEFAULT 'sent',
-        downloaded_by_sender BOOLEAN DEFAULT FALSE,
-        downloaded_by_receiver BOOLEAN DEFAULT FALSE
-      )`,
-
-      `CREATE TABLE IF NOT EXISTS groups (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        name TEXT NOT NULL,
-        description TEXT DEFAULT '',
-        created_by TEXT NOT NULL,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-      )`,
-
-      `CREATE TABLE IF NOT EXISTS group_members (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        group_id INTEGER NOT NULL,
-        user_email TEXT NOT NULL,
-        role TEXT DEFAULT 'member',
-        joined_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        UNIQUE(group_id, user_email)
-      )`,
-
-      `CREATE TABLE IF NOT EXISTS group_messages (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        group_id INTEGER NOT NULL,
-        sender_email TEXT NOT NULL,
-        message TEXT DEFAULT '',
-        attachment_type TEXT DEFAULT '',
-        attachment_filename TEXT DEFAULT '',
-        attachment_original_name TEXT DEFAULT '',
-        attachment_mime_type TEXT DEFAULT '',
-        attachment_size INTEGER DEFAULT 0,
-        duration INTEGER DEFAULT 0,
-        thumbnail TEXT DEFAULT '',
-        timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-      )`,
-
-      `CREATE TABLE IF NOT EXISTS agora_calls (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        channel_name TEXT UNIQUE NOT NULL,
-        caller_email TEXT NOT NULL,
-        receiver_email TEXT NOT NULL,
-        call_type TEXT DEFAULT 'audio',
-        status TEXT DEFAULT 'ringing',
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        ended_at TIMESTAMP
-      )`
-    ];
-
-    for (const queryStr of queries) {
-      try {
-        await run(queryStr);
-        console.log(`✅ Таблица создана`);
-      } catch (tableError) {
-        console.error('❌ Ошибка создания таблицы:', tableError.message);
-      }
+        process.on('SIGINT', () => {
+            clearInterval(pingInterval);
+            console.log('🛑 Само-пинг остановлен');
+        });
+        
+        process.on('SIGTERM', () => {
+            clearInterval(pingInterval);
+            console.log('🛑 Само-пинг остановлен');
+        });
+        
+        return pingInterval;
+    } else {
+        console.log('ℹ️ Само-пинг отключен (не продакшен режим)');
+        return null;
     }
-    
-    // Создание индексов
-    const indexes = [
-      `CREATE INDEX IF NOT EXISTS idx_regular_users_email ON regular_users(email)`,
-      `CREATE INDEX IF NOT EXISTS idx_beresta_users_email ON beresta_users(email)`,
-      `CREATE INDEX IF NOT EXISTS idx_messages_conversation ON messages(sender_email, receiver_email)`,
-      `CREATE INDEX IF NOT EXISTS idx_messages_timestamp ON messages(timestamp)`,
-      `CREATE INDEX IF NOT EXISTS idx_group_messages_group ON group_messages(group_id)`,
-      `CREATE INDEX IF NOT EXISTS idx_group_members_group ON group_members(group_id)`
-    ];
-
-    for (const index of indexes) {
-      try {
-        await run(index);
-        console.log(`✅ Индекс создан`);
-      } catch (indexError) {
-        console.error('❌ Ошибка создания индекса:', indexError.message);
-      }
-    }
-    
-    console.log('✅ Все таблицы созданы/проверены');
-    
-  } catch (error) {
-    console.error('❌ Ошибка создания таблиц:', error);
-  }
 }
 
 // Функция определения типа файла
@@ -417,74 +228,77 @@ function moveFileToPermanent(filename) {
     }
 }
 
-// Функция проверки и удаления файла если оба пользователя скачали
-async function checkAndDeleteFile(messageId, filename) {
-    try {
-        const result = await query(
-            `SELECT downloaded_by_sender, downloaded_by_receiver FROM messages WHERE id = ?`,
-            [messageId]
-        );
-
-        if (result.length > 0) {
-            const row = result[0];
-            if (row.downloaded_by_sender && row.downloaded_by_receiver) {
-                const filePath = path.join(permanentDir, filename);
-                if (fs.existsSync(filePath)) {
-                    fs.unlinkSync(filePath);
-                    console.log(`🗑️  Файл удален: ${filename}`);
-                }
-            }
-        }
-    } catch (err) {
-        console.error('❌ Ошибка проверки статуса скачивания:', err);
-    }
+// Валидация имени канала Agora
+function isValidChannelName(channelName) {
+    const pattern = /^[a-zA-Z0-9!#$%&()+\-:;<=>.?@[\]^_{}|~]{1,64}$/;
+    return pattern.test(channelName) && channelName.length <= 64;
 }
 
-// Функция обновления статуса скачивания
-async function updateDownloadStatus(messageId, userEmail, isSender) {
-    try {
-        const field = isSender ? 'downloaded_by_sender' : 'downloaded_by_receiver';
-        
-        await run(
-            `UPDATE messages SET ${field} = ? WHERE id = ?`,
-            [true, messageId]
-        );
-        
-        const result = await query(
-            `SELECT attachment_filename FROM messages WHERE id = ?`,
-            [messageId]
-        );
-        
-        if (result.length > 0 && result[0].attachment_filename) {
-            await checkAndDeleteFile(messageId, result[0].attachment_filename);
-        }
-    } catch (err) {
-        console.error('❌ Ошибка обновления статуса скачивания:', err);
+// Функции для работы с Supabase
+
+// Получение информации о пользователе
+async function getUserInfo(email) {
+    const { data: regularUser, error: regularError } = await supabase
+        .from('regular_users')
+        .select('*')
+        .eq('email', email.toLowerCase())
+        .single();
+
+    if (regularUser) {
+        return { ...regularUser, userType: 'regular' };
     }
+
+    const { data: berestaUser, error: berestaError } = await supabase
+        .from('beresta_users')
+        .select('*')
+        .eq('email', email.toLowerCase())
+        .single();
+
+    if (berestaUser) {
+        return { ...berestaUser, userType: 'beresta' };
+    }
+
+    return null;
 }
 
-// Функция автоматического добавления в чаты
+// Проверка существования пользователя
+async function userExists(email) {
+    const user = await getUserInfo(email);
+    return user !== null;
+}
+
+// Автоматическое добавление в чаты
 async function addToChatsAutomatically(user1, user2) {
     try {
-        const user1Info = await getUserTableAndType(user1);
-        const user2Info = await getUserTableAndType(user2);
+        const user1Info = await getUserInfo(user1);
+        const user2Info = await getUserInfo(user2);
 
         if (!user1Info || !user2Info) {
-            console.log('⚠️  Один или оба пользователя не найдены');
+            console.log('⚠️ Один или оба пользователя не найдены');
             return;
         }
 
-        await run(
-            `INSERT INTO friends (user_email, friend_email) 
-             VALUES (?, ?) ON CONFLICT DO NOTHING`,
-            [user1.toLowerCase(), user2.toLowerCase()]
-        );
+        // Добавляем запись для user1
+        await supabase
+            .from('friends')
+            .upsert({ 
+                user_email: user1.toLowerCase(), 
+                friend_email: user2.toLowerCase() 
+            }, { 
+                onConflict: 'user_email,friend_email',
+                ignoreDuplicates: true 
+            });
 
-        await run(
-            `INSERT INTO friends (user_email, friend_email) 
-             VALUES (?, ?) ON CONFLICT DO NOTHING`,
-            [user2.toLowerCase(), user1.toLowerCase()]
-        );
+        // Добавляем запись для user2
+        await supabase
+            .from('friends')
+            .upsert({ 
+                user_email: user2.toLowerCase(), 
+                friend_email: user1.toLowerCase() 
+            }, { 
+                onConflict: 'user_email,friend_email',
+                ignoreDuplicates: true 
+            });
 
         console.log(`✅ Автоматически добавлены чаты: ${user1} ↔️ ${user2}`);
     } catch (error) {
@@ -492,17 +306,13 @@ async function addToChatsAutomatically(user1, user2) {
     }
 }
 
-// Валидация имени канала Agora
-function isValidChannelName(channelName) {
-    const pattern = /^[a-zA-Z0-9!#$%&()+\-:;<=>.?@[\]^_{}|~]{1,64}$/;
-    return pattern.test(channelName) && channelName.length <= 64;
-}
-
-// Улучшенный health check эндпоинт
+// Health check эндпоинт
 app.get('/health', async (req, res) => {
     try {
-        // Проверка базы данных
-        await query('SELECT 1');
+        // Проверка подключения к Supabase
+        const { error } = await supabase.from('regular_users').select('count', { count: 'exact', head: true });
+        
+        if (error) throw error;
         
         // Проверка доступности директорий
         const dirs = [uploadDir, tempDir, permanentDir, thumbnailsDir];
@@ -511,8 +321,6 @@ app.get('/health', async (req, res) => {
             dirStatus[dir] = fs.existsSync(dir);
         });
         
-        // Статистика активных подключений
-        const activeUsers = new Map(); // Локальная переменная для этого эндпоинта
         const stats = {
             activeUsers: activeUsers.size,
             activeCalls: activeCalls.size,
@@ -520,8 +328,8 @@ app.get('/health', async (req, res) => {
             timestamp: new Date().toISOString(),
             uptime: process.uptime(),
             memory: process.memoryUsage(),
-            database: 'SQLite',
-            dbPath: dbPath,
+            database: 'Supabase',
+            databaseUrl: supabaseUrl,
             directories: dirStatus
         };
         
@@ -552,23 +360,29 @@ app.post('/register', async (req, res) => {
             });
         }
 
-        const existingUser = await userExists(email);
-        if (existingUser) {
+        const exists = await userExists(email);
+        if (exists) {
             return res.status(409).json({ 
                 success: false, 
                 error: 'Пользователь уже существует' 
             });
         }
 
-        const result = await run(
-            "INSERT INTO regular_users (email, first_name, last_name) VALUES (?, ?, ?)",
-            [email.toLowerCase(), firstName, lastName]
-        );
+        const { data, error } = await supabase
+            .from('regular_users')
+            .insert([{ 
+                email: email.toLowerCase(), 
+                first_name: firstName, 
+                last_name: lastName 
+            }])
+            .select();
+
+        if (error) throw error;
 
         res.json({
             success: true,
             message: 'Пользователь успешно зарегистрирован',
-            userId: result.lastID
+            userId: data[0].id
         });
 
     } catch (error) {
@@ -589,23 +403,30 @@ app.post('/register-beresta', async (req, res) => {
             });
         }
 
-        const existingUser = await userExists(email);
-        if (existingUser) {
+        const exists = await userExists(email);
+        if (exists) {
             return res.status(409).json({ 
                 success: false, 
                 error: 'Пользователь уже существует' 
             });
         }
 
-        const result = await run(
-            "INSERT INTO beresta_users (email, first_name, last_name, beresta_id) VALUES (?, ?, ?, ?)",
-            [email.toLowerCase(), firstName, lastName, berestaId]
-        );
+        const { data, error } = await supabase
+            .from('beresta_users')
+            .insert([{ 
+                email: email.toLowerCase(), 
+                first_name: firstName, 
+                last_name: lastName,
+                beresta_id: berestaId 
+            }])
+            .select();
+
+        if (error) throw error;
 
         res.json({
             success: true,
             message: 'Beresta ID пользователь зарегистрирован',
-            userId: result.lastID
+            userId: data[0].id
         });
 
     } catch (error) {
@@ -617,15 +438,22 @@ app.post('/register-beresta', async (req, res) => {
 // Получение всех пользователей
 app.get('/users', async (req, res) => {
     try {
-        const regularResult = await query(
-            "SELECT email, first_name as firstName, last_name as lastName, 'regular' as userType FROM regular_users ORDER BY first_name, last_name"
-        );
+        const { data: regularUsers, error: regularError } = await supabase
+            .from('regular_users')
+            .select('email, first_name, last_name')
+            .order('first_name');
 
-        const berestaResult = await query(
-            "SELECT email, first_name as firstName, last_name as lastName, 'beresta' as userType FROM beresta_users ORDER BY first_name, last_name"
-        );
+        const { data: berestaUsers, error: berestaError } = await supabase
+            .from('beresta_users')
+            .select('email, first_name, last_name')
+            .order('first_name');
 
-        const allUsers = [...regularResult, ...berestaResult];
+        if (regularError || berestaError) throw regularError || berestaError;
+
+        const allUsers = [
+            ...regularUsers.map(u => ({ ...u, userType: 'regular' })),
+            ...berestaUsers.map(u => ({ ...u, userType: 'beresta' }))
+        ];
 
         res.json({
             success: true,
@@ -641,37 +469,23 @@ app.get('/users', async (req, res) => {
 app.get('/user/:email', async (req, res) => {
     try {
         const email = decodeURIComponent(req.params.email).toLowerCase();
+        const user = await getUserInfo(email);
 
-        const regularResult = await query(
-            `SELECT email, first_name as firstName, last_name as lastName, 
-             avatar_filename as avatarFilename, 'regular' as userType 
-             FROM regular_users WHERE email = ?`, 
-            [email]
-        );
-
-        if (regularResult.length > 0) {
-            return res.json({
-                success: true,
-                user: regularResult[0]
-            });
+        if (!user) {
+            return res.status(404).json({ success: false, error: 'Пользователь не найден' });
         }
 
-        const berestaResult = await query(
-            `SELECT email, first_name as firstName, last_name as lastName, 
-             avatar_filename as avatarFilename, 'beresta' as userType,
-             beresta_id as berestaId
-             FROM beresta_users WHERE email = ?`, 
-            [email]
-        );
-
-        if (berestaResult.length > 0) {
-            return res.json({
-                success: true,
-                user: berestaResult[0]
-            });
-        }
-
-        return res.status(404).json({ success: false, error: 'Пользователь не найден' });
+        res.json({
+            success: true,
+            user: {
+                email: user.email,
+                firstName: user.first_name,
+                lastName: user.last_name,
+                avatarFilename: user.avatar_filename || '',
+                userType: user.userType,
+                berestaId: user.beresta_id
+            }
+        });
 
     } catch (error) {
         console.error('❌ Ошибка получения пользователя:', error);
@@ -679,7 +493,7 @@ app.get('/user/:email', async (req, res) => {
     }
 });
 
-// Добавление в друзья - УПРОЩЕННАЯ версия БЕЗ типов
+// Добавление в друзья
 app.post('/add-friend', async (req, res) => {
     try {
         const { userEmail, friendEmail } = req.body;
@@ -693,7 +507,6 @@ app.post('/add-friend', async (req, res) => {
         const normalizedUserEmail = userEmail.toLowerCase().trim();
         const normalizedFriendEmail = friendEmail.toLowerCase().trim();
 
-        // Проверка на добавление самого себя
         if (normalizedUserEmail === normalizedFriendEmail) {
             return res.status(400).json({ 
                 success: false, 
@@ -701,7 +514,6 @@ app.post('/add-friend', async (req, res) => {
             });
         }
 
-        // Проверка существования пользователей - используем функцию userExists
         const userExistsCheck = await userExists(normalizedUserEmail);
         const friendExistsCheck = await userExists(normalizedFriendEmail);
 
@@ -712,26 +524,34 @@ app.post('/add-friend', async (req, res) => {
             });
         }
 
-        // ПРОСТАЯ вставка БЕЗ типов
-        const result = await run(
-            `INSERT INTO friends (user_email, friend_email) 
-             VALUES (?, ?) 
-             ON CONFLICT (user_email, friend_email) DO NOTHING`,
-            [normalizedUserEmail, normalizedFriendEmail]
-        );
+        // Добавляем для первого пользователя
+        const { error: error1 } = await supabase
+            .from('friends')
+            .upsert({ 
+                user_email: normalizedUserEmail, 
+                friend_email: normalizedFriendEmail 
+            }, { 
+                onConflict: 'user_email,friend_email',
+                ignoreDuplicates: true 
+            });
 
-        // Обратная связь БЕЗ типов
-        await run(
-            `INSERT INTO friends (user_email, friend_email) 
-             VALUES (?, ?) 
-             ON CONFLICT (user_email, friend_email) DO NOTHING`,
-            [normalizedFriendEmail, normalizedUserEmail]
-        );
+        // Добавляем для второго пользователя
+        const { error: error2 } = await supabase
+            .from('friends')
+            .upsert({ 
+                user_email: normalizedFriendEmail, 
+                friend_email: normalizedUserEmail 
+            }, { 
+                onConflict: 'user_email,friend_email',
+                ignoreDuplicates: true 
+            });
+
+        if (error1 || error2) throw error1 || error2;
 
         res.json({
             success: true,
             message: 'Друг добавлен',
-            inserted: result.changes > 0
+            inserted: true
         });
 
     } catch (error) {
@@ -753,10 +573,13 @@ app.post('/remove-friend', async (req, res) => {
             return res.status(400).json({ success: false, error: 'Email обязательны' });
         }
 
-        await run(
-            "DELETE FROM friends WHERE user_email = ? AND friend_email = ?",
-            [userEmail.toLowerCase(), friendEmail.toLowerCase()]
-        );
+        const { error } = await supabase
+            .from('friends')
+            .delete()
+            .eq('user_email', userEmail.toLowerCase())
+            .eq('friend_email', friendEmail.toLowerCase());
+
+        if (error) throw error;
 
         res.json({
             success: true,
@@ -769,37 +592,55 @@ app.post('/remove-friend', async (req, res) => {
     }
 });
 
-// Получение чатов пользователя - ИСПРАВЛЕННАЯ версия БЕЗ friend_type
+// Получение чатов пользователя
 app.get('/chats/:userEmail', async (req, res) => {
     try {
         const userEmail = req.params.userEmail.toLowerCase();
 
         console.log('🔄 Получение чатов для:', userEmail);
 
-        const result = await query(`
-            SELECT 
-                f.friend_email as contactEmail,
-                COALESCE(ru.first_name, bu.first_name) as firstName,
-                COALESCE(ru.last_name, bu.last_name) as lastName,
-                'friend' as type,
-                COALESCE(
-                    (SELECT MAX(timestamp) FROM messages m 
-                     WHERE (m.sender_email = f.user_email AND m.receiver_email = f.friend_email)
-                     OR (m.sender_email = f.friend_email AND m.receiver_email = f.user_email)),
-                    f.created_at
-                ) as lastMessageTime
-            FROM friends f
-            LEFT JOIN regular_users ru ON f.friend_email = ru.email
-            LEFT JOIN beresta_users bu ON f.friend_email = bu.email
-            WHERE f.user_email = ?
-            ORDER BY lastMessageTime DESC
-        `, [userEmail]);
+        const { data: friends, error } = await supabase
+            .from('friends')
+            .select(`
+                friend_email,
+                regular_users!friends_friend_email_fkey (first_name, last_name),
+                beresta_users!friends_friend_email_fkey (first_name, last_name)
+            `)
+            .eq('user_email', userEmail);
 
-        console.log('✅ Найдено чатов:', result.length);
+        if (error) throw error;
+
+        // Получаем последние сообщения для каждого чата
+        const chats = await Promise.all(friends.map(async (f) => {
+            const friendEmail = f.friend_email;
+            const userData = f.regular_users || f.beresta_users;
+            
+            const { data: messages, error: msgError } = await supabase
+                .from('messages')
+                .select('timestamp')
+                .or(`and(sender_email.eq.${userEmail},receiver_email.eq.${friendEmail}),and(sender_email.eq.${friendEmail},receiver_email.eq.${userEmail})`)
+                .order('timestamp', { ascending: false })
+                .limit(1);
+
+            if (msgError) throw msgError;
+
+            return {
+                contactEmail: friendEmail,
+                firstName: userData?.first_name || '',
+                lastName: userData?.last_name || '',
+                type: 'friend',
+                lastMessageTime: messages?.[0]?.timestamp || f.created_at
+            };
+        }));
+
+        // Сортируем по времени последнего сообщения
+        chats.sort((a, b) => new Date(b.lastMessageTime) - new Date(a.lastMessageTime));
+
+        console.log('✅ Найдено чатов:', chats.length);
 
         res.json({
             success: true,
-            chats: result
+            chats: chats
         });
     } catch (error) {
         console.error('❌ Ошибка получения чатов:', error);
@@ -813,22 +654,17 @@ app.get('/messages/:userEmail/:friendEmail', async (req, res) => {
         const userEmail = req.params.userEmail.toLowerCase();
         const friendEmail = req.params.friendEmail.toLowerCase();
 
-        const result = await query(`
-            SELECT id, sender_email as sender_email, receiver_email as receiver_email, message, 
-                   attachment_type as attachment_type, attachment_filename as attachment_filename, 
-                   attachment_original_name as attachment_original_name,
-                   attachment_mime_type as attachment_mime_type, attachment_size as attachment_size, 
-                   duration, thumbnail,
-                   timestamp, status
-            FROM messages 
-            WHERE (sender_email = ? AND receiver_email = ?) 
-               OR (sender_email = ? AND receiver_email = ?)
-            ORDER BY timestamp ASC
-        `, [userEmail, friendEmail, friendEmail, userEmail]);
+        const { data, error } = await supabase
+            .from('messages')
+            .select('*')
+            .or(`and(sender_email.eq.${userEmail},receiver_email.eq.${friendEmail}),and(sender_email.eq.${friendEmail},receiver_email.eq.${userEmail})`)
+            .order('timestamp', { ascending: true });
+
+        if (error) throw error;
 
         res.json({
             success: true,
-            messages: result
+            messages: data
         });
     } catch (error) {
         console.error('❌ Ошибка получения сообщений:', error);
@@ -836,7 +672,7 @@ app.get('/messages/:userEmail/:friendEmail', async (req, res) => {
     }
 });
 
-// Отправка текстового сообщения - УПРОЩЕННАЯ версия
+// Отправка текстового сообщения
 app.post('/send-message', async (req, res) => {
     try {
         const { senderEmail, receiverEmail, message, duration } = req.body;
@@ -845,27 +681,28 @@ app.post('/send-message', async (req, res) => {
             return res.status(400).json({ success: false, error: 'Email обязательны' });
         }
 
-        const senderInfo = await getUserTableAndType(senderEmail);
-        const receiverInfo = await getUserTableAndType(receiverEmail);
+        const senderInfo = await getUserInfo(senderEmail);
+        const receiverInfo = await getUserInfo(receiverEmail);
 
         if (!senderInfo || !receiverInfo) {
             return res.status(404).json({ success: false, error: 'Пользователь не найден' });
         }
 
-        const result = await run(
-            `INSERT INTO messages (sender_email, receiver_email, message, duration) 
-             VALUES (?, ?, ?, ?)`,
-            [
-                senderEmail.toLowerCase(), 
-                receiverEmail.toLowerCase(),
-                message || '', 
-                duration || 0
-            ]
-        );
+        const { data, error } = await supabase
+            .from('messages')
+            .insert([{
+                sender_email: senderEmail.toLowerCase(),
+                receiver_email: receiverEmail.toLowerCase(),
+                message: message || '',
+                duration: duration || 0
+            }])
+            .select();
+
+        if (error) throw error;
 
         res.json({
             success: true,
-            messageId: result.lastID
+            messageId: data[0].id
         });
 
         addToChatsAutomatically(senderEmail, receiverEmail);
@@ -888,14 +725,14 @@ app.post('/accept-call', async (req, res) => {
             });
         }
 
-        // Удаляем из ожидающих звонков
         pendingCalls.delete(receiverEmail.toLowerCase());
 
-        // Обновляем статус в базе данных
-        await run(
-            "UPDATE agora_calls SET status = 'accepted' WHERE channel_name = ?",
-            [channelName]
-        );
+        const { error } = await supabase
+            .from('agora_calls')
+            .update({ status: 'accepted' })
+            .eq('channel_name', channelName);
+
+        if (error) throw error;
 
         console.log(`✅ Звонок принят: ${channelName} пользователем ${receiverEmail}`);
 
@@ -947,7 +784,7 @@ app.post('/upload-file', upload.single('file'), async (req, res) => {
     }
 });
 
-// Загрузка файла с сообщением - УПРОЩЕННАЯ версия
+// Загрузка файла с сообщением
 app.post('/upload', upload.single('file'), async (req, res) => {
     try {
         if (!req.file) {
@@ -961,8 +798,8 @@ app.post('/upload', upload.single('file'), async (req, res) => {
             return res.status(400).json({ success: false, error: 'Email обязательны' });
         }
 
-        const senderInfo = await getUserTableAndType(senderEmail);
-        const receiverInfo = await getUserTableAndType(receiverEmail);
+        const senderInfo = await getUserInfo(senderEmail);
+        const receiverInfo = await getUserInfo(receiverEmail);
 
         if (!senderInfo || !receiverInfo) {
             fs.unlinkSync(req.file.path);
@@ -975,30 +812,28 @@ app.post('/upload', upload.single('file'), async (req, res) => {
 
         const completeFileUpload = async (thumbnail = '') => {
             try {
-                const result = await run(
-                    `INSERT INTO messages 
-                     (sender_email, receiver_email, message, attachment_type, 
-                      attachment_filename, attachment_original_name, attachment_mime_type, 
-                      attachment_size, duration, thumbnail) 
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-                    [
-                        senderEmail.toLowerCase(),
-                        receiverEmail.toLowerCase(),
-                        message || '',
-                        fileType,
-                        req.file.filename,
-                        req.file.originalname,
-                        req.file.mimetype,
-                        req.file.size,
-                        videoDuration,
-                        thumbnail
-                    ]
-                );
+                const { data, error } = await supabase
+                    .from('messages')
+                    .insert([{
+                        sender_email: senderEmail.toLowerCase(),
+                        receiver_email: receiverEmail.toLowerCase(),
+                        message: message || '',
+                        attachment_type: fileType,
+                        attachment_filename: req.file.filename,
+                        attachment_original_name: req.file.originalname,
+                        attachment_mime_type: req.file.mimetype,
+                        attachment_size: req.file.size,
+                        duration: videoDuration,
+                        thumbnail: thumbnail
+                    }])
+                    .select();
+
+                if (error) throw error;
 
                 if (moveFileToPermanent(req.file.filename)) {
                     res.json({
                         success: true,
-                        messageId: result.lastID,
+                        messageId: data[0].id,
                         filename: req.file.filename,
                         thumbnail: thumbnail
                     });
@@ -1047,7 +882,7 @@ app.post('/upload', upload.single('file'), async (req, res) => {
     }
 });
 
-// Отправка сообщения с информацией о файле - УПРОЩЕННАЯ версия
+// Отправка сообщения с информацией о файле
 app.post('/send-message-with-attachment', async (req, res) => {
     try {
         const { senderEmail, receiverEmail, message, attachmentType, 
@@ -1057,32 +892,31 @@ app.post('/send-message-with-attachment', async (req, res) => {
             return res.status(400).json({ success: false, error: 'Email обязательны' });
         }
 
-        const senderInfo = await getUserTableAndType(senderEmail);
-        const receiverInfo = await getUserTableAndType(receiverEmail);
+        const senderInfo = await getUserInfo(senderEmail);
+        const receiverInfo = await getUserInfo(receiverEmail);
 
         if (!senderInfo || !receiverInfo) {
             return res.status(404).json({ success: false, error: 'Пользователь не найден' });
         }
 
-        const result = await run(
-            `INSERT INTO messages 
-             (sender_email, receiver_email, message, attachment_type, 
-              attachment_filename, attachment_original_name, attachment_url) 
-             VALUES (?, ?, ?, ?, ?, ?, ?)`,
-            [
-                senderEmail.toLowerCase(),
-                receiverEmail.toLowerCase(),
-                message || '',
-                attachmentType || '',
-                attachmentFilename || '',
-                attachmentOriginalName || '',
-                attachmentUrl || ''
-            ]
-        );
+        const { data, error } = await supabase
+            .from('messages')
+            .insert([{
+                sender_email: senderEmail.toLowerCase(),
+                receiver_email: receiverEmail.toLowerCase(),
+                message: message || '',
+                attachment_type: attachmentType || '',
+                attachment_filename: attachmentFilename || '',
+                attachment_original_name: attachmentOriginalName || '',
+                attachment_url: attachmentUrl || ''
+            }])
+            .select();
+
+        if (error) throw error;
 
         res.json({
             success: true,
-            messageId: result.lastID
+            messageId: data[0].id
         });
 
         addToChatsAutomatically(senderEmail, receiverEmail);
@@ -1108,7 +942,27 @@ app.get('/download/:filename', async (req, res) => {
         }
 
         if (messageId && userEmail) {
-            await updateDownloadStatus(messageId, userEmail, isSender);
+            const field = isSender ? 'downloaded_by_sender' : 'downloaded_by_receiver';
+            
+            await supabase
+                .from('messages')
+                .update({ [field]: true })
+                .eq('id', messageId);
+
+            // Проверяем, нужно ли удалить файл
+            const { data } = await supabase
+                .from('messages')
+                .select('downloaded_by_sender, downloaded_by_receiver, attachment_filename')
+                .eq('id', messageId)
+                .single();
+
+            if (data?.downloaded_by_sender && data?.downloaded_by_receiver && data?.attachment_filename) {
+                const fileToDelete = path.join(permanentDir, data.attachment_filename);
+                if (fs.existsSync(fileToDelete)) {
+                    fs.unlinkSync(fileToDelete);
+                    console.log(`🗑️ Файл удален: ${data.attachment_filename}`);
+                }
+            }
         }
 
         const mimeType = mime.lookup(filename) || 'application/octet-stream';
@@ -1131,28 +985,27 @@ app.get('/file-info/:messageId', async (req, res) => {
     try {
         const messageId = req.params.messageId;
 
-        const result = await query(
-            `SELECT attachment_filename, attachment_original_name, 
-                    attachment_mime_type, attachment_size, attachment_type
-             FROM messages WHERE id = ?`,
-            [messageId]
-        );
+        const { data, error } = await supabase
+            .from('messages')
+            .select('attachment_filename, attachment_original_name, attachment_mime_type, attachment_size, attachment_type')
+            .eq('id', messageId)
+            .single();
 
-        if (result.length === 0 || !result[0].attachment_filename) {
+        if (error || !data?.attachment_filename) {
             return res.status(404).json({ success: false, error: 'Файл не найден' });
         }
 
-        const filePath = path.join(permanentDir, result[0].attachment_filename);
+        const filePath = path.join(permanentDir, data.attachment_filename);
         const exists = fs.existsSync(filePath);
 
         res.json({
             success: true,
             exists: exists,
-            filename: result[0].attachment_filename,
-            originalName: result[0].attachment_original_name,
-            mimeType: result[0].attachment_mime_type,
-            size: result[0].attachment_size,
-            type: result[0].attachment_type
+            filename: data.attachment_filename,
+            originalName: data.attachment_original_name,
+            mimeType: data.attachment_mime_type,
+            size: data.attachment_size,
+            type: data.attachment_type
         });
     } catch (error) {
         console.error('❌ Ошибка получения информации о файле:', error);
@@ -1160,7 +1013,7 @@ app.get('/file-info/:messageId', async (req, res) => {
     }
 });
 
-// Создание группы - УПРОЩЕННАЯ версия
+// Создание группы
 app.post('/create-group', async (req, res) => {
     try {
         const { name, description, createdBy, members } = req.body;
@@ -1169,77 +1022,108 @@ app.post('/create-group', async (req, res) => {
             return res.status(400).json({ success: false, error: 'Название и создатель обязательны' });
         }
 
-        const createdByInfo = await getUserTableAndType(createdBy);
+        const createdByInfo = await getUserInfo(createdBy);
         if (!createdByInfo) {
             return res.status(404).json({ success: false, error: 'Создатель не найден' });
         }
 
-        try {
-            // Начинаем транзакцию вручную для SQLite
-            await run('BEGIN TRANSACTION');
+        // Создаем группу
+        const { data: group, error: groupError } = await supabase
+            .from('groups')
+            .insert([{
+                name: name,
+                description: description || '',
+                created_by: createdBy.toLowerCase()
+            }])
+            .select()
+            .single();
 
-            const groupResult = await run(
-                "INSERT INTO groups (name, description, created_by) VALUES (?, ?, ?)",
-                [name, description || '', createdBy.toLowerCase()]
-            );
+        if (groupError) throw groupError;
 
-            const groupId = groupResult.lastID;
+        // Добавляем создателя как администратора
+        const { error: memberError1 } = await supabase
+            .from('group_members')
+            .insert([{
+                group_id: group.id,
+                user_email: createdBy.toLowerCase(),
+                role: 'admin'
+            }]);
 
-            await run(
-                "INSERT INTO group_members (group_id, user_email, role) VALUES (?, ?, 'admin')",
-                [groupId, createdBy.toLowerCase()]
-            );
+        if (memberError1) throw memberError1;
 
-            if (members && members.length > 0) {
-                for (const member of members) {
-                    if (member !== createdBy) {
-                        const memberInfo = await getUserTableAndType(member);
-                        if (memberInfo) {
-                            await run(
-                                "INSERT INTO group_members (group_id, user_email) VALUES (?, ?) ON CONFLICT DO NOTHING",
-                                [groupId, member.toLowerCase()]
-                            );
-                        }
-                    }
-                }
+        // Добавляем остальных участников
+        if (members && members.length > 0) {
+            const memberInserts = members
+                .filter(member => member !== createdBy)
+                .map(member => ({
+                    group_id: group.id,
+                    user_email: member.toLowerCase()
+                }));
+
+            if (memberInserts.length > 0) {
+                const { error: memberError2 } = await supabase
+                    .from('group_members')
+                    .insert(memberInserts, { ignoreDuplicates: true });
+
+                if (memberError2) throw memberError2;
             }
-
-            await run('COMMIT');
-
-            res.json({
-                success: true,
-                groupId: groupId,
-                message: 'Группа создана'
-            });
-        } catch (error) {
-            await run('ROLLBACK');
-            throw error;
         }
+
+        res.json({
+            success: true,
+            groupId: group.id,
+            message: 'Группа создана'
+        });
+
     } catch (error) {
         console.error('❌ Ошибка создания группы:', error);
         res.status(500).json({ success: false, error: 'Internal server error' });
     }
 });
 
-// Получение списка групп пользователя - УПРОЩЕННАЯ версия
+// Получение списка групп пользователя
 app.get('/groups/:userEmail', async (req, res) => {
     try {
         const userEmail = req.params.userEmail.toLowerCase();
 
-        const result = await query(`
-            SELECT g.id, g.name, g.description, g.created_by, g.created_at,
-                   gm.role, COUNT(gm2.user_email) as member_count
-            FROM groups g
-            JOIN group_members gm ON g.id = gm.group_id
-            LEFT JOIN group_members gm2 ON g.id = gm2.group_id
-            WHERE gm.user_email = ?
-            GROUP BY g.id, g.name, g.description, g.created_by, g.created_at, gm.role
-            ORDER BY g.name
-        `, [userEmail]);
+        const { data, error } = await supabase
+            .from('group_members')
+            .select(`
+                group_id,
+                role,
+                groups (
+                    id,
+                    name,
+                    description,
+                    created_by,
+                    created_at
+                )
+            `)
+            .eq('user_email', userEmail);
+
+        if (error) throw error;
+
+        // Получаем количество участников для каждой группы
+        const groups = await Promise.all(data.map(async (item) => {
+            const { count } = await supabase
+                .from('group_members')
+                .select('*', { count: 'exact', head: true })
+                .eq('group_id', item.group_id);
+
+            return {
+                id: item.groups.id,
+                name: item.groups.name,
+                description: item.groups.description,
+                created_by: item.groups.created_by,
+                created_at: item.groups.created_at,
+                role: item.role,
+                member_count: count
+            };
+        }));
 
         res.json({
             success: true,
-            groups: result
+            groups: groups
         });
     } catch (error) {
         console.error('❌ Ошибка получения групп:', error);
@@ -1252,18 +1136,33 @@ app.get('/group-members/:groupId', async (req, res) => {
     try {
         const groupId = req.params.groupId;
 
-        const result = await query(`
-            SELECT u.email, u.first_name, u.last_name, gm.role, gm.joined_at
-            FROM group_members gm
-            LEFT JOIN regular_users u ON gm.user_email = u.email
-            LEFT JOIN beresta_users u2 ON gm.user_email = u2.email
-            WHERE gm.group_id = ?
-            ORDER BY gm.role DESC, u.first_name, u.last_name
-        `, [groupId]);
+        const { data, error } = await supabase
+            .from('group_members')
+            .select(`
+                user_email,
+                role,
+                joined_at,
+                regular_users!group_members_user_email_fkey (first_name, last_name),
+                beresta_users!group_members_user_email_fkey (first_name, last_name)
+            `)
+            .eq('group_id', groupId);
+
+        if (error) throw error;
+
+        const members = data.map(m => {
+            const userData = m.regular_users || m.beresta_users;
+            return {
+                email: m.user_email,
+                first_name: userData?.first_name || '',
+                last_name: userData?.last_name || '',
+                role: m.role,
+                joined_at: m.joined_at
+            };
+        });
 
         res.json({
             success: true,
-            members: result
+            members: members
         });
     } catch (error) {
         console.error('❌ Ошибка получения участников группы:', error);
@@ -1271,7 +1170,7 @@ app.get('/group-members/:groupId', async (req, res) => {
     }
 });
 
-// Отправка сообщения в группу - УПРОЩЕННАЯ версия
+// Отправка сообщения в группу
 app.post('/send-group-message', async (req, res) => {
     try {
         const { groupId, senderEmail, message, duration } = req.body;
@@ -1280,20 +1179,26 @@ app.post('/send-group-message', async (req, res) => {
             return res.status(400).json({ success: false, error: 'Группа и отправитель обязательны' });
         }
 
-        const senderInfo = await getUserTableAndType(senderEmail);
+        const senderInfo = await getUserInfo(senderEmail);
         if (!senderInfo) {
             return res.status(404).json({ success: false, error: 'Отправитель не найден' });
         }
 
-        const result = await run(
-            `INSERT INTO group_messages (group_id, sender_email, message, duration) 
-             VALUES (?, ?, ?, ?)`,
-            [groupId, senderEmail.toLowerCase(), message || '', duration || 0]
-        );
+        const { data, error } = await supabase
+            .from('group_messages')
+            .insert([{
+                group_id: groupId,
+                sender_email: senderEmail.toLowerCase(),
+                message: message || '',
+                duration: duration || 0
+            }])
+            .select();
+
+        if (error) throw error;
 
         res.json({
             success: true,
-            messageId: result.lastID
+            messageId: data[0].id
         });
     } catch (error) {
         console.error('❌ Ошибка отправки группового сообщения:', error);
@@ -1306,23 +1211,30 @@ app.get('/group-messages/:groupId', async (req, res) => {
     try {
         const groupId = req.params.groupId;
 
-        const result = await query(`
-            SELECT gm.id, gm.sender_email, gm.message, 
-                   gm.attachment_type, gm.attachment_filename, gm.attachment_original_name,
-                   gm.attachment_mime_type, gm.attachment_size, gm.duration, gm.thumbnail,
-                   gm.timestamp,
-                   COALESCE(ru.first_name, bu.first_name) as first_name,
-                   COALESCE(ru.last_name, bu.last_name) as last_name
-            FROM group_messages gm
-            LEFT JOIN regular_users ru ON gm.sender_email = ru.email
-            LEFT JOIN beresta_users bu ON gm.sender_email = bu.email
-            WHERE gm.group_id = ?
-            ORDER BY gm.timestamp ASC
-        `, [groupId]);
+        const { data, error } = await supabase
+            .from('group_messages')
+            .select(`
+                *,
+                regular_users!group_messages_sender_email_fkey (first_name, last_name),
+                beresta_users!group_messages_sender_email_fkey (first_name, last_name)
+            `)
+            .eq('group_id', groupId)
+            .order('timestamp', { ascending: true });
+
+        if (error) throw error;
+
+        const messages = data.map(m => {
+            const userData = m.regular_users || m.beresta_users;
+            return {
+                ...m,
+                first_name: userData?.first_name || '',
+                last_name: userData?.last_name || ''
+            };
+        });
 
         res.json({
             success: true,
-            messages: result
+            messages: messages
         });
     } catch (error) {
         console.error('❌ Ошибка получения групповых сообщений:', error);
@@ -1339,12 +1251,12 @@ app.post('/update-profile', upload.single('avatar'), async (req, res) => {
             return res.status(400).json({ success: false, error: 'Email обязателен' });
         }
 
-        const userInfo = await getUserTableAndType(email);
+        const userInfo = await getUserInfo(email);
         if (!userInfo) {
             return res.status(404).json({ success: false, error: 'Пользователь не найден' });
         }
 
-        let avatarFilename = undefined;
+        let avatarFilename = userInfo.avatar_filename;
 
         if (req.file) {
             if (moveFileToPermanent(req.file.filename)) {
@@ -1354,85 +1266,33 @@ app.post('/update-profile', upload.single('avatar'), async (req, res) => {
             avatarFilename = '';
         }
 
-        let queryStr = `UPDATE ${userInfo.table} SET first_name = ?, last_name = ?`;
-        let params = [firstName, lastName];
+        const table = userInfo.userType === 'regular' ? 'regular_users' : 'beresta_users';
 
-        if (avatarFilename !== undefined) {
-            queryStr += ", avatar_filename = ?";
-            params.push(avatarFilename);
-        }
+        const { error } = await supabase
+            .from(table)
+            .update({
+                first_name: firstName,
+                last_name: lastName,
+                avatar_filename: avatarFilename
+            })
+            .eq('email', email.toLowerCase());
 
-        queryStr += " WHERE email = ?";
-        params.push(email.toLowerCase());
-
-        await run(queryStr, params);
-
-        const result = await query(
-            `SELECT email, first_name as firstName, last_name as lastName, 
-                    avatar_filename as avatarFilename, '${userInfo.type}' as userType 
-             FROM ${userInfo.table} WHERE email = ?`, 
-            [email.toLowerCase()]
-        );
+        if (error) throw error;
 
         res.json({
             success: true,
             message: 'Профиль обновлен',
-            user: result[0]
+            user: {
+                email: email,
+                firstName: firstName,
+                lastName: lastName,
+                avatarFilename: avatarFilename,
+                userType: userInfo.userType
+            }
         });
     } catch (error) {
         console.error('❌ Ошибка обновления профиля:', error);
         res.status(500).json({ success: false, error: 'Internal server error' });
-    }
-});
-
-// Проверить статус звонка
-app.get('/check-call-status/:channelName', async (req, res) => {
-    try {
-        const { channelName } = req.params;
-        const { userEmail } = req.query;
-
-        if (!channelName) {
-            return res.status(400).json({ 
-                success: false, 
-                error: 'channelName обязателен' 
-            });
-        }
-
-        const result = await query(`
-            SELECT status, caller_email, receiver_email
-            FROM agora_calls 
-            WHERE channel_name = ?
-            LIMIT 1
-        `, [channelName]);
-
-        if (result.length === 0) {
-            return res.json({
-                success: true,
-                status: 'not_found',
-                message: 'Call not found'
-            });
-        }
-
-        const call = result[0];
-        
-        res.json({
-            success: true,
-            status: call.status,
-            channelName: channelName,
-            callerEmail: call.caller_email,
-            receiverEmail: call.receiver_email,
-            isParticipant: userEmail && (
-                userEmail.toLowerCase() === call.caller_email.toLowerCase() || 
-                userEmail.toLowerCase() === call.receiver_email.toLowerCase()
-            )
-        });
-
-    } catch (error) {
-        console.error('❌ Ошибка проверки статуса звонка:', error);
-        res.status(500).json({ 
-            success: false, 
-            error: 'Internal server error' 
-        });
     }
 });
 
@@ -1491,7 +1351,7 @@ app.get('/agora/token/:channelName/:userId', (req, res) => {
     }
 });
 
-// Новая функция: Само-пинг сайта по адресу https://beresta-server-5udn.onrender.com
+// Само-пинг сайта
 function startSitePing() {
     const siteUrl = 'https://beresta-server-5udn.onrender.com';
     
@@ -1517,9 +1377,8 @@ function startSitePing() {
                     error: err.message
                 });
             });
-        }, 3.5 * 60 * 1000); // Пинг каждые 3.5 минуты (немного реже чем внутренний пинг)
+        }, 3.5 * 60 * 1000);
 
-        // Очистка при завершении
         process.on('SIGINT', () => {
             clearInterval(sitePingInterval);
             console.log('🛑 Само-пинг сайта остановлен');
@@ -1537,7 +1396,7 @@ function startSitePing() {
     }
 }
 
-// Создание Agora звонка - УПРОЩЕННАЯ версия
+// Создание Agora звонка
 app.post('/agora/create-call', async (req, res) => {
     try {
         console.log('📞 Данные создания звонка:', req.body);
@@ -1549,8 +1408,8 @@ app.post('/agora/create-call', async (req, res) => {
             return res.status(400).json({ success: false, error: 'Все поля обязательны' });
         }
 
-        const callerInfo = await getUserTableAndType(callerEmail);
-        const receiverInfo = await getUserTableAndType(receiverEmail);
+        const callerInfo = await getUserInfo(callerEmail);
+        const receiverInfo = await getUserInfo(receiverEmail);
 
         if (!callerInfo || !receiverInfo) {
             return res.status(404).json({ success: false, error: 'Пользователь не найден' });
@@ -1564,17 +1423,24 @@ app.post('/agora/create-call', async (req, res) => {
             });
         }
 
-        const result = await run(
-            `INSERT INTO agora_calls (channel_name, caller_email, receiver_email, call_type, status)
-             VALUES (?, ?, ?, ?, 'ringing')`,
-            [channelName, callerEmail.toLowerCase(), receiverEmail.toLowerCase(), callType || 'audio']
-        );
+        const { data, error } = await supabase
+            .from('agora_calls')
+            .insert([{
+                channel_name: channelName,
+                caller_email: callerEmail.toLowerCase(),
+                receiver_email: receiverEmail.toLowerCase(),
+                call_type: callType || 'audio',
+                status: 'ringing'
+            }])
+            .select();
+
+        if (error) throw error;
 
         console.log('✅ Запись звонка создана');
         
         res.json({
             success: true,
-            callId: result.lastID,
+            callId: data[0].id,
             channelName: channelName
         });
 
@@ -1714,7 +1580,7 @@ io.on('connection', (socket) => {
   });
 });
 
-// Эндпоинты для звонков
+// Отправка звонка
 app.post('/send-call', async (req, res) => {
     try {
         const { channelName, callerEmail, receiverEmail, callType, callerName } = req.body;
@@ -1728,8 +1594,8 @@ app.post('/send-call', async (req, res) => {
             });
         }
 
-        const callerInfo = await getUserTableAndType(callerEmail);
-        const receiverInfo = await getUserTableAndType(receiverEmail);
+        const callerInfo = await getUserInfo(callerEmail);
+        const receiverInfo = await getUserInfo(receiverEmail);
 
         if (!callerInfo || !receiverInfo) {
             return res.status(404).json({ success: false, error: 'Пользователь не найден' });
@@ -1747,20 +1613,24 @@ app.post('/send-call', async (req, res) => {
             callId: Date.now().toString()
         };
 
-        await run(
-            `INSERT INTO agora_calls (channel_name, caller_email, receiver_email, call_type, status)
-             VALUES (?, ?, ?, ?, 'ringing') 
-             ON CONFLICT (channel_name) 
-             DO UPDATE SET status = 'ringing', created_at = CURRENT_TIMESTAMP`,
-            [channelName, callerEmail, normalizedReceiver, callType || 'audio']
-        );
+        await supabase
+            .from('agora_calls')
+            .upsert({
+                channel_name: channelName,
+                caller_email: callerEmail,
+                receiver_email: normalizedReceiver,
+                call_type: callType || 'audio',
+                status: 'ringing'
+            }, {
+                onConflict: 'channel_name'
+            });
 
         pendingCalls.set(normalizedReceiver, callData);
         
         setTimeout(() => {
             if (pendingCalls.get(normalizedReceiver)?.callId === callData.callId) {
                 pendingCalls.delete(normalizedReceiver);
-                console.log(`🗑️  Очищен ожидающий звонок для: ${normalizedReceiver}`);
+                console.log(`🗑️ Очищен ожидающий звонок для: ${normalizedReceiver}`);
             }
         }, 60000);
 
@@ -1860,10 +1730,15 @@ app.post('/end-call', async (req, res) => {
             pendingCalls.delete(receiverEmail.toLowerCase());
         }
 
-        await run(
-            "UPDATE agora_calls SET status = 'ended', ended_at = CURRENT_TIMESTAMP WHERE channel_name = ?",
-            [channelName]
-        );
+        const { error } = await supabase
+            .from('agora_calls')
+            .update({ 
+                status: 'ended', 
+                ended_at: new Date().toISOString() 
+            })
+            .eq('channel_name', channelName);
+
+        if (error) throw error;
 
         res.json({
             success: true,
@@ -1888,18 +1763,17 @@ app.post('/clear-chat', async (req, res) => {
             return res.status(400).json({ success: false, error: 'Email обязательны' });
         }
 
-        const result = await run(
-            `DELETE FROM messages 
-             WHERE (sender_email = ? AND receiver_email = ?) 
-                OR (sender_email = ? AND receiver_email = ?)`,
-            [userEmail.toLowerCase(), friendEmail.toLowerCase(), 
-             friendEmail.toLowerCase(), userEmail.toLowerCase()]
-        );
+        const { error } = await supabase
+            .from('messages')
+            .delete()
+            .or(`and(sender_email.eq.${userEmail.toLowerCase()},receiver_email.eq.${friendEmail.toLowerCase()}),and(sender_email.eq.${friendEmail.toLowerCase()},receiver_email.eq.${userEmail.toLowerCase()})`);
+
+        if (error) throw error;
 
         res.json({
             success: true,
             message: 'История чата очищена',
-            deletedCount: result.changes
+            deletedCount: 0
         });
     } catch (error) {
         console.error('❌ Ошибка очистки чата:', error);
@@ -1912,17 +1786,24 @@ app.delete('/delete-account/:userEmail', async (req, res) => {
     try {
         const userEmail = req.params.userEmail.toLowerCase();
 
-        const userInfo = await getUserTableAndType(userEmail);
+        const userInfo = await getUserInfo(userEmail);
         if (!userInfo) {
             return res.status(404).json({ success: false, error: 'Пользователь не найден' });
         }
 
-        const result = await run(`DELETE FROM ${userInfo.table} WHERE email = ?`, [userEmail]);
+        const table = userInfo.userType === 'regular' ? 'regular_users' : 'beresta_users';
+
+        const { error } = await supabase
+            .from(table)
+            .delete()
+            .eq('email', userEmail);
+
+        if (error) throw error;
 
         res.json({
             success: true,
             message: 'Аккаунт удален',
-            deletedCount: result.changes
+            deletedCount: 1
         });
     } catch (error) {
         console.error('❌ Ошибка удаления аккаунта:', error);
@@ -1930,7 +1811,7 @@ app.delete('/delete-account/:userEmail', async (req, res) => {
     }
 });
 
-// Загрузка файла в группу - УПРОЩЕННАЯ версия
+// Загрузка файла в группу
 app.post('/upload-group', upload.single('file'), async (req, res) => {
     try {
         if (!req.file) {
@@ -1944,7 +1825,7 @@ app.post('/upload-group', upload.single('file'), async (req, res) => {
             return res.status(400).json({ success: false, error: 'Группа и отправитель обязательны' });
         }
 
-        const senderInfo = await getUserTableAndType(senderEmail);
+        const senderInfo = await getUserInfo(senderEmail);
         if (!senderInfo) {
             fs.unlinkSync(req.file.path);
             return res.status(404).json({ success: false, error: 'Отправитель не найден' });
@@ -1956,30 +1837,28 @@ app.post('/upload-group', upload.single('file'), async (req, res) => {
 
         const completeFileUpload = async (thumbnail = '') => {
             try {
-                const result = await run(
-                    `INSERT INTO group_messages 
-                     (group_id, sender_email, message, attachment_type, 
-                      attachment_filename, attachment_original_name, attachment_mime_type, 
-                      attachment_size, duration, thumbnail) 
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-                    [
-                        groupId,
-                        senderEmail.toLowerCase(),
-                        message || '',
-                        fileType,
-                        req.file.filename,
-                        req.file.originalname,
-                        req.file.mimetype,
-                        req.file.size,
-                        videoDuration,
-                        thumbnail
-                    ]
-                );
+                const { data, error } = await supabase
+                    .from('group_messages')
+                    .insert([{
+                        group_id: groupId,
+                        sender_email: senderEmail.toLowerCase(),
+                        message: message || '',
+                        attachment_type: fileType,
+                        attachment_filename: req.file.filename,
+                        attachment_original_name: req.file.originalname,
+                        attachment_mime_type: req.file.mimetype,
+                        attachment_size: req.file.size,
+                        duration: videoDuration,
+                        thumbnail: thumbnail
+                    }])
+                    .select();
+
+                if (error) throw error;
 
                 if (moveFileToPermanent(req.file.filename)) {
                     res.json({
                         success: true,
-                        messageId: result.lastID,
+                        messageId: data[0].id,
                         filename: req.file.filename,
                         thumbnail: thumbnail
                     });
@@ -2031,28 +1910,27 @@ app.get('/group-file-info/:filename', async (req, res) => {
     try {
         const filename = req.params.filename;
 
-        const result = await query(
-            `SELECT attachment_filename, attachment_original_name, 
-                    attachment_mime_type, attachment_size, attachment_type
-             FROM group_messages WHERE attachment_filename = ?`,
-            [filename]
-        );
+        const { data, error } = await supabase
+            .from('group_messages')
+            .select('attachment_filename, attachment_original_name, attachment_mime_type, attachment_size, attachment_type')
+            .eq('attachment_filename', filename)
+            .single();
 
-        if (result.length === 0 || !result[0].attachment_filename) {
+        if (error || !data) {
             return res.status(404).json({ success: false, error: 'Файл не найден' });
         }
 
-        const filePath = path.join(permanentDir, result[0].attachment_filename);
+        const filePath = path.join(permanentDir, data.attachment_filename);
         const exists = fs.existsSync(filePath);
 
         res.json({
             success: true,
             exists: exists,
-            filename: result[0].attachment_filename,
-            originalName: result[0].attachment_original_name,
-            mimeType: result[0].attachment_mime_type,
-            size: result[0].attachment_size,
-            type: result[0].attachment_type
+            filename: data.attachment_filename,
+            originalName: data.attachment_original_name,
+            mimeType: data.attachment_mime_type,
+            size: data.attachment_size,
+            type: data.attachment_type
         });
     } catch (error) {
         console.error('❌ Ошибка получения информации о групповом файле:', error);
@@ -2067,23 +1945,29 @@ app.get('/check-calls/:userEmail', async (req, res) => {
         
         console.log(`🔍 Проверка звонков для: ${userEmail}`);
         
-        const result = await query(`
-            SELECT channel_name as channelName, caller_email as callerEmail, 
-                   receiver_email as receiverEmail, call_type as callType, 
-                   status, created_at as createdAt
-            FROM agora_calls 
-            WHERE receiver_email = ? 
-            AND status = 'ringing'
-            AND created_at > datetime('now', '-5 minutes')
-            ORDER BY created_at DESC
-            LIMIT 5
-        `, [userEmail]);
+        const { data, error } = await supabase
+            .from('agora_calls')
+            .select('channel_name, caller_email, receiver_email, call_type, status, created_at')
+            .eq('receiver_email', userEmail)
+            .eq('status', 'ringing')
+            .gte('created_at', new Date(Date.now() - 5 * 60 * 1000).toISOString())
+            .order('created_at', { ascending: false })
+            .limit(5);
 
-        console.log(`📞 Найдено активных звонков: ${result.length}`);
+        if (error) throw error;
+
+        console.log(`📞 Найдено активных звонков: ${data.length}`);
         
         res.json({
             success: true,
-            calls: result,
+            calls: data.map(call => ({
+                channelName: call.channel_name,
+                callerEmail: call.caller_email,
+                receiverEmail: call.receiver_email,
+                callType: call.call_type,
+                status: call.status,
+                createdAt: call.created_at
+            })),
             timestamp: new Date().toISOString()
         });
 
@@ -2105,15 +1989,22 @@ app.post('/add-group-member', async (req, res) => {
             return res.status(400).json({ success: false, error: 'Группа и пользователь обязательны' });
         }
 
-        const userInfo = await getUserTableAndType(userEmail);
+        const userInfo = await getUserInfo(userEmail);
         if (!userInfo) {
             return res.status(404).json({ success: false, error: 'Пользователь не найден' });
         }
 
-        await run(
-            "INSERT INTO group_members (group_id, user_email) VALUES (?, ?) ON CONFLICT DO NOTHING",
-            [groupId, userEmail.toLowerCase()]
-        );
+        const { error } = await supabase
+            .from('group_members')
+            .upsert({
+                group_id: groupId,
+                user_email: userEmail.toLowerCase()
+            }, {
+                onConflict: 'group_id,user_email',
+                ignoreDuplicates: true
+            });
+
+        if (error) throw error;
 
         res.json({
             success: true,
@@ -2134,10 +2025,13 @@ app.post('/remove-group-member', async (req, res) => {
             return res.status(400).json({ success: false, error: 'Группа и пользователь обязательны' });
         }
 
-        await run(
-            "DELETE FROM group_members WHERE group_id = ? AND user_email = ?",
-            [groupId, userEmail.toLowerCase()]
-        );
+        const { error } = await supabase
+            .from('group_members')
+            .delete()
+            .eq('group_id', groupId)
+            .eq('user_email', userEmail.toLowerCase());
+
+        if (error) throw error;
 
         res.json({
             success: true,
@@ -2154,7 +2048,12 @@ app.delete('/group/:groupId', async (req, res) => {
     try {
         const groupId = req.params.groupId;
 
-        await run("DELETE FROM groups WHERE id = ?", [groupId]);
+        const { error } = await supabase
+            .from('groups')
+            .delete()
+            .eq('id', groupId);
+
+        if (error) throw error;
 
         res.json({
             success: true,
@@ -2169,59 +2068,39 @@ app.delete('/group/:groupId', async (req, res) => {
 // Статические файлы
 app.use('/uploads', express.static(uploadDir));
 
-// Обновленная часть запуска сервера:
-db = new sqlite3.Database(dbPath, (err) => {
-    if (err) {
-        console.error('❌ Ошибка подключения к SQLite:', err.message);
-        process.exit(1);
-    }
-    console.log(`✅ Подключение к SQLite установлено: ${dbPath}`);
+// Запуск сервера
+server.listen(PORT, '0.0.0.0', async () => {
+    console.log(`🚀 Сервер запущен на порту ${PORT}`);
+    console.log(`🌐 URL: http://0.0.0.0:${PORT}`);
+    console.log(`📡 WebSocket сервер активен: ws://0.0.0.0:${PORT}`);
+    console.log(`🔧 Режим: ${process.env.NODE_ENV || 'development'}`);
+    console.log(`🔗 Внешний URL: https://beresta-server-5udn.onrender.com`);
+    console.log(`💾 База данных: Supabase (${supabaseUrl})`);
     
-    // Автоматическое создание таблиц после подключения
-    createTables();
-    
-    server.listen(PORT, '0.0.0.0', async () => {
-        console.log(`🚀 Сервер запущен на порту ${PORT}`);
-        console.log(`🌐 URL: http://0.0.0.0:${PORT}`);
-        console.log(`📡 WebSocket сервер активен: ws://0.0.0.0:${PORT}`);
-        console.log(`🔧 Режим: ${process.env.NODE_ENV || 'development'}`);
-        console.log(`🔗 Внешний URL: https://beresta-server-5udn.onrender.com`);
-        console.log(`💾 База данных: SQLite (${dbPath})`);
+    // Запуск само-пинга для Render.com
+    if (isRender) {
+        startSelfPing();
+        startSitePing();
         
-        // Запуск само-пинга для Render.com
-        if (isRender) {
-            startSelfPing();
-            startSitePing();
-            
-            // Первый немедленный пинг сайта
-            setTimeout(() => {
-                const https = require('https');
-                https.get('https://beresta-server-5udn.onrender.com/health', (res) => {
-                    console.log('🚀 Первый пинг сайта:', {
-                        status: res.statusCode,
-                        timestamp: new Date().toISOString()
-                    });
-                }).on('error', (err) => {
-                    console.error('⚠️ Первый пинг сайта не удался:', err.message);
+        // Первый немедленный пинг сайта
+        setTimeout(() => {
+            const https = require('https');
+            https.get('https://beresta-server-5udn.onrender.com/health', (res) => {
+                console.log('🚀 Первый пинг сайта:', {
+                    status: res.statusCode,
+                    timestamp: new Date().toISOString()
                 });
-            }, 3000);
-        }
-        
-        console.log('✅ Сервер готов к работе');
-    });
+            }).on('error', (err) => {
+                console.error('⚠️ Первый пинг сайта не удался:', err.message);
+            });
+        }, 3000);
+    }
+    
+    console.log('✅ Сервер готов к работе');
 });
 
 // Graceful shutdown
 process.on('SIGINT', async () => {
     console.log('\n🛑 Остановка сервера...');
-    if (db) {
-        db.close((err) => {
-            if (err) {
-                console.error('❌ Ошибка закрытия БД:', err.message);
-            } else {
-                console.log('✅ Подключение к SQLite закрыто');
-            }
-        });
-    }
     process.exit(0);
 });
