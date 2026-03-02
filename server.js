@@ -6,17 +6,17 @@ const fs = require('fs');
 const multer = require('multer');
 const mime = require('mime-types');
 const { v4: uuidv4 } = require('uuid');
-const ffmpeg = require('fluent-ffmpeg');
-const ffmpegPath = require('ffmpeg-static');
-const ffprobePath = require('ffprobe-static').path;
-const Agora = require('agora-access-token');
 const http = require('http');
 const socketIo = require('socket.io');
 const { createClient } = require('@supabase/supabase-js');
 
 const isRender = process.env.NODE_ENV === 'production';
-const activeCalls = new Map();
-const pendingCalls = new Map();
+
+// Хранилище для WebRTC соединений
+const activeUsers = new Map(); // email -> socketId
+const activeCalls = new Map(); // callId -> call info
+const pendingCalls = new Map(); // receiverEmail -> call info
+const peerConnections = new Map(); // socketId -> room/channel
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -31,14 +31,13 @@ const io = socketIo(server, {
   transports: ['websocket', 'polling'],
   pingTimeout: 60000,
   pingInterval: 25000,
-  allowEIO3: true,
   maxHttpBufferSize: 1e8,
   connectTimeout: 45000
 });
 
 // Инициализация Supabase
 const supabaseUrl = process.env.SUPABASE_URL;
-const supabaseKey = process.env.SUPABASE_SERVICE_KEY; // Используйте service_role key для сервера
+const supabaseKey = process.env.SUPABASE_SERVICE_KEY;
 const supabase = createClient(supabaseUrl, supabaseKey);
 
 // Middleware
@@ -82,17 +81,10 @@ const upload = multer({
     limits: {
         fileSize: 100 * 1024 * 1024,
         fieldSize: 50 * 1024 * 1024
-    },
-    fileFilter: (req, file, cb) => {
-        cb(null, true);
     }
 });
 
-// Устанавливаем пути к ffmpeg
-ffmpeg.setFfmpegPath(ffmpegPath);
-ffmpeg.setFfprobePath(ffprobePath);
-
-// Функция само-пинга для Render.com (только для поддержания активности сервера)
+// Функция само-пинга для Render.com
 function startSelfPing() {
     const selfPingUrl = process.env.RENDER_SELF_PING_URL || `http://localhost:${PORT}`;
     
@@ -117,7 +109,7 @@ function startSelfPing() {
             }).on('error', (err) => {
                 console.error('❌ Ошибка внутреннего само-пинга:', err.message);
             });
-        }, 4 * 60 * 1000); // Пинг каждые 4 минуты
+        }, 4 * 60 * 1000);
 
         process.on('SIGINT', () => {
             clearInterval(pingInterval);
@@ -161,53 +153,6 @@ function getFileType(mimetype, filename) {
     return 'file';
 }
 
-// Функция создания превью для медиафайлов
-function createMediaPreview(filePath, outputPath, fileType, callback) {
-    if (fileType === 'video') {
-        ffmpeg(filePath)
-            .screenshots({
-                timestamps: ['00:00:01'],
-                filename: path.basename(outputPath),
-                folder: path.dirname(outputPath),
-                size: '320x240'
-            })
-            .on('end', () => {
-                console.log('✅ Превью видео создано:', outputPath);
-                callback(null, outputPath);
-            })
-            .on('error', (err) => {
-                console.error('❌ Ошибка создания превью видео:', err);
-                callback(err);
-            });
-    } else if (fileType === 'image') {
-        ffmpeg(filePath)
-            .size('320x240')
-            .output(outputPath)
-            .on('end', () => {
-                console.log('✅ Превью изображения создано:', outputPath);
-                callback(null, outputPath);
-            })
-            .on('error', (err) => {
-                console.error('❌ Ошибка создания превью изображения:', err);
-                callback(err);
-            });
-    } else {
-        callback(new Error('Unsupported file type for preview'));
-    }
-}
-
-// Функция получения длительности видео
-function getVideoDuration(videoPath, callback) {
-    ffmpeg.ffprobe(videoPath, (err, metadata) => {
-        if (err) {
-            console.error('❌ Ошибка получения длительности видео:', err);
-            return callback(err);
-        }
-        const duration = Math.round(metadata.format.duration || 0);
-        callback(null, duration);
-    });
-}
-
 // Функция перемещения файла
 function moveFileToPermanent(filename) {
     const tempPath = path.join(tempDir, filename);
@@ -228,15 +173,8 @@ function moveFileToPermanent(filename) {
     }
 }
 
-// Валидация имени канала Agora
-function isValidChannelName(channelName) {
-    const pattern = /^[a-zA-Z0-9!#$%&()+\-:;<=>.?@[\]^_{}|~]{1,64}$/;
-    return pattern.test(channelName) && channelName.length <= 64;
-}
-
 // Функции для работы с Supabase
 
-// Получение информации о пользователе
 async function getUserInfo(email) {
     const { data: regularUser, error: regularError } = await supabase
         .from('regular_users')
@@ -261,7 +199,6 @@ async function getUserInfo(email) {
     return null;
 }
 
-// Проверка существования пользователя
 async function userExists(email) {
     const user = await getUserInfo(email);
     return user !== null;
@@ -278,7 +215,6 @@ async function addToChatsAutomatically(user1, user2) {
             return;
         }
 
-        // Добавляем запись для user1
         await supabase
             .from('friends')
             .upsert({ 
@@ -289,7 +225,6 @@ async function addToChatsAutomatically(user1, user2) {
                 ignoreDuplicates: true 
             });
 
-        // Добавляем запись для user2
         await supabase
             .from('friends')
             .upsert({ 
@@ -306,15 +241,381 @@ async function addToChatsAutomatically(user1, user2) {
     }
 }
 
-// Health check эндпоинт
+// === WEBRTC SIGNALING HANDLERS ===
+
+io.on('connection', (socket) => {
+  console.log('✅ WebSocket подключение установлено:', socket.id);
+  
+  let userEmail = null;
+
+  // Аутентификация пользователя
+  socket.on('authenticate', (data) => {
+    if (data && data.email) {
+      userEmail = data.email.toLowerCase();
+      
+      // Удаляем предыдущее соединение если было
+      if (activeUsers.has(userEmail)) {
+        const oldSocketId = activeUsers.get(userEmail);
+        if (oldSocketId !== socket.id) {
+          io.to(oldSocketId).emit('force_disconnect', { reason: 'NEW_CONNECTION' });
+        }
+      }
+      
+      activeUsers.set(userEmail, socket.id);
+      socket.userEmail = userEmail;
+      
+      console.log(`👤 Пользователь аутентифицирован: ${userEmail} (socket: ${socket.id})`);
+      console.log(`📊 Всего онлайн: ${activeUsers.size} пользователей`);
+
+      socket.emit('authenticated', {
+        status: 'success',
+        email: userEmail,
+        timestamp: new Date().toISOString()
+      });
+
+      // Уведомляем других о статусе онлайн
+      socket.broadcast.emit('user_status_changed', {
+        email: userEmail,
+        status: 'online',
+        timestamp: new Date().toISOString()
+      });
+    }
+  });
+
+  // === ЗВОНКИ (SIGNALING) ===
+
+  // Инициация звонка
+  socket.on('call:initiate', (data) => {
+    try {
+      const { receiverEmail, callType } = data;
+      
+      if (!receiverEmail || !callType) {
+        socket.emit('call:error', { error: 'Missing required fields' });
+        return;
+      }
+
+      if (!userEmail) {
+        socket.emit('call:error', { error: 'Not authenticated' });
+        return;
+      }
+
+      const receiverSocketId = activeUsers.get(receiverEmail.toLowerCase());
+      
+      if (!receiverSocketId) {
+        socket.emit('call:error', { error: 'USER_OFFLINE', receiver: receiverEmail });
+        return;
+      }
+
+      const callId = `call_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+      
+      const callInfo = {
+        callId,
+        callerEmail: userEmail,
+        receiverEmail: receiverEmail.toLowerCase(),
+        callType,
+        status: 'ringing',
+        startTime: Date.now(),
+        callerSocketId: socket.id,
+        receiverSocketId
+      };
+
+      activeCalls.set(callId, callInfo);
+      pendingCalls.set(receiverEmail.toLowerCase(), callInfo);
+
+      // Уведомляем получателя о входящем звонке
+      io.to(receiverSocketId).emit('call:incoming', {
+        callId,
+        callerEmail: userEmail,
+        callType,
+        timestamp: Date.now()
+      });
+
+      console.log(`📞 Инициирован звонок: ${callId} (${userEmail} -> ${receiverEmail})`);
+
+      socket.emit('call:initiated', {
+        success: true,
+        callId,
+        message: 'Звонок инициирован'
+      });
+
+      // Автоматически удаляем через 60 секунд если не ответили
+      setTimeout(() => {
+        const call = activeCalls.get(callId);
+        if (call && call.status === 'ringing') {
+          endCall(callId, 'timeout');
+        }
+      }, 60000);
+
+    } catch (error) {
+      console.error('❌ Ошибка инициации звонка:', error);
+      socket.emit('call:error', { error: 'Internal error' });
+    }
+  });
+
+  // Принятие звонка
+  socket.on('call:accept', (data) => {
+    try {
+      const { callId } = data;
+      
+      const call = activeCalls.get(callId);
+      
+      if (!call) {
+        socket.emit('call:error', { error: 'CALL_NOT_FOUND' });
+        return;
+      }
+
+      if (call.status !== 'ringing') {
+        socket.emit('call:error', { error: 'INVALID_CALL_STATUS' });
+        return;
+      }
+
+      call.status = 'accepted';
+      activeCalls.set(callId, call);
+      
+      // Удаляем из ожидающих
+      pendingCalls.delete(call.receiverEmail);
+
+      // Уведомляем инициатора
+      io.to(call.callerSocketId).emit('call:accepted', {
+        callId,
+        receiverEmail: call.receiverEmail,
+        timestamp: Date.now()
+      });
+
+      // Уведомляем получателя
+      socket.emit('call:accepted_confirmation', {
+        callId,
+        success: true
+      });
+
+      console.log(`✅ Звонок принят: ${callId}`);
+
+    } catch (error) {
+      console.error('❌ Ошибка принятия звонка:', error);
+      socket.emit('call:error', { error: 'Internal error' });
+    }
+  });
+
+  // Отклонение звонка
+  socket.on('call:reject', (data) => {
+    try {
+      const { callId } = data;
+      
+      const call = activeCalls.get(callId);
+      
+      if (!call) {
+        return;
+      }
+
+      call.status = 'rejected';
+      
+      // Уведомляем инициатора
+      io.to(call.callerSocketId).emit('call:rejected', {
+        callId,
+        receiverEmail: call.receiverEmail,
+        timestamp: Date.now()
+      });
+
+      // Очищаем
+      activeCalls.delete(callId);
+      pendingCalls.delete(call.receiverEmail);
+
+      console.log(`❌ Звонок отклонен: ${callId}`);
+
+    } catch (error) {
+      console.error('❌ Ошибка отклонения звонка:', error);
+    }
+  });
+
+  // Завершение звонка
+  socket.on('call:end', (data) => {
+    try {
+      const { callId } = data;
+      
+      const call = activeCalls.get(callId);
+      
+      if (!call) {
+        return;
+      }
+
+      endCall(callId, 'ended');
+
+    } catch (error) {
+      console.error('❌ Ошибка завершения звонка:', error);
+    }
+  });
+
+  // WebRTC signaling: предложение SDP
+  socket.on('call:offer', (data) => {
+    try {
+      const { callId, offer, to } = data;
+      
+      const call = activeCalls.get(callId);
+      
+      if (!call) {
+        socket.emit('call:error', { error: 'CALL_NOT_FOUND' });
+        return;
+      }
+
+      const targetSocketId = to === 'caller' ? call.callerSocketId : call.receiverSocketId;
+      
+      io.to(targetSocketId).emit('call:offer', {
+        callId,
+        offer,
+        from: userEmail,
+        fromSocket: socket.id
+      });
+
+    } catch (error) {
+      console.error('❌ Ошибка отправки offer:', error);
+    }
+  });
+
+  // WebRTC signaling: ответ SDP
+  socket.on('call:answer', (data) => {
+    try {
+      const { callId, answer, to } = data;
+      
+      const call = activeCalls.get(callId);
+      
+      if (!call) {
+        socket.emit('call:error', { error: 'CALL_NOT_FOUND' });
+        return;
+      }
+
+      const targetSocketId = to === 'caller' ? call.callerSocketId : call.receiverSocketId;
+      
+      io.to(targetSocketId).emit('call:answer', {
+        callId,
+        answer,
+        from: userEmail,
+        fromSocket: socket.id
+      });
+
+    } catch (error) {
+      console.error('❌ Ошибка отправки answer:', error);
+    }
+  });
+
+  // WebRTC signaling: ICE кандидаты
+  socket.on('call:ice-candidate', (data) => {
+    try {
+      const { callId, candidate, to } = data;
+      
+      const call = activeCalls.get(callId);
+      
+      if (!call) {
+        return;
+      }
+
+      const targetSocketId = to === 'caller' ? call.callerSocketId : call.receiverSocketId;
+      
+      io.to(targetSocketId).emit('call:ice-candidate', {
+        callId,
+        candidate,
+        from: userEmail,
+        fromSocket: socket.id
+      });
+
+    } catch (error) {
+      console.error('❌ Ошибка отправки ICE кандидата:', error);
+    }
+  });
+
+  // Проверка статуса звонка
+  socket.on('call:check-status', (data) => {
+    try {
+      const { callId } = data;
+      
+      const call = activeCalls.get(callId);
+      
+      socket.emit('call:status', {
+        callId,
+        status: call ? call.status : 'not_found',
+        exists: !!call
+      });
+
+    } catch (error) {
+      console.error('❌ Ошибка проверки статуса:', error);
+    }
+  });
+
+  // Отключение
+  socket.on('disconnect', (reason) => {
+    console.log(`❌ WebSocket отключен: ${socket.id}, причина: ${reason}`);
+    
+    if (userEmail) {
+      activeUsers.delete(userEmail);
+      console.log(`👤 Удален из онлайн: ${userEmail}`);
+      
+      // Завершаем все активные звонки пользователя
+      activeCalls.forEach((call, callId) => {
+        if (call.callerEmail === userEmail || call.receiverEmail === userEmail) {
+          endCall(callId, 'disconnected');
+        }
+      });
+      
+      socket.broadcast.emit('user_status_changed', {
+        email: userEmail,
+        status: 'offline',
+        timestamp: new Date().toISOString(),
+        reason: reason
+      });
+    }
+    
+    console.log(`📊 Осталось онлайн: ${activeUsers.size} пользователей`);
+  });
+
+  // Обработка ошибок
+  socket.on('error', (error) => {
+    console.error('💥 WebSocket ошибка:', error);
+  });
+
+  // Ping для поддержания соединения
+  socket.on('ping', (data) => {
+    socket.emit('pong', {
+      ...data,
+      serverTime: new Date().toISOString()
+    });
+  });
+
+});
+
+// Вспомогательная функция для завершения звонка
+function endCall(callId, reason) {
+  const call = activeCalls.get(callId);
+  
+  if (!call) {
+    return;
+  }
+
+  call.status = reason;
+
+  // Уведомляем участников
+  if (call.callerSocketId) {
+    io.to(call.callerSocketId).emit('call:ended', { callId, reason });
+  }
+  
+  if (call.receiverSocketId) {
+    io.to(call.receiverSocketId).emit('call:ended', { callId, reason });
+  }
+
+  // Очищаем
+  activeCalls.delete(callId);
+  pendingCalls.delete(call.receiverEmail);
+
+  console.log(`📞 Звонок завершен: ${callId}, причина: ${reason}`);
+}
+
+// === HTTP ENDPOINTS ===
+
+// Health check
 app.get('/health', async (req, res) => {
     try {
-        // Проверка подключения к Supabase
         const { error } = await supabase.from('regular_users').select('count', { count: 'exact', head: true });
         
         if (error) throw error;
         
-        // Проверка доступности директорий
         const dirs = [uploadDir, tempDir, permanentDir, thumbnailsDir];
         const dirStatus = {};
         dirs.forEach(dir => {
@@ -329,7 +630,6 @@ app.get('/health', async (req, res) => {
             uptime: process.uptime(),
             memory: process.memoryUsage(),
             database: 'Supabase',
-            databaseUrl: supabaseUrl,
             directories: dirStatus
         };
         
@@ -345,6 +645,61 @@ app.get('/health', async (req, res) => {
             error: 'Health check failed',
             details: error.message 
         });
+    }
+});
+
+// Проверка статуса звонка (HTTP fallback)
+app.get('/call/status/:callId', (req, res) => {
+    try {
+        const { callId } = req.params;
+        
+        const call = activeCalls.get(callId);
+        
+        res.json({
+            success: true,
+            status: call ? call.status : 'not_found',
+            call: call ? {
+                callId: call.callId,
+                callerEmail: call.callerEmail,
+                receiverEmail: call.receiverEmail,
+                callType: call.callType,
+                status: call.status,
+                startTime: call.startTime
+            } : null
+        });
+    } catch (error) {
+        console.error('❌ Ошибка проверки статуса звонка:', error);
+        res.status(500).json({ success: false, error: 'Internal server error' });
+    }
+});
+
+// Проверка активных звонков для пользователя
+app.get('/call/active/:userEmail', (req, res) => {
+    try {
+        const userEmail = req.params.userEmail.toLowerCase();
+        
+        const userCalls = [];
+        activeCalls.forEach((call, callId) => {
+            if (call.callerEmail === userEmail || call.receiverEmail === userEmail) {
+                userCalls.push({
+                    callId,
+                    callerEmail: call.callerEmail,
+                    receiverEmail: call.receiverEmail,
+                    callType: call.callType,
+                    status: call.status,
+                    startTime: call.startTime
+                });
+            }
+        });
+        
+        res.json({
+            success: true,
+            calls: userCalls,
+            count: userCalls.length
+        });
+    } catch (error) {
+        console.error('❌ Ошибка проверки активных звонков:', error);
+        res.status(500).json({ success: false, error: 'Internal server error' });
     }
 });
 
@@ -498,8 +853,6 @@ app.post('/add-friend', async (req, res) => {
     try {
         const { userEmail, friendEmail } = req.body;
 
-        console.log('🔄 Добавление друга:', { userEmail, friendEmail });
-
         if (!userEmail || !friendEmail) {
             return res.status(400).json({ success: false, error: 'Email обязательны' });
         }
@@ -524,7 +877,6 @@ app.post('/add-friend', async (req, res) => {
             });
         }
 
-        // Добавляем для первого пользователя
         const { error: error1 } = await supabase
             .from('friends')
             .upsert({ 
@@ -535,7 +887,6 @@ app.post('/add-friend', async (req, res) => {
                 ignoreDuplicates: true 
             });
 
-        // Добавляем для второго пользователя
         const { error: error2 } = await supabase
             .from('friends')
             .upsert({ 
@@ -597,8 +948,6 @@ app.get('/chats/:userEmail', async (req, res) => {
     try {
         const userEmail = req.params.userEmail.toLowerCase();
 
-        console.log('🔄 Получение чатов для:', userEmail);
-
         const { data: friends, error } = await supabase
             .from('friends')
             .select(`
@@ -610,7 +959,6 @@ app.get('/chats/:userEmail', async (req, res) => {
 
         if (error) throw error;
 
-        // Получаем последние сообщения для каждого чата
         const chats = await Promise.all(friends.map(async (f) => {
             const friendEmail = f.friend_email;
             const userData = f.regular_users || f.beresta_users;
@@ -633,10 +981,7 @@ app.get('/chats/:userEmail', async (req, res) => {
             };
         }));
 
-        // Сортируем по времени последнего сообщения
         chats.sort((a, b) => new Date(b.lastMessageTime) - new Date(a.lastMessageTime));
-
-        console.log('✅ Найдено чатов:', chats.length);
 
         res.json({
             success: true,
@@ -713,44 +1058,6 @@ app.post('/send-message', async (req, res) => {
     }
 });
 
-// Принять звонок
-app.post('/accept-call', async (req, res) => {
-    try {
-        const { channelName, receiverEmail } = req.body;
-
-        if (!channelName || !receiverEmail) {
-            return res.status(400).json({ 
-                success: false, 
-                error: 'channelName и receiverEmail обязательны' 
-            });
-        }
-
-        pendingCalls.delete(receiverEmail.toLowerCase());
-
-        const { error } = await supabase
-            .from('agora_calls')
-            .update({ status: 'accepted' })
-            .eq('channel_name', channelName);
-
-        if (error) throw error;
-
-        console.log(`✅ Звонок принят: ${channelName} пользователем ${receiverEmail}`);
-
-        res.json({
-            success: true,
-            message: 'Call accepted',
-            channelName: channelName
-        });
-
-    } catch (error) {
-        console.error('❌ Ошибка принятия звонка:', error);
-        res.status(500).json({ 
-            success: false, 
-            error: 'Internal server error' 
-        });
-    }
-});
-
 // Загрузка файла
 app.post('/upload-file', upload.single('file'), async (req, res) => {
     try {
@@ -791,7 +1098,7 @@ app.post('/upload', upload.single('file'), async (req, res) => {
             return res.status(400).json({ success: false, error: 'Файл не загружен' });
         }
 
-        const { senderEmail, receiverEmail, duration, message } = req.body;
+        const { senderEmail, receiverEmail, message } = req.body;
 
         if (!senderEmail || !receiverEmail) {
             fs.unlinkSync(req.file.path);
@@ -807,10 +1114,8 @@ app.post('/upload', upload.single('file'), async (req, res) => {
         }
 
         const fileType = getFileType(req.file.mimetype, req.file.originalname);
-        let thumbnailFilename = '';
-        let videoDuration = duration || 0;
 
-        const completeFileUpload = async (thumbnail = '') => {
+        const completeFileUpload = async () => {
             try {
                 const { data, error } = await supabase
                     .from('messages')
@@ -822,9 +1127,7 @@ app.post('/upload', upload.single('file'), async (req, res) => {
                         attachment_filename: req.file.filename,
                         attachment_original_name: req.file.originalname,
                         attachment_mime_type: req.file.mimetype,
-                        attachment_size: req.file.size,
-                        duration: videoDuration,
-                        thumbnail: thumbnail
+                        attachment_size: req.file.size
                     }])
                     .select();
 
@@ -834,8 +1137,7 @@ app.post('/upload', upload.single('file'), async (req, res) => {
                     res.json({
                         success: true,
                         messageId: data[0].id,
-                        filename: req.file.filename,
-                        thumbnail: thumbnail
+                        filename: req.file.filename
                     });
 
                     addToChatsAutomatically(senderEmail, receiverEmail);
@@ -844,85 +1146,17 @@ app.post('/upload', upload.single('file'), async (req, res) => {
                 }
             } catch (error) {
                 fs.unlinkSync(req.file.path);
-                if (thumbnail) {
-                    fs.unlinkSync(path.join(thumbnailsDir, thumbnail));
-                }
                 throw error;
             }
         };
 
-        if (fileType === 'image' || fileType === 'video') {
-            const previewName = `preview_${path.parse(req.file.filename).name}.jpg`;
-            const previewPath = path.join(thumbnailsDir, previewName);
+        await completeFileUpload();
 
-            if (fileType === 'video') {
-                getVideoDuration(req.file.path, (err, duration) => {
-                    if (!err && duration > 0) videoDuration = duration;
-                    
-                    createMediaPreview(req.file.path, previewPath, fileType, (err) => {
-                        if (!err) thumbnailFilename = previewName;
-                        completeFileUpload(thumbnailFilename);
-                    });
-                });
-            } else {
-                createMediaPreview(req.file.path, previewPath, fileType, (err) => {
-                    if (!err) thumbnailFilename = previewName;
-                    completeFileUpload(thumbnailFilename);
-                });
-            }
-        } else {
-            await completeFileUpload();
-        }
     } catch (error) {
         console.error('❌ Ошибка загрузки файла:', error);
         if (req.file && fs.existsSync(req.file.path)) {
             fs.unlinkSync(req.file.path);
         }
-        res.status(500).json({ success: false, error: 'Internal server error' });
-    }
-});
-
-// Отправка сообщения с информацией о файле
-app.post('/send-message-with-attachment', async (req, res) => {
-    try {
-        const { senderEmail, receiverEmail, message, attachmentType, 
-                attachmentFilename, attachmentOriginalName, attachmentUrl } = req.body;
-
-        if (!senderEmail || !receiverEmail) {
-            return res.status(400).json({ success: false, error: 'Email обязательны' });
-        }
-
-        const senderInfo = await getUserInfo(senderEmail);
-        const receiverInfo = await getUserInfo(receiverEmail);
-
-        if (!senderInfo || !receiverInfo) {
-            return res.status(404).json({ success: false, error: 'Пользователь не найден' });
-        }
-
-        const { data, error } = await supabase
-            .from('messages')
-            .insert([{
-                sender_email: senderEmail.toLowerCase(),
-                receiver_email: receiverEmail.toLowerCase(),
-                message: message || '',
-                attachment_type: attachmentType || '',
-                attachment_filename: attachmentFilename || '',
-                attachment_original_name: attachmentOriginalName || '',
-                attachment_url: attachmentUrl || ''
-            }])
-            .select();
-
-        if (error) throw error;
-
-        res.json({
-            success: true,
-            messageId: data[0].id
-        });
-
-        addToChatsAutomatically(senderEmail, receiverEmail);
-
-    } catch (error) {
-        console.error('❌ Ошибка отправки сообщения с вложением:', error);
         res.status(500).json({ success: false, error: 'Internal server error' });
     }
 });
@@ -949,7 +1183,6 @@ app.get('/download/:filename', async (req, res) => {
                 .update({ [field]: true })
                 .eq('id', messageId);
 
-            // Проверяем, нужно ли удалить файл
             const { data } = await supabase
                 .from('messages')
                 .select('downloaded_by_sender, downloaded_by_receiver, attachment_filename')
@@ -980,7 +1213,7 @@ app.get('/download/:filename', async (req, res) => {
     }
 });
 
-// Получение информации о файле по ID сообщения
+// Получение информации о файле
 app.get('/file-info/:messageId', async (req, res) => {
     try {
         const messageId = req.params.messageId;
@@ -1027,7 +1260,6 @@ app.post('/create-group', async (req, res) => {
             return res.status(404).json({ success: false, error: 'Создатель не найден' });
         }
 
-        // Создаем группу
         const { data: group, error: groupError } = await supabase
             .from('groups')
             .insert([{
@@ -1040,7 +1272,6 @@ app.post('/create-group', async (req, res) => {
 
         if (groupError) throw groupError;
 
-        // Добавляем создателя как администратора
         const { error: memberError1 } = await supabase
             .from('group_members')
             .insert([{
@@ -1051,7 +1282,6 @@ app.post('/create-group', async (req, res) => {
 
         if (memberError1) throw memberError1;
 
-        // Добавляем остальных участников
         if (members && members.length > 0) {
             const memberInserts = members
                 .filter(member => member !== createdBy)
@@ -1081,7 +1311,7 @@ app.post('/create-group', async (req, res) => {
     }
 });
 
-// Получение списка групп пользователя
+// Получение групп пользователя
 app.get('/groups/:userEmail', async (req, res) => {
     try {
         const userEmail = req.params.userEmail.toLowerCase();
@@ -1103,7 +1333,6 @@ app.get('/groups/:userEmail', async (req, res) => {
 
         if (error) throw error;
 
-        // Получаем количество участников для каждой группы
         const groups = await Promise.all(data.map(async (item) => {
             const { count } = await supabase
                 .from('group_members')
@@ -1173,7 +1402,7 @@ app.get('/group-members/:groupId', async (req, res) => {
 // Отправка сообщения в группу
 app.post('/send-group-message', async (req, res) => {
     try {
-        const { groupId, senderEmail, message, duration } = req.body;
+        const { groupId, senderEmail, message } = req.body;
 
         if (!groupId || !senderEmail) {
             return res.status(400).json({ success: false, error: 'Группа и отправитель обязательны' });
@@ -1189,8 +1418,7 @@ app.post('/send-group-message', async (req, res) => {
             .insert([{
                 group_id: groupId,
                 sender_email: senderEmail.toLowerCase(),
-                message: message || '',
-                duration: duration || 0
+                message: message || ''
             }])
             .select();
 
@@ -1296,476 +1524,6 @@ app.post('/update-profile', upload.single('avatar'), async (req, res) => {
     }
 });
 
-// Agora токен
-app.get('/agora/token/:channelName/:userId', (req, res) => {
-    try {
-        const { channelName, userId } = req.params;
-
-        console.log(`🔑 Запрос токена: channel=${channelName}, userId=${userId}`);
-
-        if (!channelName) {
-            console.log('❌ Пустое имя канала');
-            return res.status(400).json({ success: false, error: 'Channel name обязателен' });
-        }
-
-        if (!isValidChannelName(channelName)) {
-            console.log(`❌ Недопустимое имя канала: ${channelName}`);
-            return res.status(400).json({ 
-                success: false, 
-                error: 'Недопустимое имя канала' 
-            });
-        }
-
-        const appId = process.env.AGORA_APP_ID || '0eef2fbc530f4d27a19a18f6527dda20';
-        const appCertificate = process.env.AGORA_APP_CERTIFICATE || '5ffaa1348ef5433b8fbb37d22772ca0e';
-        const expirationTimeInSeconds = 3600;
-
-        const currentTimestamp = Math.floor(Date.now() / 1000);
-        const privilegeExpiredTs = currentTimestamp + expirationTimeInSeconds;
-
-        const uid = Math.abs(parseInt(userId) || 0);
-        
-        console.log(`🛠️ Генерация токена: appId=${appId}, uid=${uid}, channel=${channelName}`);
-        
-        const token = Agora.RtcTokenBuilder.buildTokenWithUid(
-            appId,
-            appCertificate,
-            channelName,
-            uid,
-            Agora.RtcRole.PUBLISHER,
-            privilegeExpiredTs
-        );
-
-        console.log(`✅ Токен сгенерирован успешно для канала: ${channelName}`);
-
-        res.json({
-            success: true,
-            token: token,
-            appId: appId,
-            channelName: channelName
-        });
-
-    } catch (error) {
-        console.error('❌ Ошибка генерации Agora токена:', error);
-        res.status(500).json({ success: false, error: 'Internal server error' });
-    }
-});
-
-// Создание Agora звонка
-app.post('/agora/create-call', async (req, res) => {
-    try {
-        console.log('📞 Данные создания звонка:', req.body);
-        
-        const { callerEmail, receiverEmail, callType, channelName } = req.body;
-
-        if (!callerEmail || !receiverEmail || !channelName) {
-            console.log('❌ Отсутствуют обязательные поля');
-            return res.status(400).json({ success: false, error: 'Все поля обязательны' });
-        }
-
-        const callerInfo = await getUserInfo(callerEmail);
-        const receiverInfo = await getUserInfo(receiverEmail);
-
-        if (!callerInfo || !receiverInfo) {
-            return res.status(404).json({ success: false, error: 'Пользователь не найден' });
-        }
-
-        if (!isValidChannelName(channelName)) {
-            console.log('❌ Невалидное имя канала:', channelName);
-            return res.status(400).json({ 
-                success: false, 
-                error: 'Недопустимое имя канала' 
-            });
-        }
-
-        const { data, error } = await supabase
-            .from('agora_calls')
-            .insert([{
-                channel_name: channelName,
-                caller_email: callerEmail.toLowerCase(),
-                receiver_email: receiverEmail.toLowerCase(),
-                call_type: callType || 'audio',
-                status: 'ringing'
-            }])
-            .select();
-
-        if (error) throw error;
-
-        console.log('✅ Запись звонка создана');
-        
-        res.json({
-            success: true,
-            callId: data[0].id,
-            channelName: channelName
-        });
-
-    } catch (error) {
-        console.error('❌ Ошибка создания Agora звонка:', error);
-        res.status(500).json({ success: false, error: 'Internal server error' });
-    }
-});
-
-// WebSocket соединения
-const activeUsers = new Map();
-
-io.on('connection', (socket) => {
-  console.log('✅ WebSocket подключение установлено:', socket.id);
-  
-  if (socket.userEmail) {
-    activeUsers.set(socket.userEmail, socket.id);
-    
-    console.log(`👤 Пользователь онлайн: ${socket.userEmail} (socket: ${socket.id})`);
-    console.log(`📊 Всего онлайн: ${activeUsers.size} пользователей`);
-
-    socket.emit('connection_established', {
-      status: 'connected',
-      email: socket.userEmail,
-      socketId: socket.id,
-      timestamp: new Date().toISOString()
-    });
-
-    socket.broadcast.emit('user_status_changed', {
-      email: socket.userEmail,
-      status: 'online',
-      timestamp: new Date().toISOString()
-    });
-  }
-
-  socket.on('ping', (data) => {
-    socket.emit('pong', {
-      ...data,
-      serverTime: new Date().toISOString()
-    });
-  });
-
-  socket.on('user_online', (data) => {
-    try {
-      if (data && data.email) {
-        const email = data.email.toLowerCase();
-        activeUsers.set(email, socket.id);
-        socket.userEmail = email;
-        
-        console.log(`👤 Явный user_online: ${email}`);
-        
-        socket.emit('user_online_confirmed', {
-          status: 'confirmed',
-          email: email,
-          timestamp: new Date().toISOString()
-        });
-      }
-    } catch (error) {
-      console.error('❌ Ошибка в user_online:', error);
-    }
-  });
-
-  socket.on('call_notification', (data) => {
-    try {
-      console.log('📞 Получен call_notification:', data);
-      
-      if (!data || !data.receiverEmail) {
-        socket.emit('call_notification_failed', {
-          error: 'No receiver email'
-        });
-        return;
-      }
-
-      const receiverEmail = data.receiverEmail.toLowerCase();
-      const receiverSocketId = activeUsers.get(receiverEmail);
-      
-      console.log(`🔍 Поиск получателя: ${receiverEmail} -> ${receiverSocketId}`);
-
-      if (receiverSocketId && io.sockets.sockets.has(receiverSocketId)) {
-        const callData = {
-          type: 'incoming_call',
-          channelName: data.channelName,
-          callerEmail: data.callerEmail,
-          callerName: data.callerName || data.callerEmail,
-          callType: data.callType || 'audio',
-          timestamp: new Date().toISOString(),
-          callId: data.callId || Date.now().toString()
-        };
-
-        io.to(receiverSocketId).emit('incoming_call', callData);
-        
-        console.log(`✅ Уведомление отправлено: ${receiverEmail}`);
-        
-        socket.emit('call_notification_sent', {
-          success: true,
-          receiver: receiverEmail,
-          timestamp: new Date().toISOString()
-        });
-      } else {
-        console.log(`❌ Пользователь оффлайн: ${receiverEmail}`);
-        
-        socket.emit('call_notification_failed', {
-          success: false,
-          error: 'USER_OFFLINE',
-          receiver: receiverEmail
-        });
-      }
-    } catch (error) {
-      console.error('❌ Ошибка в call_notification:', error);
-      socket.emit('call_notification_failed', {
-        error: 'INTERNAL_ERROR',
-        details: error.message
-      });
-    }
-  });
-
-  socket.on('disconnect', (reason) => {
-    console.log(`❌ WebSocket отключен: ${socket.id}, причина: ${reason}`);
-    
-    if (socket.userEmail) {
-      activeUsers.delete(socket.userEmail);
-      console.log(`👤 Удален из онлайн: ${socket.userEmail}`);
-      
-      socket.broadcast.emit('user_status_changed', {
-        email: socket.userEmail,
-        status: 'offline',
-        timestamp: new Date().toISOString(),
-        reason: reason
-      });
-    }
-    
-    console.log(`📊 Осталось онлайн: ${activeUsers.size} пользователей`);
-  });
-
-  socket.on('error', (error) => {
-    console.error('💥 WebSocket ошибка:', error);
-  });
-});
-
-// Отправка звонка
-app.post('/send-call', async (req, res) => {
-    try {
-        const { channelName, callerEmail, receiverEmail, callType, callerName } = req.body;
-
-        console.log('📞 Отправка звонка:', { channelName, callerEmail, receiverEmail, callType });
-
-        if (!channelName || !callerEmail || !receiverEmail) {
-            return res.status(400).json({ 
-                success: false, 
-                error: 'channelName, callerEmail, receiverEmail обязательны' 
-            });
-        }
-
-        const callerInfo = await getUserInfo(callerEmail);
-        const receiverInfo = await getUserInfo(receiverEmail);
-
-        if (!callerInfo || !receiverInfo) {
-            return res.status(404).json({ success: false, error: 'Пользователь не найден' });
-        }
-
-        const normalizedReceiver = receiverEmail.toLowerCase();
-        
-        const callData = {
-            channelName: channelName,
-            callerEmail: callerEmail,
-            receiverEmail: normalizedReceiver,
-            callType: callType || 'audio',
-            callerName: callerName || callerEmail,
-            timestamp: new Date().toISOString(),
-            callId: Date.now().toString()
-        };
-
-        await supabase
-            .from('agora_calls')
-            .upsert({
-                channel_name: channelName,
-                caller_email: callerEmail,
-                receiver_email: normalizedReceiver,
-                call_type: callType || 'audio',
-                status: 'ringing'
-            }, {
-                onConflict: 'channel_name'
-            });
-
-        pendingCalls.set(normalizedReceiver, callData);
-        
-        setTimeout(() => {
-            if (pendingCalls.get(normalizedReceiver)?.callId === callData.callId) {
-                pendingCalls.delete(normalizedReceiver);
-                console.log(`🗑️ Очищен ожидающий звонок для: ${normalizedReceiver}`);
-            }
-        }, 60000);
-
-        console.log(`✅ Звонок отправлен: ${callerEmail} -> ${normalizedReceiver}`);
-
-        res.json({
-            success: true,
-            message: 'Call sent successfully',
-            callId: callData.callId
-        });
-
-    } catch (error) {
-        console.error('❌ Ошибка отправки звонка:', error);
-        res.status(500).json({ 
-            success: false, 
-            error: 'Internal server error',
-            details: error.message 
-        });
-    }
-});
-
-// Проверка входящих звонков
-app.get('/check-incoming-calls/:userEmail', async (req, res) => {
-    try {
-        const userEmail = req.params.userEmail.toLowerCase();
-        const timeout = parseInt(req.query.timeout) || 30000;
-
-        console.log(`🔍 Проверка звонков для: ${userEmail}, timeout: ${timeout}ms`);
-
-        const existingCall = pendingCalls.get(userEmail);
-        if (existingCall) {
-            pendingCalls.delete(userEmail);
-            return res.json({
-                success: true,
-                hasCall: true,
-                call: existingCall
-            });
-        }
-
-        const checkCall = () => {
-            const call = pendingCalls.get(userEmail);
-            if (call) {
-                pendingCalls.delete(userEmail);
-                res.json({
-                    success: true,
-                    hasCall: true,
-                    call: call
-                });
-                return true;
-            }
-            return false;
-        };
-
-        if (checkCall()) return;
-
-        const interval = setInterval(() => {
-            if (checkCall()) {
-                clearInterval(interval);
-            }
-        }, 1000);
-
-        setTimeout(() => {
-            clearInterval(interval);
-            if (!res.headersSent) {
-                res.json({
-                    success: true,
-                    hasCall: false,
-                    message: 'No incoming calls'
-                });
-            }
-        }, timeout);
-
-    } catch (error) {
-        console.error('❌ Ошибка проверки звонков:', error);
-        if (!res.headersSent) {
-            res.status(500).json({ 
-                success: false, 
-                error: 'Internal server error' 
-            });
-        }
-    }
-});
-
-// Завершение звонка
-app.post('/end-call', async (req, res) => {
-    try {
-        const { channelName, receiverEmail } = req.body;
-
-        if (!channelName) {
-            return res.status(400).json({ 
-                success: false, 
-                error: 'channelName обязателен' 
-            });
-        }
-
-        if (receiverEmail) {
-            pendingCalls.delete(receiverEmail.toLowerCase());
-        }
-
-        const { error } = await supabase
-            .from('agora_calls')
-            .update({ 
-                status: 'ended', 
-                ended_at: new Date().toISOString() 
-            })
-            .eq('channel_name', channelName);
-
-        if (error) throw error;
-
-        res.json({
-            success: true,
-            message: 'Call ended'
-        });
-
-    } catch (error) {
-        console.error('❌ Ошибка завершения звонка:', error);
-        res.status(500).json({ 
-            success: false, 
-            error: 'Internal server error' 
-        });
-    }
-});
-
-// Очистка истории чата
-app.post('/clear-chat', async (req, res) => {
-    try {
-        const { userEmail, friendEmail } = req.body;
-
-        if (!userEmail || !friendEmail) {
-            return res.status(400).json({ success: false, error: 'Email обязательны' });
-        }
-
-        const { error } = await supabase
-            .from('messages')
-            .delete()
-            .or(`and(sender_email.eq.${userEmail.toLowerCase()},receiver_email.eq.${friendEmail.toLowerCase()}),and(sender_email.eq.${friendEmail.toLowerCase()},receiver_email.eq.${userEmail.toLowerCase()})`);
-
-        if (error) throw error;
-
-        res.json({
-            success: true,
-            message: 'История чата очищена',
-            deletedCount: 0
-        });
-    } catch (error) {
-        console.error('❌ Ошибка очистки чата:', error);
-        res.status(500).json({ success: false, error: 'Internal server error' });
-    }
-});
-
-// Удаление аккаунта
-app.delete('/delete-account/:userEmail', async (req, res) => {
-    try {
-        const userEmail = req.params.userEmail.toLowerCase();
-
-        const userInfo = await getUserInfo(userEmail);
-        if (!userInfo) {
-            return res.status(404).json({ success: false, error: 'Пользователь не найден' });
-        }
-
-        const table = userInfo.userType === 'regular' ? 'regular_users' : 'beresta_users';
-
-        const { error } = await supabase
-            .from(table)
-            .delete()
-            .eq('email', userEmail);
-
-        if (error) throw error;
-
-        res.json({
-            success: true,
-            message: 'Аккаунт удален',
-            deletedCount: 1
-        });
-    } catch (error) {
-        console.error('❌ Ошибка удаления аккаунта:', error);
-        res.status(500).json({ success: false, error: 'Internal server error' });
-    }
-});
-
 // Загрузка файла в группу
 app.post('/upload-group', upload.single('file'), async (req, res) => {
     try {
@@ -1787,10 +1545,8 @@ app.post('/upload-group', upload.single('file'), async (req, res) => {
         }
 
         const fileType = getFileType(req.file.mimetype, req.file.originalname);
-        let thumbnailFilename = '';
-        let videoDuration = 0;
 
-        const completeFileUpload = async (thumbnail = '') => {
+        const completeFileUpload = async () => {
             try {
                 const { data, error } = await supabase
                     .from('group_messages')
@@ -1802,9 +1558,7 @@ app.post('/upload-group', upload.single('file'), async (req, res) => {
                         attachment_filename: req.file.filename,
                         attachment_original_name: req.file.originalname,
                         attachment_mime_type: req.file.mimetype,
-                        attachment_size: req.file.size,
-                        duration: videoDuration,
-                        thumbnail: thumbnail
+                        attachment_size: req.file.size
                     }])
                     .select();
 
@@ -1814,43 +1568,19 @@ app.post('/upload-group', upload.single('file'), async (req, res) => {
                     res.json({
                         success: true,
                         messageId: data[0].id,
-                        filename: req.file.filename,
-                        thumbnail: thumbnail
+                        filename: req.file.filename
                     });
                 } else {
                     throw new Error('Ошибка перемещения файла');
                 }
             } catch (error) {
                 fs.unlinkSync(req.file.path);
-                if (thumbnail) {
-                    fs.unlinkSync(path.join(thumbnailsDir, thumbnail));
-                }
                 throw error;
             }
         };
 
-        if (fileType === 'image' || fileType === 'video') {
-            const previewName = `preview_${path.parse(req.file.filename).name}.jpg`;
-            const previewPath = path.join(thumbnailsDir, previewName);
+        await completeFileUpload();
 
-            if (fileType === 'video') {
-                getVideoDuration(req.file.path, (err, duration) => {
-                    if (!err && duration > 0) videoDuration = duration;
-                    
-                    createMediaPreview(req.file.path, previewPath, fileType, (err) => {
-                        if (!err) thumbnailFilename = previewName;
-                        completeFileUpload(thumbnailFilename);
-                    });
-                });
-            } else {
-                createMediaPreview(req.file.path, previewPath, fileType, (err) => {
-                    if (!err) thumbnailFilename = previewName;
-                    completeFileUpload(thumbnailFilename);
-                });
-            }
-        } else {
-            await completeFileUpload();
-        }
     } catch (error) {
         console.error('❌ Ошибка загрузки группового файла:', error);
         if (req.file && fs.existsSync(req.file.path)) {
@@ -1890,48 +1620,6 @@ app.get('/group-file-info/:filename', async (req, res) => {
     } catch (error) {
         console.error('❌ Ошибка получения информации о групповом файле:', error);
         res.status(500).json({ success: false, error: 'Internal server error' });
-    }
-});
-
-// Проверка активных звонков
-app.get('/check-calls/:userEmail', async (req, res) => {
-    try {
-        const userEmail = req.params.userEmail.toLowerCase();
-        
-        console.log(`🔍 Проверка звонков для: ${userEmail}`);
-        
-        const { data, error } = await supabase
-            .from('agora_calls')
-            .select('channel_name, caller_email, receiver_email, call_type, status, created_at')
-            .eq('receiver_email', userEmail)
-            .eq('status', 'ringing')
-            .gte('created_at', new Date(Date.now() - 5 * 60 * 1000).toISOString())
-            .order('created_at', { ascending: false })
-            .limit(5);
-
-        if (error) throw error;
-
-        console.log(`📞 Найдено активных звонков: ${data.length}`);
-        
-        res.json({
-            success: true,
-            calls: data.map(call => ({
-                channelName: call.channel_name,
-                callerEmail: call.caller_email,
-                receiverEmail: call.receiver_email,
-                callType: call.call_type,
-                status: call.status,
-                createdAt: call.created_at
-            })),
-            timestamp: new Date().toISOString()
-        });
-
-    } catch (error) {
-        console.error('❌ Ошибка проверки звонков:', error);
-        res.status(500).json({ 
-            success: false, 
-            error: 'Internal server error' 
-        });
     }
 });
 
@@ -2020,6 +1708,61 @@ app.delete('/group/:groupId', async (req, res) => {
     }
 });
 
+// Очистка истории чата
+app.post('/clear-chat', async (req, res) => {
+    try {
+        const { userEmail, friendEmail } = req.body;
+
+        if (!userEmail || !friendEmail) {
+            return res.status(400).json({ success: false, error: 'Email обязательны' });
+        }
+
+        const { error } = await supabase
+            .from('messages')
+            .delete()
+            .or(`and(sender_email.eq.${userEmail.toLowerCase()},receiver_email.eq.${friendEmail.toLowerCase()}),and(sender_email.eq.${friendEmail.toLowerCase()},receiver_email.eq.${userEmail.toLowerCase()})`);
+
+        if (error) throw error;
+
+        res.json({
+            success: true,
+            message: 'История чата очищена'
+        });
+    } catch (error) {
+        console.error('❌ Ошибка очистки чата:', error);
+        res.status(500).json({ success: false, error: 'Internal server error' });
+    }
+});
+
+// Удаление аккаунта
+app.delete('/delete-account/:userEmail', async (req, res) => {
+    try {
+        const userEmail = req.params.userEmail.toLowerCase();
+
+        const userInfo = await getUserInfo(userEmail);
+        if (!userInfo) {
+            return res.status(404).json({ success: false, error: 'Пользователь не найден' });
+        }
+
+        const table = userInfo.userType === 'regular' ? 'regular_users' : 'beresta_users';
+
+        const { error } = await supabase
+            .from(table)
+            .delete()
+            .eq('email', userEmail);
+
+        if (error) throw error;
+
+        res.json({
+            success: true,
+            message: 'Аккаунт удален'
+        });
+    } catch (error) {
+        console.error('❌ Ошибка удаления аккаунта:', error);
+        res.status(500).json({ success: false, error: 'Internal server error' });
+    }
+});
+
 // Статические файлы
 app.use('/uploads', express.static(uploadDir));
 
@@ -2029,13 +1772,11 @@ server.listen(PORT, '0.0.0.0', async () => {
     console.log(`🌐 URL: http://0.0.0.0:${PORT}`);
     console.log(`📡 WebSocket сервер активен: ws://0.0.0.0:${PORT}`);
     console.log(`🔧 Режим: ${process.env.NODE_ENV || 'development'}`);
-    console.log(`🔗 Внешний URL: https://beresta-server-5udn.onrender.com`);
     console.log(`💾 База данных: Supabase (${supabaseUrl})`);
     
-    // Запуск только внутреннего само-пинга для Render.com
     if (isRender) {
         startSelfPing();
-        console.log('✅ Внутренний само-пинг активирован (только для поддержания активности сервера)');
+        console.log('✅ Внутренний само-пинг активирован');
     }
     
     console.log('✅ Сервер готов к работе');
