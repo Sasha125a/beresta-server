@@ -571,6 +571,80 @@ app.get('/chats/:userEmail', async (req, res) => {
     }
 });
 
+// Получение информации о пользователе
+app.get('/user/:email', async (req, res) => {
+    try {
+        const email = decodeURIComponent(req.params.email).toLowerCase();
+        console.log('🔍 Поиск пользователя по email:', email);
+
+        // Ищем в regular_users
+        const { data: regularUser, error: regularError } = await supabase
+            .from('regular_users')
+            .select('*')
+            .eq('email', email)
+            .maybeSingle();
+
+        if (regularError) {
+            console.error('❌ Ошибка поиска в regular_users:', regularError);
+        }
+
+        if (regularUser) {
+            console.log('✅ Найден в regular_users:', regularUser);
+            return res.json({
+                success: true,
+                user: {
+                    email: regularUser.email,
+                    firstName: regularUser.first_name,
+                    lastName: regularUser.last_name,
+                    avatarFilename: regularUser.avatar_filename || '',
+                    userType: 'regular'
+                }
+            });
+        }
+
+        // Ищем в beresta_users
+        const { data: berestaUser, error: berestaError } = await supabase
+            .from('beresta_users')
+            .select('*')
+            .eq('email', email)
+            .maybeSingle();
+
+        if (berestaError) {
+            console.error('❌ Ошибка поиска в beresta_users:', berestaError);
+        }
+
+        if (berestaUser) {
+            console.log('✅ Найден в beresta_users:', berestaUser);
+            return res.json({
+                success: true,
+                user: {
+                    email: berestaUser.email,
+                    firstName: berestaUser.first_name,
+                    lastName: berestaUser.last_name,
+                    avatarFilename: berestaUser.avatar_filename || '',
+                    userType: 'beresta',
+                    berestaId: berestaUser.beresta_id
+                }
+            });
+        }
+
+        // Пользователь не найден
+        console.log('❌ Пользователь не найден:', email);
+        return res.status(404).json({ 
+            success: false, 
+            error: 'Пользователь не найден' 
+        });
+
+    } catch (error) {
+        console.error('❌ Ошибка получения пользователя:', error);
+        res.status(500).json({ 
+            success: false, 
+            error: 'Internal server error',
+            details: error.message 
+        });
+    }
+});
+
 // Добавление в друзья
 app.post('/add-friend', async (req, res) => {
     try {
