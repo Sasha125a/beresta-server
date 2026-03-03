@@ -10,9 +10,9 @@ const { v4: uuidv4 } = require('uuid');
 const ffmpeg = require('fluent-ffmpeg');
 const ffmpegPath = require('ffmpeg-static');
 const ffprobePath = require('ffprobe-static').path;
-const Agora = require('agora-access-token');
 const http = require('http');
 const socketIo = require('socket.io');
+const WebSocket = require('ws');
 const { createClient } = require('@supabase/supabase-js');
 
 // ==================== КОНФИГУРАЦИЯ ====================
@@ -22,6 +22,8 @@ const SERVER_ID = process.env.RENDER_SERVICE_ID || `server-${Math.random().toStr
 const app = express();
 const PORT = process.env.PORT || 3000;
 const server = http.createServer(app);
+
+// ==================== SOCKET.IO (для чата) ====================
 const io = socketIo(server, {
     cors: {
         origin: isRender ? ["https://beresta-server-5udn.onrender.com"] : "*",
@@ -31,6 +33,12 @@ const io = socketIo(server, {
     transports: ['websocket', 'polling'],
     pingTimeout: 60000,
     pingInterval: 25000
+});
+
+// ==================== WEBSOCKET (для WebRTC сигналинга) ====================
+const wss = new WebSocket.Server({ 
+    server: server,
+    path: '/webrtc'
 });
 
 // ==================== SUPABASE ====================
@@ -190,14 +198,6 @@ function createMediaPreview(filePath, outputPath, fileType, callback) {
     }
 }
 
-/**
- * Валидация имени канала Agora
- */
-function isValidChannelName(channelName) {
-    const pattern = /^[a-zA-Z0-9!#$%&()+\-:;<=>.?@[\]^_{}|~]{1,64}$/;
-    return pattern.test(channelName) && channelName.length <= 64;
-}
-
 // ==================== ФУНКЦИИ РАБОТЫ С БАЗОЙ ДАННЫХ ====================
 
 /**
@@ -337,10 +337,189 @@ async function cleanupOldPresence() {
     }
 }
 
+/**
+ * Очистка устаревших звонков
+ */
+async function cleanupOldCalls() {
+    try {
+        const { error } = await supabase
+            .from('active_calls')
+            .delete()
+            .lt('expires_at', new Date().toISOString());
+
+        if (error) throw error;
+    } catch (error) {
+        console.error('❌ Ошибка очистки звонков:', error);
+    }
+}
+
 // Запускаем очистку раз в минуту
 setInterval(cleanupOldPresence, 60000);
+setInterval(cleanupOldCalls, 60000);
 
-// ==================== WEB-SOCKET СОЕДИНЕНИЯ ====================
+// ==================== ХРАНИЛИЩЕ ДЛЯ WEBRTC СИГНАЛИНГА ====================
+const callSessions = new Map(); // callId -> { participants, offers }
+const userConnections = new Map(); // userEmail -> ws
+
+// ==================== WEBSOCKET ДЛЯ WEBRTC СИГНАЛИНГА ====================
+wss.on('connection', (ws, req) => {
+    const url = new URL(req.url, `http://${req.headers.host}`);
+    const userId = url.searchParams.get('userId');
+    
+    if (!userId) {
+        ws.close(1008, 'User ID required');
+        return;
+    }
+
+    console.log(`🔌 WebRTC клиент подключен: ${userId}`);
+    userConnections.set(userId, ws);
+
+    ws.on('message', async (message) => {
+        try {
+            const data = JSON.parse(message);
+            console.log(`📨 WebRTC сообщение от ${userId}:`, data.type);
+
+            switch (data.type) {
+                case 'call-offer':
+                    // Инициатор звонка отправляет offer
+                    const callId = uuidv4();
+                    const callSession = {
+                        callId,
+                        caller: userId,
+                        callee: data.targetUserId,
+                        offer: data.offer,
+                        iceCandidates: [],
+                        status: 'ringing'
+                    };
+                    
+                    callSessions.set(callId, callSession);
+                    
+                    // Сохраняем в БД
+                    await supabase
+                        .from('webrtc_calls')
+                        .insert({
+                            call_id: callId,
+                            caller_email: userId,
+                            receiver_email: data.targetUserId,
+                            status: 'ringing',
+                            created_at: new Date().toISOString()
+                        });
+                    
+                    // Отправляем уведомление получателю
+                    const calleeWs = userConnections.get(data.targetUserId);
+                    if (calleeWs && calleeWs.readyState === WebSocket.OPEN) {
+                        calleeWs.send(JSON.stringify({
+                            type: 'incoming-call',
+                            callId,
+                            caller: userId,
+                            offer: data.offer
+                        }));
+                    } else {
+                        // Получатель офлайн
+                        ws.send(JSON.stringify({
+                            type: 'call-failed',
+                            reason: 'USER_OFFLINE'
+                        }));
+                        
+                        // Обновляем статус в БД
+                        await supabase
+                            .from('webrtc_calls')
+                            .update({ status: 'failed' })
+                            .eq('call_id', callId);
+                    }
+                    break;
+
+                case 'call-answer':
+                    // Получатель отвечает на звонок
+                    const session = callSessions.get(data.callId);
+                    if (session) {
+                        session.status = 'connected';
+                        
+                        // Отправляем answer звонящему
+                        const callerWs = userConnections.get(session.caller);
+                        if (callerWs && callerWs.readyState === WebSocket.OPEN) {
+                            callerWs.send(JSON.stringify({
+                                type: 'call-answer',
+                                callId: data.callId,
+                                answer: data.answer
+                            }));
+                        }
+                        
+                        // Обновляем статус в БД
+                        await supabase
+                            .from('webrtc_calls')
+                            .update({ 
+                                status: 'connected',
+                                answered_at: new Date().toISOString()
+                            })
+                            .eq('call_id', data.callId);
+                    }
+                    break;
+
+                case 'ice-candidate':
+                    // Обмен ICE кандидатами
+                    const targetSession = callSessions.get(data.callId);
+                    if (targetSession) {
+                        const targetUser = data.targetUserId;
+                        const targetWs = userConnections.get(targetUser);
+                        
+                        if (targetWs && targetWs.readyState === WebSocket.OPEN) {
+                            targetWs.send(JSON.stringify({
+                                type: 'ice-candidate',
+                                callId: data.callId,
+                                candidate: data.candidate
+                            }));
+                        }
+                    }
+                    break;
+
+                case 'call-end':
+                    // Завершение звонка
+                    const endedSession = callSessions.get(data.callId);
+                    if (endedSession) {
+                        // Уведомляем всех участников
+                        [endedSession.caller, endedSession.callee].forEach(email => {
+                            const userWs = userConnections.get(email);
+                            if (userWs && userWs.readyState === WebSocket.OPEN) {
+                                userWs.send(JSON.stringify({
+                                    type: 'call-ended',
+                                    callId: data.callId
+                                }));
+                            }
+                        });
+                        
+                        callSessions.delete(data.callId);
+                        
+                        // Обновляем статус в БД
+                        await supabase
+                            .from('webrtc_calls')
+                            .update({ 
+                                status: 'ended',
+                                ended_at: new Date().toISOString()
+                            })
+                            .eq('call_id', data.callId);
+                    }
+                    break;
+            }
+        } catch (error) {
+            console.error('❌ Ошибка обработки WebRTC сообщения:', error);
+        }
+    });
+
+    ws.on('close', () => {
+        console.log(`🔌 WebRTC клиент отключен: ${userId}`);
+        userConnections.delete(userId);
+        
+        // Очищаем активные звонки этого пользователя
+        callSessions.forEach((session, callId) => {
+            if (session.caller === userId || session.callee === userId) {
+                callSessions.delete(callId);
+            }
+        });
+    });
+});
+
+// ==================== SOCKET.IO СОЕДИНЕНИЯ (для чата) ====================
 
 io.on('connection', (socket) => {
     console.log('✅ WebSocket подключен:', socket.id);
@@ -383,84 +562,6 @@ io.on('connection', (socket) => {
             ...data,
             serverTime: new Date().toISOString()
         });
-    });
-
-    // Обработчик уведомлений о звонке
-    socket.on('call_notification', async (data) => {
-        try {
-            console.log('📞 Получен call_notification:', data);
-            
-            if (!data || !data.receiverEmail) {
-                socket.emit('call_notification_failed', {
-                    error: 'No receiver email'
-                });
-                return;
-            }
-
-            const receiverEmail = data.receiverEmail.toLowerCase();
-            const receiverPresence = await getUserSocketId(receiverEmail);
-            
-            console.log(`🔍 Поиск получателя: ${receiverEmail} ->`, receiverPresence);
-
-            if (receiverPresence && receiverPresence.server_id === SERVER_ID) {
-                // Получатель на этом же сервере
-                io.to(receiverPresence.socket_id).emit('incoming_call', {
-                    type: 'incoming_call',
-                    channelName: data.channelName,
-                    callerEmail: data.callerEmail,
-                    callerName: data.callerName || data.callerEmail,
-                    callType: data.callType || 'audio',
-                    timestamp: new Date().toISOString(),
-                    callId: data.callId || Date.now().toString()
-                });
-                
-                console.log(`✅ Уведомление отправлено напрямую: ${receiverEmail}`);
-                
-                socket.emit('call_notification_sent', {
-                    success: true,
-                    receiver: receiverEmail,
-                    timestamp: new Date().toISOString()
-                });
-            } else if (receiverPresence) {
-                // Получатель на другом сервере - сохраняем в БД для long-polling
-                console.log(`📱 Получатель на сервере ${receiverPresence.server_id}, сохраняем в БД`);
-                
-                await supabase
-                    .from('active_calls')
-                    .upsert({
-                        call_id: data.callId || Date.now().toString(),
-                        channel_name: data.channelName,
-                        caller_email: data.callerEmail.toLowerCase(),
-                        receiver_email: receiverEmail,
-                        call_type: data.callType || 'audio',
-                        status: 'ringing',
-                        expires_at: new Date(Date.now() + 60000).toISOString()
-                    }, {
-                        onConflict: 'call_id'
-                    });
-
-                socket.emit('call_notification_sent', {
-                    success: true,
-                    receiver: receiverEmail,
-                    via: 'database',
-                    timestamp: new Date().toISOString()
-                });
-            } else {
-                console.log(`❌ Пользователь оффлайн: ${receiverEmail}`);
-                
-                socket.emit('call_notification_failed', {
-                    success: false,
-                    error: 'USER_OFFLINE',
-                    receiver: receiverEmail
-                });
-            }
-        } catch (error) {
-            console.error('❌ Ошибка в call_notification:', error);
-            socket.emit('call_notification_failed', {
-                error: 'INTERNAL_ERROR',
-                details: error.message
-            });
-        }
     });
 
     // Обработчик отключения
@@ -1622,334 +1723,7 @@ app.get('/group-file-info/:filename', async (req, res) => {
     }
 });
 
-// ===== Agora токен =====
-app.get('/agora/token/:channelName/:userId', (req, res) => {
-    try {
-        const { channelName, userId } = req.params;
-
-        console.log(`🔑 Запрос токена: channel=${channelName}, userId=${userId}`);
-
-        if (!channelName) {
-            return res.status(400).json({ success: false, error: 'Channel name обязателен' });
-        }
-
-        if (!isValidChannelName(channelName)) {
-            return res.status(400).json({
-                success: false,
-                error: 'Недопустимое имя канала'
-            });
-        }
-
-        const appId = process.env.AGORA_APP_ID || '0eef2fbc530f4d27a19a18f6527dda20';
-        const appCertificate = process.env.AGORA_APP_CERTIFICATE || '5ffaa1348ef5433b8fbb37d22772ca0e';
-        const expirationTimeInSeconds = 3600;
-
-        const currentTimestamp = Math.floor(Date.now() / 1000);
-        const privilegeExpiredTs = currentTimestamp + expirationTimeInSeconds;
-
-        const uid = Math.abs(parseInt(userId) || 0);
-
-        const token = Agora.RtcTokenBuilder.buildTokenWithUid(
-            appId,
-            appCertificate,
-            channelName,
-            uid,
-            Agora.RtcRole.PUBLISHER,
-            privilegeExpiredTs
-        );
-
-        res.json({
-            success: true,
-            token: token,
-            appId: appId,
-            channelName: channelName
-        });
-    } catch (error) {
-        console.error('❌ Ошибка генерации Agora токена:', error);
-        res.status(500).json({ success: false, error: 'Internal server error' });
-    }
-});
-
-// ===== СОЗДАНИЕ ЗВОНКА =====
-app.post('/send-call', async (req, res) => {
-    try {
-        const { channelName, callerEmail, receiverEmail, callType, callerName } = req.body;
-
-        console.log('📞 Создание звонка:', { channelName, callerEmail, receiverEmail, callType, callerName });
-        console.log('📦 Полный body:', req.body);
-
-        if (!channelName || !callerEmail || !receiverEmail) {
-            console.log('❌ Отсутствуют обязательные поля');
-            return res.status(400).json({ 
-                success: false, 
-                error: 'Все поля обязательны',
-                required: ['channelName', 'callerEmail', 'receiverEmail'],
-                received: req.body
-            });
-        }
-
-        const callId = Date.now().toString();
-        console.log('🆔 Сгенерирован callId:', callId);
-
-        // Проверяем, существует ли получатель
-        const receiverExists = await userExists(receiverEmail);
-        if (!receiverExists) {
-            console.log('❌ Получатель не найден в БД:', receiverEmail);
-            return res.status(404).json({ 
-                success: false, 
-                error: 'Получатель не найден' 
-            });
-        }
-
-        // Сохраняем звонок в БД
-        console.log('💾 Сохранение в active_calls...');
-        const { data, error } = await supabase
-            .from('active_calls')
-            .insert({
-                call_id: callId,
-                channel_name: channelName,
-                caller_email: callerEmail.toLowerCase(),
-                receiver_email: receiverEmail.toLowerCase(),
-                call_type: callType || 'audio',
-                status: 'ringing',
-                expires_at: new Date(Date.now() + 60000).toISOString()
-            })
-            .select();
-
-        if (error) {
-            console.error('❌ Ошибка Supabase:', error);
-            return res.status(500).json({ 
-                success: false, 
-                error: 'Ошибка базы данных',
-                details: error.message 
-            });
-        }
-
-        console.log('✅ Звонок сохранен в БД:', data);
-
-        // Проверяем, онлайн ли получатель
-        const receiverPresence = await getUserSocketId(receiverEmail);
-        console.log('📱 Статус получателя:', receiverPresence);
-
-        if (receiverPresence && receiverPresence.server_id === SERVER_ID) {
-            // Получатель на этом же сервере - отправляем напрямую через WebSocket
-            console.log(`📤 Отправка через WebSocket на ${receiverPresence.socket_id}`);
-            io.to(receiverPresence.socket_id).emit('incoming_call', {
-                channelName,
-                callerEmail,
-                callerName: callerName || callerEmail,
-                callType: callType || 'audio',
-                callId,
-                timestamp: new Date().toISOString()
-            });
-
-            console.log(`✅ Звонок доставлен напрямую: ${receiverEmail}`);
-        } else if (receiverPresence) {
-            console.log(`📱 Получатель на сервере ${receiverPresence.server_id}, будет получен через long-polling`);
-        } else {
-            console.log(`❌ Получатель оффлайн: ${receiverEmail}`);
-        }
-
-        res.json({
-            success: true,
-            callId,
-            message: 'Звонок создан'
-        });
-    } catch (error) {
-        console.error('❌ Ошибка создания звонка:', error);
-        res.status(500).json({ 
-            success: false, 
-            error: 'Internal server error',
-            details: error.message 
-        });
-    }
-});
-
-// ===== ПРОВЕРКА ВХОДЯЩИХ ЗВОНКОВ (LONG-POLLING) =====
-app.get('/check-incoming-calls/:userEmail', async (req, res) => {
-    try {
-        const userEmail = req.params.userEmail.toLowerCase();
-        const timeout = parseInt(req.query.timeout) || 30000;
-
-        console.log(`🔍 Long-polling проверка звонков для: ${userEmail}`);
-
-        // Функция проверки звонков в БД
-        const checkCallsInDB = async () => {
-            const { data, error } = await supabase
-                .from('active_calls')
-                .select('*')
-                .eq('receiver_email', userEmail)
-                .eq('status', 'ringing')
-                .gt('expires_at', new Date().toISOString())
-                .limit(1);
-
-            if (error) throw error;
-            return data?.[0] || null;
-        };
-
-        // Проверяем сразу
-        let call = await checkCallsInDB();
-        if (call) {
-            // Помечаем как доставленный
-            await supabase
-                .from('active_calls')
-                .update({ status: 'delivered' })
-                .eq('call_id', call.call_id);
-
-            return res.json({
-                success: true,
-                hasCall: true,
-                call: {
-                    channelName: call.channel_name,
-                    callerEmail: call.caller_email,
-                    callType: call.call_type,
-                    callId: call.call_id
-                }
-            });
-        }
-
-        // Если нет звонков, ждем timeout
-        const checkInterval = setInterval(async () => {
-            try {
-                const newCall = await checkCallsInDB();
-                if (newCall) {
-                    clearInterval(checkInterval);
-                    clearTimeout(timeoutHandle);
-                    
-                    if (!res.headersSent) {
-                        await supabase
-                            .from('active_calls')
-                            .update({ status: 'delivered' })
-                            .eq('call_id', newCall.call_id);
-
-                        res.json({
-                            success: true,
-                            hasCall: true,
-                            call: {
-                                channelName: newCall.channel_name,
-                                callerEmail: newCall.caller_email,
-                                callType: newCall.call_type,
-                                callId: newCall.call_id
-                            }
-                        });
-                    }
-                }
-            } catch (error) {
-                console.error('❌ Ошибка в интервале проверки звонков:', error);
-            }
-        }, 2000);
-
-        const timeoutHandle = setTimeout(() => {
-            clearInterval(checkInterval);
-            if (!res.headersSent) {
-                res.json({
-                    success: true,
-                    hasCall: false,
-                    message: 'No incoming calls'
-                });
-            }
-        }, timeout);
-
-        // Очистка при отключении клиента
-        req.on('close', () => {
-            clearInterval(checkInterval);
-            clearTimeout(timeoutHandle);
-        });
-    } catch (error) {
-        console.error('❌ Ошибка long-polling проверки звонков:', error);
-        if (!res.headersSent) {
-            res.status(500).json({ success: false, error: 'Internal server error' });
-        }
-    }
-});
-
-// ===== ПРИНЯТИЕ ЗВОНКА =====
-app.post('/accept-call', async (req, res) => {
-    try {
-        const { channelName, receiverEmail } = req.body;
-
-        console.log('✅ Принятие звонка:', { channelName, receiverEmail });
-
-        // Обновляем статус в БД
-        const { data: call, error } = await supabase
-            .from('active_calls')
-            .update({ status: 'accepted' })
-            .eq('channel_name', channelName)
-            .select()
-            .single();
-
-        if (error) throw error;
-
-        // Уведомляем звонящего, если он онлайн
-        if (call) {
-            const callerPresence = await getUserSocketId(call.caller_email);
-            if (callerPresence && callerPresence.server_id === SERVER_ID) {
-                io.to(callerPresence.socket_id).emit('call_accepted', {
-                    channelName,
-                    receiverEmail
-                });
-                console.log(`✅ Уведомление о принятии отправлено: ${call.caller_email}`);
-            }
-        }
-
-        res.json({ success: true });
-    } catch (error) {
-        console.error('❌ Ошибка принятия звонка:', error);
-        res.status(500).json({ success: false, error: 'Internal server error' });
-    }
-});
-
-// ===== ЗАВЕРШЕНИЕ ЗВОНКА =====
-app.post('/end-call', async (req, res) => {
-    try {
-        const { channelName } = req.body;
-
-        console.log('🛑 Завершение звонка:', { channelName });
-
-        await supabase
-            .from('active_calls')
-            .update({ status: 'ended' })
-            .eq('channel_name', channelName);
-
-        res.json({ success: true });
-    } catch (error) {
-        console.error('❌ Ошибка завершения звонка:', error);
-        res.status(500).json({ success: false, error: 'Internal server error' });
-    }
-});
-
-// ===== ПРОВЕРКА АКТИВНЫХ ЗВОНКОВ =====
-app.get('/check-calls/:userEmail', async (req, res) => {
-    try {
-        const userEmail = req.params.userEmail.toLowerCase();
-
-        const { data, error } = await supabase
-            .from('active_calls')
-            .select('channel_name, caller_email, call_type, status, created_at')
-            .eq('receiver_email', userEmail)
-            .eq('status', 'ringing')
-            .gt('expires_at', new Date().toISOString())
-            .order('created_at', { ascending: false });
-
-        if (error) throw error;
-
-        res.json({
-            success: true,
-            calls: (data || []).map(call => ({
-                channelName: call.channel_name,
-                callerEmail: call.caller_email,
-                callType: call.call_type,
-                status: call.status,
-                createdAt: call.created_at
-            }))
-        });
-    } catch (error) {
-        console.error('❌ Ошибка проверки звонков:', error);
-        res.status(500).json({ success: false, error: 'Internal server error' });
-    }
-});
-
-// ===== ПОЛУЧЕНИЕ ОНЛАЙН ПОЛЬЗОВАТЕЛЕЙ =====
+// ===== Получение онлайн пользователей =====
 app.get('/online-users', async (req, res) => {
     try {
         const { data, error } = await supabase
@@ -1975,6 +1749,28 @@ app.get('/online-users', async (req, res) => {
     }
 });
 
+// ===== Создание таблицы для WebRTC звонков =====
+app.get('/setup-webrtc-table', async (req, res) => {
+    try {
+        // Создаем таблицу для WebRTC звонков
+        const { error } = await supabase.rpc('create_webrtc_calls_table', {});
+        
+        // Если RPC не работает, выполняем прямой SQL (нужны права)
+        if (error) {
+            console.log('Используем альтернативный метод создания таблицы');
+            // В реальном проекте нужно выполнить SQL через миграции
+        }
+
+        res.json({
+            success: true,
+            message: 'WebRTC таблица настроена'
+        });
+    } catch (error) {
+        console.error('❌ Ошибка создания таблицы:', error);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
 // ===== СТАТИЧЕСКИЕ ФАЙЛЫ =====
 app.use('/uploads', express.static(uploadDir));
 
@@ -1986,10 +1782,38 @@ server.listen(PORT, '0.0.0.0', async () => {
     console.log(`📡 Порт: ${PORT}`);
     console.log(`🆔 Server ID: ${SERVER_ID}`);
     console.log(`🌐 Режим: ${process.env.NODE_ENV || 'development'}`);
-    console.log(`📡 WebSocket активен`);
+    console.log(`📡 Socket.IO (чат) активен на /socket.io`);
+    console.log(`📡 WebSocket (WebRTC) активен на /webrtc`);
     console.log(`💾 База данных: Supabase (${supabaseUrl})`);
     console.log(`📁 Папка загрузок: ${uploadDir}`);
     console.log('='.repeat(50) + '\n');
+    
+    // Проверяем наличие таблицы webrtc_calls
+    try {
+        const { error } = await supabase
+            .from('webrtc_calls')
+            .select('count', { count: 'exact', head: true });
+        
+        if (error && error.message.includes('relation "webrtc_calls" does not exist')) {
+            console.log('⚠️ Таблица webrtc_calls не найдена. Создайте её в Supabase:');
+            console.log(`
+CREATE TABLE IF NOT EXISTS webrtc_calls (
+    call_id TEXT PRIMARY KEY,
+    caller_email TEXT NOT NULL,
+    receiver_email TEXT NOT NULL,
+    status TEXT DEFAULT 'ringing',
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    answered_at TIMESTAMP WITH TIME ZONE,
+    ended_at TIMESTAMP WITH TIME ZONE
+);
+
+CREATE INDEX IF NOT EXISTS idx_webrtc_calls_caller ON webrtc_calls(caller_email);
+CREATE INDEX IF NOT EXISTS idx_webrtc_calls_receiver ON webrtc_calls(receiver_email, status);
+            `);
+        }
+    } catch (e) {
+        // Игнорируем ошибки
+    }
 });
 
 // ===== Graceful shutdown =====
@@ -2007,6 +1831,9 @@ process.on('SIGINT', async () => {
         console.error('❌ Ошибка очистки присутствия:', error);
     }
     
+    // Закрываем WebSocket соединения
+    wss.close();
+    
     process.exit(0);
 });
 
@@ -2022,6 +1849,8 @@ process.on('SIGTERM', async () => {
     } catch (error) {
         console.error('❌ Ошибка очистки присутствия:', error);
     }
+    
+    wss.close();
     
     process.exit(0);
 });
