@@ -1675,16 +1675,35 @@ app.post('/send-call', async (req, res) => {
     try {
         const { channelName, callerEmail, receiverEmail, callType, callerName } = req.body;
 
-        console.log('📞 Создание звонка:', { channelName, callerEmail, receiverEmail });
+        console.log('📞 Создание звонка:', { channelName, callerEmail, receiverEmail, callType, callerName });
+        console.log('📦 Полный body:', req.body);
 
         if (!channelName || !callerEmail || !receiverEmail) {
-            return res.status(400).json({ success: false, error: 'Все поля обязательны' });
+            console.log('❌ Отсутствуют обязательные поля');
+            return res.status(400).json({ 
+                success: false, 
+                error: 'Все поля обязательны',
+                required: ['channelName', 'callerEmail', 'receiverEmail'],
+                received: req.body
+            });
         }
 
         const callId = Date.now().toString();
+        console.log('🆔 Сгенерирован callId:', callId);
+
+        // Проверяем, существует ли получатель
+        const receiverExists = await userExists(receiverEmail);
+        if (!receiverExists) {
+            console.log('❌ Получатель не найден в БД:', receiverEmail);
+            return res.status(404).json({ 
+                success: false, 
+                error: 'Получатель не найден' 
+            });
+        }
 
         // Сохраняем звонок в БД
-        const { error } = await supabase
+        console.log('💾 Сохранение в active_calls...');
+        const { data, error } = await supabase
             .from('active_calls')
             .insert({
                 call_id: callId,
@@ -1694,15 +1713,27 @@ app.post('/send-call', async (req, res) => {
                 call_type: callType || 'audio',
                 status: 'ringing',
                 expires_at: new Date(Date.now() + 60000).toISOString()
-            });
+            })
+            .select();
 
-        if (error) throw error;
+        if (error) {
+            console.error('❌ Ошибка Supabase:', error);
+            return res.status(500).json({ 
+                success: false, 
+                error: 'Ошибка базы данных',
+                details: error.message 
+            });
+        }
+
+        console.log('✅ Звонок сохранен в БД:', data);
 
         // Проверяем, онлайн ли получатель
         const receiverPresence = await getUserSocketId(receiverEmail);
+        console.log('📱 Статус получателя:', receiverPresence);
 
         if (receiverPresence && receiverPresence.server_id === SERVER_ID) {
             // Получатель на этом же сервере - отправляем напрямую через WebSocket
+            console.log(`📤 Отправка через WebSocket на ${receiverPresence.socket_id}`);
             io.to(receiverPresence.socket_id).emit('incoming_call', {
                 channelName,
                 callerEmail,
@@ -1726,7 +1757,11 @@ app.post('/send-call', async (req, res) => {
         });
     } catch (error) {
         console.error('❌ Ошибка создания звонка:', error);
-        res.status(500).json({ success: false, error: 'Internal server error' });
+        res.status(500).json({ 
+            success: false, 
+            error: 'Internal server error',
+            details: error.message 
+        });
     }
 });
 
