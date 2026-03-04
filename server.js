@@ -100,6 +100,25 @@ const upload = multer({
 ffmpeg.setFfmpegPath(ffmpegPath);
 ffmpeg.setFfprobePath(ffprobePath);
 
+// ==================== ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ ====================
+// Для хранения активных звонков (временное решение, в продакшене используйте БД)
+global.activeCalls = new Map();
+
+// Периодическая очистка старых звонков (раз в 5 минут)
+setInterval(() => {
+    if (global.activeCalls) {
+        const now = Date.now();
+        for (const [roomId, callData] of global.activeCalls.entries()) {
+            // Удаляем звонки старше 1 часа
+            const startedAt = new Date(callData.startedAt).getTime();
+            if (now - startedAt > 60 * 60 * 1000) {
+                global.activeCalls.delete(roomId);
+                console.log(`🧹 Очищен старый звонок: ${roomId}`);
+            }
+        }
+    }
+}, 5 * 60 * 1000);
+
 // ==================== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ====================
 
 /**
@@ -641,6 +660,324 @@ app.get('/health', async (req, res) => {
             success: false,
             error: 'Health check failed',
             details: error.message
+        });
+    }
+});
+
+// ===== НОВЫЕ ЭНДПОИНТЫ ДЛЯ ЗВОНКОВ (ПРОСТАЯ РЕАЛИЗАЦИЯ) =====
+
+/**
+ * Инициирование звонка (простая версия)
+ */
+app.post('/api/calls/initiate', async (req, res) => {
+    try {
+        const { callerEmail, receiverEmail, callType } = req.body;
+        
+        if (!callerEmail || !receiverEmail) {
+            return res.status(400).json({
+                success: false,
+                error: 'Email звонящего и получателя обязательны'
+            });
+        }
+        
+        console.log(`📞 Инициирование звонка: ${callerEmail} -> ${receiverEmail}`);
+        
+        // Генерируем уникальный ID комнаты
+        const roomId = `call_${Date.now()}_${Math.random().toString(36).substring(2, 10)}`;
+        
+        // Создаем запись о звонке в памяти (в продакшене лучше использовать БД)
+        const callData = {
+            roomId,
+            caller: callerEmail,
+            receiver: receiverEmail,
+            type: callType || 'audio',
+            status: 'ringing',
+            startedAt: new Date().toISOString(),
+            participants: [callerEmail]
+        };
+        
+        // Сохраняем в глобальный Map (добавьте в начало файла: const activeCalls = new Map();)
+        if (!global.activeCalls) global.activeCalls = new Map();
+        global.activeCalls.set(roomId, callData);
+        
+        // Отправляем уведомление получателю через Socket.IO
+        io.emit(`call:${receiverEmail}`, {
+            type: 'incoming-call',
+            roomId: roomId,
+            caller: callerEmail,
+            callType: callType || 'audio',
+            timestamp: new Date().toISOString()
+        });
+        
+        console.log(`✅ Звонок инициирован, комната: ${roomId}`);
+        
+        res.json({
+            success: true,
+            roomId: roomId,
+            message: 'Звонок инициирован'
+        });
+        
+    } catch (error) {
+        console.error('❌ Ошибка инициации звонка:', error);
+        res.status(500).json({
+            success: false,
+            error: error.message
+        });
+    }
+});
+
+/**
+ * Принять звонок
+ */
+app.post('/api/calls/accept', async (req, res) => {
+    try {
+        const { roomId, userEmail } = req.body;
+        
+        if (!roomId || !userEmail) {
+            return res.status(400).json({
+                success: false,
+                error: 'ID комнаты и email обязательны'
+            });
+        }
+        
+        // Получаем информацию о звонке
+        const callData = global.activeCalls?.get(roomId);
+        
+        if (!callData) {
+            return res.status(404).json({
+                success: false,
+                error: 'Звонок не найден'
+            });
+        }
+        
+        // Проверяем, что принимает именно тот, кому звонят
+        if (callData.receiver !== userEmail) {
+            return res.status(403).json({
+                success: false,
+                error: 'Вы не можете принять этот звонок'
+            });
+        }
+        
+        // Обновляем статус
+        callData.status = 'connected';
+        callData.participants.push(userEmail);
+        callData.answeredAt = new Date().toISOString();
+        global.activeCalls.set(roomId, callData);
+        
+        // Уведомляем звонящего, что звонок принят
+        io.emit(`call:${callData.caller}`, {
+            type: 'call-accepted',
+            roomId: roomId,
+            receiver: userEmail,
+            timestamp: new Date().toISOString()
+        });
+        
+        console.log(`✅ Звонок ${roomId} принят пользователем ${userEmail}`);
+        
+        res.json({
+            success: true,
+            roomId: roomId,
+            callData: callData
+        });
+        
+    } catch (error) {
+        console.error('❌ Ошибка принятия звонка:', error);
+        res.status(500).json({
+            success: false,
+            error: error.message
+        });
+    }
+});
+
+/**
+ * Отклонить звонок
+ */
+app.post('/api/calls/reject', async (req, res) => {
+    try {
+        const { roomId, userEmail } = req.body;
+        
+        if (!roomId || !userEmail) {
+            return res.status(400).json({
+                success: false,
+                error: 'ID комнаты и email обязательны'
+            });
+        }
+        
+        const callData = global.activeCalls?.get(roomId);
+        
+        if (callData) {
+            // Уведомляем звонящего об отказе
+            io.emit(`call:${callData.caller}`, {
+                type: 'call-rejected',
+                roomId: roomId,
+                receiver: userEmail,
+                timestamp: new Date().toISOString()
+            });
+            
+            // Удаляем звонок
+            global.activeCalls.delete(roomId);
+        }
+        
+        console.log(`❌ Звонок ${roomId} отклонен пользователем ${userEmail}`);
+        
+        res.json({
+            success: true,
+            message: 'Звонок отклонен'
+        });
+        
+    } catch (error) {
+        console.error('❌ Ошибка отклонения звонка:', error);
+        res.status(500).json({
+            success: false,
+            error: error.message
+        });
+    }
+});
+
+/**
+ * Завершить звонок
+ */
+app.post('/api/calls/end', async (req, res) => {
+    try {
+        const { roomId, userEmail } = req.body;
+        
+        if (!roomId) {
+            return res.status(400).json({
+                success: false,
+                error: 'ID комнаты обязателен'
+            });
+        }
+        
+        const callData = global.activeCalls?.get(roomId);
+        
+        if (callData) {
+            // Уведомляем всех участников о завершении
+            callData.participants.forEach(email => {
+                if (email !== userEmail) {
+                    io.emit(`call:${email}`, {
+                        type: 'call-ended',
+                        roomId: roomId,
+                        endedBy: userEmail,
+                        timestamp: new Date().toISOString()
+                    });
+                }
+            });
+            
+            // Удаляем звонок
+            global.activeCalls.delete(roomId);
+        }
+        
+        console.log(`📴 Звонок ${roomId} завершен пользователем ${userEmail}`);
+        
+        res.json({
+            success: true,
+            message: 'Звонок завершен'
+        });
+        
+    } catch (error) {
+        console.error('❌ Ошибка завершения звонка:', error);
+        res.status(500).json({
+            success: false,
+            error: error.message
+        });
+    }
+});
+
+/**
+ * Получить информацию о звонке
+ */
+app.get('/api/calls/:roomId', async (req, res) => {
+    try {
+        const { roomId } = req.params;
+        
+        const callData = global.activeCalls?.get(roomId);
+        
+        if (!callData) {
+            return res.status(404).json({
+                success: false,
+                error: 'Звонок не найден'
+            });
+        }
+        
+        res.json({
+            success: true,
+            call: callData
+        });
+        
+    } catch (error) {
+        console.error('❌ Ошибка получения информации о звонке:', error);
+        res.status(500).json({
+            success: false,
+            error: error.message
+        });
+    }
+});
+
+/**
+ * Получить активные звонки пользователя
+ */
+app.get('/api/calls/user/:email', async (req, res) => {
+    try {
+        const { email } = req.params;
+        
+        const userCalls = [];
+        
+        if (global.activeCalls) {
+            for (const [roomId, callData] of global.activeCalls.entries()) {
+                if (callData.caller === email || callData.receiver === email) {
+                    userCalls.push({
+                        roomId,
+                        ...callData
+                    });
+                }
+            }
+        }
+        
+        res.json({
+            success: true,
+            calls: userCalls
+        });
+        
+    } catch (error) {
+        console.error('❌ Ошибка получения звонков пользователя:', error);
+        res.status(500).json({
+            success: false,
+            error: error.message
+        });
+    }
+});
+
+/**
+ * Проверить, свободен ли пользователь (не в звонке)
+ */
+app.get('/api/calls/check-availability/:email', async (req, res) => {
+    try {
+        const { email } = req.params;
+        
+        let isInCall = false;
+        
+        if (global.activeCalls) {
+            for (const callData of global.activeCalls.values()) {
+                if (callData.status === 'connected' && 
+                    (callData.caller === email || callData.receiver === email)) {
+                    isInCall = true;
+                    break;
+                }
+            }
+        }
+        
+        res.json({
+            success: true,
+            email: email,
+            available: !isInCall,
+            inCall: isInCall
+        });
+        
+    } catch (error) {
+        console.error('❌ Ошибка проверки доступности:', error);
+        res.status(500).json({
+            success: false,
+            error: error.message
         });
     }
 });
