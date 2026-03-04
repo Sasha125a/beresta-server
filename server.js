@@ -1,5 +1,8 @@
+// server.js - Объединенный сервер чата и звонков
 // ==================== ИМПОРТЫ ====================
 const express = require('express');
+const http = require('http');
+const socketIo = require('socket.io');
 const cors = require('cors');
 const bodyParser = require('body-parser');
 const path = require('path');
@@ -10,25 +13,21 @@ const { v4: uuidv4 } = require('uuid');
 const ffmpeg = require('fluent-ffmpeg');
 const ffmpegPath = require('ffmpeg-static');
 const ffprobePath = require('ffprobe-static').path;
-const http = require('http');
-const socketIo = require('socket.io');
-const axios = require('axios'); // Добавлен для HTTP запросов к сервису звонков
 const { createClient } = require('@supabase/supabase-js');
 
 // ==================== КОНФИГУРАЦИЯ ====================
 const isRender = process.env.NODE_ENV === 'production';
 const SERVER_ID = process.env.RENDER_SERVICE_ID || `server-${Math.random().toString(36).substring(2, 10)}`;
-const CALL_SERVICE_URL = 'https://beresta-zvonok.onrender.com'; // URL сервиса звонков
 
 const app = express();
-const PORT = process.env.PORT || 3000;
 const server = http.createServer(app);
+const PORT = process.env.PORT || 3000;
 
-// ==================== SOCKET.IO (для чата) ====================
+// ==================== SOCKET.IO (для чата и звонков) ====================
 const io = socketIo(server, {
     cors: {
         origin: isRender ? ["https://beresta-server-5udn.onrender.com"] : "*",
-        methods: ["GET", "POST"],
+        methods: ["GET", "POST", "PUT", "DELETE"],
         credentials: true
     },
     transports: ['websocket', 'polling'],
@@ -58,6 +57,8 @@ app.use(cors({
 app.options('*', cors());
 app.use(bodyParser.json({ limit: '100mb' }));
 app.use(bodyParser.urlencoded({ extended: true, limit: '100mb' }));
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
 
 // ==================== ФАЙЛОВОЕ ХРАНИЛИЩЕ ====================
 const uploadDir = process.env.UPLOAD_DIR || path.join(__dirname, 'uploads');
@@ -100,21 +101,22 @@ const upload = multer({
 ffmpeg.setFfmpegPath(ffmpegPath);
 ffmpeg.setFfprobePath(ffprobePath);
 
-// ==================== ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ ====================
-// Для хранения активных звонков (временное решение, в продакшене используйте БД)
-global.activeCalls = new Map();
+// ==================== ХРАНИЛИЩА ДАННЫХ ====================
+const rooms = new Map();           // Комнаты и их участники
+const roomsInfo = new Map();       // Информация о комнатах (название, создатель и т.д.)
+const users = new Map();           // Информация о пользователях
+const callHistory = new Map();     // История звонков
+const activeCalls = new Map();     // Активные звонки
 
 // Периодическая очистка старых звонков (раз в 5 минут)
 setInterval(() => {
-    if (global.activeCalls) {
-        const now = Date.now();
-        for (const [roomId, callData] of global.activeCalls.entries()) {
-            // Удаляем звонки старше 1 часа
-            const startedAt = new Date(callData.startedAt).getTime();
-            if (now - startedAt > 60 * 60 * 1000) {
-                global.activeCalls.delete(roomId);
-                console.log(`🧹 Очищен старый звонок: ${roomId}`);
-            }
+    const now = Date.now();
+    for (const [roomId, callData] of activeCalls.entries()) {
+        // Удаляем звонки старше 1 часа
+        const startedAt = new Date(callData.startedAt || callData.startTime).getTime();
+        if (now - startedAt > 60 * 60 * 1000) {
+            activeCalls.delete(roomId);
+            console.log(`🧹 Очищен старый звонок: ${roomId}`);
         }
     }
 }, 5 * 60 * 1000);
@@ -212,7 +214,28 @@ function createMediaPreview(filePath, outputPath, fileType, callback) {
     }
 }
 
-// ==================== ФУНКЦИИ РАБОТЫ С БАЗОЙ ДАННЫХ ====================
+/**
+ * Обновление статуса присутствия пользователя
+ */
+async function updateUserPresence(email, socketId, status = 'online') {
+    try {
+        const { error } = await supabase
+            .from('user_presence')
+            .upsert({
+                user_email: email.toLowerCase(),
+                socket_id: socketId,
+                server_id: SERVER_ID,
+                last_seen: new Date().toISOString(),
+                status: status
+            }, { 
+                onConflict: 'user_email' 
+            });
+
+        if (error) throw error;
+    } catch (error) {
+        console.error('❌ Ошибка обновления присутствия:', error);
+    }
+}
 
 /**
  * Получение информации о пользователе по email
@@ -289,52 +312,6 @@ async function addToChatsAutomatically(user1, user2) {
     }
 }
 
-// ==================== ФУНКЦИИ ДЛЯ МУЛЬТИ-СЕРВЕРНОЙ АРХИТЕКТУРЫ ====================
-
-/**
- * Обновление статуса присутствия пользователя
- */
-async function updateUserPresence(email, socketId, status = 'online') {
-    try {
-        const { error } = await supabase
-            .from('user_presence')
-            .upsert({
-                user_email: email.toLowerCase(),
-                socket_id: socketId,
-                server_id: SERVER_ID,
-                last_seen: new Date().toISOString(),
-                status: status
-            }, { 
-                onConflict: 'user_email' 
-            });
-
-        if (error) throw error;
-    } catch (error) {
-        console.error('❌ Ошибка обновления присутствия:', error);
-    }
-}
-
-/**
- * Получение socket_id пользователя
- */
-async function getUserSocketId(email) {
-    try {
-        const { data, error } = await supabase
-            .from('user_presence')
-            .select('socket_id, server_id, last_seen')
-            .eq('user_email', email.toLowerCase())
-            .eq('status', 'online')
-            .gte('last_seen', new Date(Date.now() - 30000).toISOString()) // активные за последние 30 сек
-            .maybeSingle();
-
-        if (error) throw error;
-        return data;
-    } catch (error) {
-        console.error('❌ Ошибка получения socket_id:', error);
-        return null;
-    }
-}
-
 /**
  * Очистка устаревших записей присутствия
  */
@@ -354,202 +331,34 @@ async function cleanupOldPresence() {
 // Запускаем очистку раз в минуту
 setInterval(cleanupOldPresence, 60000);
 
-// ==================== ФУНКЦИИ ДЛЯ РАБОТЫ С СЕРВИСОМ ЗВОНКОВ ====================
-
-/**
- * Проверка статуса сервиса звонков
- */
-async function checkCallServiceStatus() {
-    try {
-        const response = await axios.get(`${CALL_SERVICE_URL}/api/status`, { timeout: 5000 });
-        return {
-            online: true,
-            data: response.data
-        };
-    } catch (error) {
-        console.error('❌ Сервис звонков недоступен:', error.message);
-        return {
-            online: false,
-            error: error.message
-        };
-    }
+function calculateDuration(startTime) {
+    const start = new Date(startTime);
+    const now = new Date();
+    const diff = Math.floor((now - start) / 1000);
+    const minutes = Math.floor(diff / 60);
+    const seconds = diff % 60;
+    return minutes + ':' + (seconds < 10 ? '0' + seconds : seconds);
 }
 
-/**
- * Создание комнаты для звонка
- */
-async function createCallRoom(roomData) {
-    try {
-        const response = await axios.post(`${CALL_SERVICE_URL}/api/rooms`, roomData);
-        return {
-            success: true,
-            data: response.data
-        };
-    } catch (error) {
-        console.error('❌ Ошибка создания комнаты звонка:', error.response?.data || error.message);
-        return {
-            success: false,
-            error: error.response?.data || error.message
-        };
+function getTodayCallsCount() {
+    const today = new Date().toDateString();
+    let count = 0;
+    for (const [_, call] of callHistory) {
+        if (new Date(call.startTime || call.startedAt).toDateString() === today) {
+            count++;
+        }
     }
+    return count;
 }
 
-/**
- * Получение информации о комнате
- */
-async function getCallRoom(roomId) {
-    try {
-        const response = await axios.get(`${CALL_SERVICE_URL}/api/rooms/${roomId}`);
-        return {
-            success: true,
-            data: response.data
-        };
-    } catch (error) {
-        console.error('❌ Ошибка получения комнаты звонка:', error.response?.data || error.message);
-        return {
-            success: false,
-            error: error.response?.data || error.message
-        };
-    }
-}
-
-/**
- * Обновление комнаты
- */
-async function updateCallRoom(roomId, updateData) {
-    try {
-        const response = await axios.put(`${CALL_SERVICE_URL}/api/rooms/${roomId}`, updateData);
-        return {
-            success: true,
-            data: response.data
-        };
-    } catch (error) {
-        console.error('❌ Ошибка обновления комнаты звонка:', error.response?.data || error.message);
-        return {
-            success: false,
-            error: error.response?.data || error.message
-        };
-    }
-}
-
-/**
- * Удаление комнаты
- */
-async function deleteCallRoom(roomId) {
-    try {
-        const response = await axios.delete(`${CALL_SERVICE_URL}/api/rooms/${roomId}`);
-        return {
-            success: true,
-            data: response.data
-        };
-    } catch (error) {
-        console.error('❌ Ошибка удаления комнаты звонка:', error.response?.data || error.message);
-        return {
-            success: false,
-            error: error.response?.data || error.message
-        };
-    }
-}
-
-/**
- * Получение списка активных звонков
- */
-async function getActiveCalls() {
-    try {
-        const response = await axios.get(`${CALL_SERVICE_URL}/api/calls/active`);
-        return {
-            success: true,
-            data: response.data
-        };
-    } catch (error) {
-        console.error('❌ Ошибка получения активных звонков:', error.response?.data || error.message);
-        return {
-            success: false,
-            error: error.response?.data || error.message
-        };
-    }
-}
-
-/**
- * Инициирование звонка
- */
-async function startCall(callData) {
-    try {
-        const response = await axios.post(`${CALL_SERVICE_URL}/api/calls/start`, callData);
-        return {
-            success: true,
-            data: response.data
-        };
-    } catch (error) {
-        console.error('❌ Ошибка инициации звонка:', error.response?.data || error.message);
-        return {
-            success: false,
-            error: error.response?.data || error.message
-        };
-    }
-}
-
-/**
- * Завершение звонка
- */
-async function endCall(callId) {
-    try {
-        const response = await axios.post(`${CALL_SERVICE_URL}/api/calls/end/${callId}`);
-        return {
-            success: true,
-            data: response.data
-        };
-    } catch (error) {
-        console.error('❌ Ошибка завершения звонка:', error.response?.data || error.message);
-        return {
-            success: false,
-            error: error.response?.data || error.message
-        };
-    }
-}
-
-/**
- * Получение истории звонков
- */
-async function getCallHistory() {
-    try {
-        const response = await axios.get(`${CALL_SERVICE_URL}/api/calls/history`);
-        return {
-            success: true,
-            data: response.data
-        };
-    } catch (error) {
-        console.error('❌ Ошибка получения истории звонков:', error.response?.data || error.message);
-        return {
-            success: false,
-            error: error.response?.data || error.message
-        };
-    }
-}
-
-/**
- * Получение статистики сервиса звонков
- */
-async function getCallServiceStats() {
-    try {
-        const response = await axios.get(`${CALL_SERVICE_URL}/api/stats`);
-        return {
-            success: true,
-            data: response.data
-        };
-    } catch (error) {
-        console.error('❌ Ошибка получения статистики сервиса звонков:', error.response?.data || error.message);
-        return {
-            success: false,
-            error: error.response?.data || error.message
-        };
-    }
-}
-
-// ==================== SOCKET.IO СОЕДИНЕНИЯ (для чата) ====================
-
+// ==================== SOCKET.IO ОБРАБОТЧИКИ ====================
 io.on('connection', (socket) => {
-    console.log('✅ WebSocket подключен:', socket.id);
+    console.log('👤 Пользователь подключился:', socket.id);
+    
+    users.set(socket.id, {
+        connectedAt: new Date().toISOString(),
+        socketId: socket.id
+    });
 
     // Обработчик онлайн-статуса
     socket.on('user_online', async (data) => {
@@ -591,9 +400,85 @@ io.on('connection', (socket) => {
         });
     });
 
+    // Обработчик подключения к комнате звонка
+    socket.on('join-room', (data) => {
+        const roomId = data.roomId;
+        const userInfo = data.userInfo || {};
+        
+        console.log('📢 ' + socket.id + ' подключается к комнате звонка: ' + roomId);
+        
+        if (!rooms.has(roomId)) {
+            rooms.set(roomId, new Set());
+        }
+        
+        const room = rooms.get(roomId);
+        
+        if (room.size >= 2) {
+            console.log('❌ Комната ' + roomId + ' переполнена');
+            socket.emit('room-full');
+            return;
+        }
+        
+        room.add(socket.id);
+        socket.join(roomId);
+        
+        const userData = users.get(socket.id) || {};
+        users.set(socket.id, { ...userData, ...userInfo, roomId, joinedAt: new Date().toISOString() });
+        
+        if (!roomsInfo.has(roomId)) {
+            roomsInfo.set(roomId, {
+                name: roomId,
+                createdAt: new Date().toISOString(),
+                createdBy: socket.id,
+                type: userInfo?.type || 'video'
+            });
+        }
+        
+        console.log('✅ ' + socket.id + ' подключился к ' + roomId + '. Участников: ' + room.size);
+        
+        socket.emit('join-success', { roomId: roomId, participants: Array.from(room) });
+        
+        if (room.size > 1) {
+            io.to(roomId).emit('peer-joined', socket.id);
+        }
+        
+        io.emit('rooms-updated');
+    });
+
+    // Обработчики WebRTC сигнализации
+    socket.on('offer', (data) => {
+        console.log('📤 Оффер от ' + socket.id + ' к ' + data.target);
+        socket.to(data.target).emit('offer', {
+            offer: data.offer,
+            sender: socket.id
+        });
+    });
+
+    socket.on('answer', (data) => {
+        console.log('📤 Ответ от ' + socket.id + ' к ' + data.target);
+        socket.to(data.target).emit('answer', {
+            answer: data.answer,
+            sender: socket.id
+        });
+    });
+
+    socket.on('ice-candidate', (data) => {
+        console.log('📤 ICE кандидат от ' + socket.id + ' к ' + data.target);
+        socket.to(data.target).emit('ice-candidate', {
+            candidate: data.candidate,
+            sender: socket.id
+        });
+    });
+
+    socket.on('leave-room', (roomId) => {
+        handleDisconnect(socket, roomId);
+    });
+
     // Обработчик отключения
     socket.on('disconnect', async (reason) => {
         console.log(`❌ WebSocket отключен: ${socket.id}, причина: ${reason}`);
+        
+        handleDisconnect(socket);
         
         if (socket.userEmail) {
             // Помечаем как оффлайн в Supabase
@@ -613,6 +498,37 @@ io.on('connection', (socket) => {
     });
 });
 
+function handleDisconnect(socket, specificRoom = null) {
+    let roomId = specificRoom;
+    
+    if (!roomId) {
+        for (const [rId, members] of rooms.entries()) {
+            if (members.has(socket.id)) {
+                roomId = rId;
+                break;
+            }
+        }
+    }
+    
+    if (roomId && rooms.has(roomId)) {
+        const room = rooms.get(roomId);
+        room.delete(socket.id);
+        
+        io.to(roomId).emit('peer-disconnected');
+        
+        // Если в комнате никого не осталось, удаляем информацию о ней
+        if (room.size === 0) {
+            rooms.delete(roomId);
+            roomsInfo.delete(roomId);
+        }
+        
+        console.log('👋 ' + socket.id + ' покинул комнату ' + roomId);
+    }
+    
+    users.delete(socket.id);
+    io.emit('rooms-updated');
+}
+
 // ==================== API ЭНДПОИНТЫ ====================
 
 // ===== Health check =====
@@ -630,9 +546,6 @@ app.get('/health', async (req, res) => {
             .eq('status', 'online')
             .gte('last_seen', new Date(Date.now() - 30000).toISOString());
 
-        // Проверка доступности сервиса звонков
-        const callServiceStatus = await checkCallServiceStatus();
-
         // Проверка доступности директорий
         const dirs = [uploadDir, tempDir, permanentDir, thumbnailsDir];
         const dirStatus = {};
@@ -644,14 +557,16 @@ app.get('/health', async (req, res) => {
             success: true,
             status: 'Server is running optimally',
             serverId: SERVER_ID,
-            onlineUsers: count || 0,
+            stats: {
+                activeRooms: rooms.size,
+                totalUsers: users.size,
+                activeCalls: activeCalls.size,
+                onlineUsers: count || 0,
+                totalCallsToday: getTodayCallsCount()
+            },
             uptime: process.uptime(),
             memory: process.memoryUsage(),
             directories: dirStatus,
-            callService: {
-                url: CALL_SERVICE_URL,
-                status: callServiceStatus
-            },
             timestamp: new Date().toISOString()
         });
     } catch (error) {
@@ -662,6 +577,295 @@ app.get('/health', async (req, res) => {
             details: error.message
         });
     }
+});
+
+// ===== Статус сервера =====
+app.get('/api/status', (req, res) => {
+    res.json({
+        status: 'online',
+        timestamp: new Date().toISOString(),
+        serverId: SERVER_ID,
+        stats: {
+            activeRooms: rooms.size,
+            totalUsers: users.size,
+            activeCalls: activeCalls.size,
+            totalCallsToday: getTodayCallsCount()
+        }
+    });
+});
+
+// ===== Список всех комнат =====
+app.get('/api/rooms', (req, res) => {
+    const roomsList = [];
+    for (const [roomId, participants] of rooms.entries()) {
+        roomsList.push({
+            roomId: roomId,
+            participants: participants.size,
+            participantsList: Array.from(participants).map(socketId => ({
+                socketId,
+                userInfo: users.get(socketId) || { name: 'Аноним', type: 'unknown' }
+            })),
+            roomInfo: roomsInfo.get(roomId) || {
+                name: roomId,
+                createdAt: new Date().toISOString()
+            }
+        });
+    }
+    res.json({
+        total: roomsList.length,
+        rooms: roomsList
+    });
+});
+
+// ===== Информация о конкретной комнате =====
+app.get('/api/rooms/:roomId', (req, res) => {
+    const { roomId } = req.params;
+    const participants = rooms.get(roomId);
+    
+    if (!participants) {
+        return res.status(404).json({ error: 'Комната не найдена' });
+    }
+    
+    res.json({
+        roomId,
+        participants: participants.size,
+        participantsList: Array.from(participants).map(socketId => ({
+            socketId,
+            userInfo: users.get(socketId) || { name: 'Аноним', type: 'unknown' }
+        })),
+        roomInfo: roomsInfo.get(roomId) || {
+            name: roomId,
+            createdAt: new Date().toISOString()
+        }
+    });
+});
+
+// ===== Создать комнату (через API) =====
+app.post('/api/rooms', (req, res) => {
+    const { roomId, roomName, createdBy, type = 'video' } = req.body;
+    
+    if (!roomId) {
+        return res.status(400).json({ error: 'roomId обязателен' });
+    }
+    
+    if (rooms.has(roomId)) {
+        return res.status(409).json({ error: 'Комната уже существует' });
+    }
+    
+    rooms.set(roomId, new Set());
+    roomsInfo.set(roomId, {
+        name: roomName || roomId,
+        createdBy: createdBy || 'system',
+        createdAt: new Date().toISOString(),
+        type: type,
+        settings: req.body.settings || {}
+    });
+    
+    res.status(201).json({
+        success: true,
+        roomId,
+        message: 'Комната создана',
+        roomInfo: roomsInfo.get(roomId)
+    });
+});
+
+// ===== Обновить информацию о комнате =====
+app.put('/api/rooms/:roomId', (req, res) => {
+    const { roomId } = req.params;
+    const updates = req.body;
+    
+    if (!rooms.has(roomId)) {
+        return res.status(404).json({ error: 'Комната не найдена' });
+    }
+    
+    const currentInfo = roomsInfo.get(roomId) || {};
+    roomsInfo.set(roomId, { ...currentInfo, ...updates, updatedAt: new Date().toISOString() });
+    
+    io.to(roomId).emit('room-updated', roomsInfo.get(roomId));
+    
+    res.json({
+        success: true,
+        roomId,
+        roomInfo: roomsInfo.get(roomId)
+    });
+});
+
+// ===== Удалить комнату =====
+app.delete('/api/rooms/:roomId', (req, res) => {
+    const { roomId } = req.params;
+    
+    if (!rooms.has(roomId)) {
+        return res.status(404).json({ error: 'Комната не найдена' });
+    }
+    
+    io.to(roomId).emit('room-closed', { roomId, reason: 'Комната закрыта администратором' });
+    
+    rooms.delete(roomId);
+    roomsInfo.delete(roomId);
+    
+    res.json({
+        success: true,
+        message: 'Комната удалена'
+    });
+});
+
+// ===== Информация о пользователе по socketId =====
+app.get('/api/users/:socketId', (req, res) => {
+    const { socketId } = req.params;
+    const userInfo = users.get(socketId);
+    
+    if (!userInfo) {
+        return res.status(404).json({ error: 'Пользователь не найден' });
+    }
+    
+    res.json(userInfo);
+});
+
+// ===== Обновить информацию о пользователе =====
+app.put('/api/users/:socketId', (req, res) => {
+    const { socketId } = req.params;
+    const updates = req.body;
+    
+    const currentInfo = users.get(socketId) || {};
+    users.set(socketId, { ...currentInfo, ...updates, updatedAt: new Date().toISOString() });
+    
+    res.json({
+        success: true,
+        userInfo: users.get(socketId)
+    });
+});
+
+// ===== История звонков =====
+app.get('/api/calls/history', (req, res) => {
+    const { limit = 50, roomId } = req.query;
+    let history = Array.from(callHistory.values());
+    
+    if (roomId) {
+        history = history.filter(call => call.roomId === roomId);
+    }
+    
+    history.sort((a, b) => new Date(b.startTime || b.startedAt) - new Date(a.startTime || a.startedAt));
+    history = history.slice(0, parseInt(limit));
+    
+    res.json({
+        total: history.length,
+        calls: history
+    });
+});
+
+// ===== Активные звонки =====
+app.get('/api/calls/active', (req, res) => {
+    const active = Array.from(activeCalls.values());
+    res.json({
+        total: active.length,
+        calls: active
+    });
+});
+
+// ===== Инициировать звонок через API =====
+app.post('/api/calls/start', (req, res) => {
+    const { roomId, callerId, calleeId, type = 'video' } = req.body;
+    
+    if (!roomId || !callerId) {
+        return res.status(400).json({ error: 'roomId и callerId обязательны' });
+    }
+    
+    const callId = 'call_' + Date.now() + '_' + Math.random().toString(36).substr(2, 9);
+    const callInfo = {
+        callId,
+        roomId,
+        callerId,
+        calleeId: calleeId || null,
+        type,
+        startTime: new Date().toISOString(),
+        status: 'initiated',
+        participants: [callerId]
+    };
+    
+    activeCalls.set(callId, callInfo);
+    
+    if (calleeId) {
+        io.to(calleeId).emit('incoming-call', callInfo);
+    }
+    
+    res.status(201).json(callInfo);
+});
+
+// ===== Завершить звонок через API =====
+app.post('/api/calls/end/:callId', (req, res) => {
+    const { callId } = req.params;
+    const { endedBy } = req.body;
+    
+    const call = activeCalls.get(callId);
+    if (!call) {
+        return res.status(404).json({ error: 'Звонок не найден' });
+    }
+    
+    const endedCall = {
+        ...call,
+        endedBy: endedBy || 'system',
+        endTime: new Date().toISOString(),
+        status: 'ended',
+        duration: calculateDuration(call.startTime || call.startedAt)
+    };
+    
+    activeCalls.delete(callId);
+    
+    const historyId = 'hist_' + Date.now();
+    callHistory.set(historyId, endedCall);
+    
+    if (call.participants) {
+        call.participants.forEach(participantId => {
+            io.to(participantId).emit('call-ended', endedCall);
+        });
+    }
+    
+    res.json(endedCall);
+});
+
+// ===== Статистика =====
+app.get('/api/stats', (req, res) => {
+    const stats = {
+        timestamp: new Date().toISOString(),
+        server: {
+            id: SERVER_ID,
+            uptime: process.uptime(),
+            memory: process.memoryUsage(),
+            nodeVersion: process.version
+        },
+        rooms: {
+            total: rooms.size,
+            details: Array.from(rooms.entries()).map(([id, participants]) => ({
+                id,
+                participants: participants.size
+            }))
+        },
+        users: {
+            total: users.size,
+            online: io.engine.clientsCount
+        },
+        calls: {
+            active: activeCalls.size,
+            totalToday: getTodayCallsCount()
+        }
+    };
+    
+    res.json(stats);
+});
+
+// ===== Webhook для внешних сервисов =====
+app.post('/api/webhook/:event', (req, res) => {
+    const { event } = req.params;
+    const data = req.body;
+    
+    console.log('📡 Webhook получен: ' + event, data);
+    
+    res.json({
+        success: true,
+        event,
+        received: data,
+        timestamp: new Date().toISOString()
+    });
 });
 
 // ===== НОВЫЕ ЭНДПОИНТЫ ДЛЯ ЗВОНКОВ (ПРОСТАЯ РЕАЛИЗАЦИЯ) =====
@@ -685,7 +889,7 @@ app.post('/api/calls/initiate', async (req, res) => {
         // Генерируем уникальный ID комнаты
         const roomId = `call_${Date.now()}_${Math.random().toString(36).substring(2, 10)}`;
         
-        // Создаем запись о звонке в памяти (в продакшене лучше использовать БД)
+        // Создаем запись о звонке
         const callData = {
             roomId,
             caller: callerEmail,
@@ -696,9 +900,8 @@ app.post('/api/calls/initiate', async (req, res) => {
             participants: [callerEmail]
         };
         
-        // Сохраняем в глобальный Map (добавьте в начало файла: const activeCalls = new Map();)
-        if (!global.activeCalls) global.activeCalls = new Map();
-        global.activeCalls.set(roomId, callData);
+        // Сохраняем в Map
+        activeCalls.set(roomId, callData);
         
         // Отправляем уведомление получателю через Socket.IO
         io.emit(`call:${receiverEmail}`, {
@@ -741,7 +944,7 @@ app.post('/api/calls/accept', async (req, res) => {
         }
         
         // Получаем информацию о звонке
-        const callData = global.activeCalls?.get(roomId);
+        const callData = activeCalls.get(roomId);
         
         if (!callData) {
             return res.status(404).json({
@@ -762,7 +965,7 @@ app.post('/api/calls/accept', async (req, res) => {
         callData.status = 'connected';
         callData.participants.push(userEmail);
         callData.answeredAt = new Date().toISOString();
-        global.activeCalls.set(roomId, callData);
+        activeCalls.set(roomId, callData);
         
         // Уведомляем звонящего, что звонок принят
         io.emit(`call:${callData.caller}`, {
@@ -803,7 +1006,7 @@ app.post('/api/calls/reject', async (req, res) => {
             });
         }
         
-        const callData = global.activeCalls?.get(roomId);
+        const callData = activeCalls.get(roomId);
         
         if (callData) {
             // Уведомляем звонящего об отказе
@@ -815,7 +1018,7 @@ app.post('/api/calls/reject', async (req, res) => {
             });
             
             // Удаляем звонок
-            global.activeCalls.delete(roomId);
+            activeCalls.delete(roomId);
         }
         
         console.log(`❌ Звонок ${roomId} отклонен пользователем ${userEmail}`);
@@ -848,7 +1051,7 @@ app.post('/api/calls/end', async (req, res) => {
             });
         }
         
-        const callData = global.activeCalls?.get(roomId);
+        const callData = activeCalls.get(roomId);
         
         if (callData) {
             // Уведомляем всех участников о завершении
@@ -863,11 +1066,23 @@ app.post('/api/calls/end', async (req, res) => {
                 }
             });
             
-            // Удаляем звонок
-            global.activeCalls.delete(roomId);
+            // Сохраняем в историю
+            const endedCall = {
+                ...callData,
+                endedBy: userEmail || 'system',
+                endTime: new Date().toISOString(),
+                status: 'ended',
+                duration: calculateDuration(callData.startedAt)
+            };
+            
+            const historyId = 'hist_' + Date.now();
+            callHistory.set(historyId, endedCall);
+            
+            // Удаляем из активных
+            activeCalls.delete(roomId);
         }
         
-        console.log(`📴 Звонок ${roomId} завершен пользователем ${userEmail}`);
+        console.log(`📴 Звонок ${roomId} завершен пользователем ${userEmail || 'system'}`);
         
         res.json({
             success: true,
@@ -890,7 +1105,7 @@ app.get('/api/calls/:roomId', async (req, res) => {
     try {
         const { roomId } = req.params;
         
-        const callData = global.activeCalls?.get(roomId);
+        const callData = activeCalls.get(roomId);
         
         if (!callData) {
             return res.status(404).json({
@@ -922,14 +1137,13 @@ app.get('/api/calls/user/:email', async (req, res) => {
         
         const userCalls = [];
         
-        if (global.activeCalls) {
-            for (const [roomId, callData] of global.activeCalls.entries()) {
-                if (callData.caller === email || callData.receiver === email) {
-                    userCalls.push({
-                        roomId,
-                        ...callData
-                    });
-                }
+        for (const [roomId, callData] of activeCalls.entries()) {
+            if (callData.caller === email || callData.receiver === email || 
+                (callData.participants && callData.participants.includes(email))) {
+                userCalls.push({
+                    roomId,
+                    ...callData
+                });
             }
         }
         
@@ -956,13 +1170,12 @@ app.get('/api/calls/check-availability/:email', async (req, res) => {
         
         let isInCall = false;
         
-        if (global.activeCalls) {
-            for (const callData of global.activeCalls.values()) {
-                if (callData.status === 'connected' && 
-                    (callData.caller === email || callData.receiver === email)) {
-                    isInCall = true;
-                    break;
-                }
+        for (const callData of activeCalls.values()) {
+            if (callData.status === 'connected' && 
+                (callData.caller === email || callData.receiver === email || 
+                 (callData.participants && callData.participants.includes(email)))) {
+                isInCall = true;
+                break;
             }
         }
         
@@ -2101,213 +2314,863 @@ app.get('/online-users', async (req, res) => {
     }
 });
 
-// ==================== НОВЫЕ ЭНДПОИНТЫ ДЛЯ ИНТЕГРАЦИИ С СЕРВИСОМ ЗВОНКОВ ====================
-
-/**
- * Проверка статуса сервиса звонков
- */
-app.get('/call-service/status', async (req, res) => {
-    const status = await checkCallServiceStatus();
-    res.json({
-        success: status.online,
-        ...status
-    });
-});
-
-/**
- * Создание комнаты для звонка
- */
-app.post('/call-service/rooms', async (req, res) => {
-    const result = await createCallRoom(req.body);
-    res.status(result.success ? 200 : 500).json(result);
-});
-
-/**
- * Получение информации о комнате
- */
-app.get('/call-service/rooms/:roomId', async (req, res) => {
-    const result = await getCallRoom(req.params.roomId);
-    res.status(result.success ? 200 : 404).json(result);
-});
-
-/**
- * Обновление комнаты
- */
-app.put('/call-service/rooms/:roomId', async (req, res) => {
-    const result = await updateCallRoom(req.params.roomId, req.body);
-    res.status(result.success ? 200 : 500).json(result);
-});
-
-/**
- * Удаление комнаты
- */
-app.delete('/call-service/rooms/:roomId', async (req, res) => {
-    const result = await deleteCallRoom(req.params.roomId);
-    res.status(result.success ? 200 : 500).json(result);
-});
-
-/**
- * Получение списка комнат
- */
-app.get('/call-service/rooms', async (req, res) => {
-    try {
-        const response = await axios.get(`${CALL_SERVICE_URL}/api/rooms`);
-        res.json({
-            success: true,
-            data: response.data
-        });
-    } catch (error) {
-        res.status(500).json({
-            success: false,
-            error: error.response?.data || error.message
-        });
-    }
-});
-
-/**
- * Инициирование звонка
- */
-app.post('/call-service/calls/start', async (req, res) => {
-    const result = await startCall(req.body);
-    res.status(result.success ? 200 : 500).json(result);
-});
-
-/**
- * Завершение звонка
- */
-app.post('/call-service/calls/end/:callId', async (req, res) => {
-    const result = await endCall(req.params.callId);
-    res.status(result.success ? 200 : 500).json(result);
-});
-
-/**
- * Получение активных звонков
- */
-app.get('/call-service/calls/active', async (req, res) => {
-    const result = await getActiveCalls();
-    res.status(result.success ? 200 : 500).json(result);
-});
-
-/**
- * Получение истории звонков
- */
-app.get('/call-service/calls/history', async (req, res) => {
-    const result = await getCallHistory();
-    res.status(result.success ? 200 : 500).json(result);
-});
-
-/**
- * Получение статистики сервиса звонков
- */
-app.get('/call-service/stats', async (req, res) => {
-    const result = await getCallServiceStats();
-    res.status(result.success ? 200 : 500).json(result);
-});
-
-/**
- * Webhook для событий звонков
- */
-app.post('/call-service/webhook/:event', async (req, res) => {
-    try {
-        const { event } = req.params;
-        const webhookData = req.body;
-        
-        console.log(`📞 Получен webhook события звонка: ${event}`, webhookData);
-        
-        // Здесь можно обрабатывать webhook события от сервиса звонков
-        // Например, уведомлять пользователей через Socket.IO о статусе звонка
-        
-        // Пример: если звонок начался, уведомить участников
-        if (event === 'call-started') {
-            const { roomId, participants } = webhookData;
-            
-            // Уведомляем участников через Socket.IO
-            participants?.forEach(email => {
-                io.emit(`call:${email}`, {
-                    type: 'incoming-call',
-                    roomId,
-                    caller: webhookData.caller
-                });
-            });
-        }
-        
-        // Если звонок завершился
-        if (event === 'call-ended') {
-            const { roomId, participants } = webhookData;
-            
-            participants?.forEach(email => {
-                io.emit(`call:${email}`, {
-                    type: 'call-ended',
-                    roomId
-                });
-            });
-        }
-        
-        res.json({
-            success: true,
-            message: `Webhook ${event} обработан`
-        });
-    } catch (error) {
-        console.error('❌ Ошибка обработки webhook:', error);
-        res.status(500).json({
-            success: false,
-            error: error.message
-        });
-    }
-});
-
-// ===== Информация о сервисе звонков =====
-app.get('/call-service/info', async (req, res) => {
-    try {
-        // Получаем основную информацию о сервисе
-        const [status, stats] = await Promise.all([
-            checkCallServiceStatus(),
-            getCallServiceStats()
-        ]);
-        
-        res.json({
-            success: true,
-            serviceUrl: CALL_SERVICE_URL,
-            status: status,
-            stats: stats.success ? stats.data : null,
-            endpoints: {
-                rooms: `${CALL_SERVICE_URL}/api/rooms`,
-                calls: `${CALL_SERVICE_URL}/api/calls`,
-                stats: `${CALL_SERVICE_URL}/api/stats`
-            }
-        });
-    } catch (error) {
-        res.status(500).json({
-            success: false,
-            error: error.message
-        });
-    }
-});
-
 // ===== СТАТИЧЕСКИЕ ФАЙЛЫ =====
 app.use('/uploads', express.static(uploadDir));
 
+// ===== ВЕБ-ИНТЕРФЕЙС =====
+app.get('/', (req, res) => {
+    res.send(`
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Beresta - Чат и Видеозвонки</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            padding: 20px;
+        }
+        .container { max-width: 1400px; margin: 0 auto; }
+        h1 {
+            text-align: center;
+            color: white;
+            margin-bottom: 30px;
+            font-size: 2.5em;
+            text-shadow: 2px 2px 4px rgba(0,0,0,0.2);
+        }
+        .main-panel {
+            display: grid;
+            grid-template-columns: 300px 1fr;
+            gap: 20px;
+        }
+        .sidebar {
+            background: white;
+            border-radius: 20px;
+            padding: 20px;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.2);
+        }
+        .sidebar h2 {
+            color: #333;
+            margin-bottom: 20px;
+            font-size: 1.3em;
+            border-bottom: 2px solid #f0f0f0;
+            padding-bottom: 10px;
+        }
+        .user-info {
+            background: #f8f9fa;
+            border-radius: 10px;
+            padding: 15px;
+            margin-bottom: 20px;
+        }
+        .user-info input {
+            width: 100%;
+            padding: 10px;
+            margin: 10px 0;
+            border: 2px solid #e0e0e0;
+            border-radius: 8px;
+            font-size: 14px;
+        }
+        .call-type-selector {
+            display: flex;
+            gap: 10px;
+            margin: 15px 0;
+        }
+        .call-type-btn {
+            flex: 1;
+            padding: 10px;
+            border: 2px solid #e0e0e0;
+            background: white;
+            border-radius: 8px;
+            cursor: pointer;
+            transition: all 0.3s;
+        }
+        .call-type-btn.active {
+            background: #667eea;
+            color: white;
+            border-color: #667eea;
+        }
+        .room-list {
+            max-height: 300px;
+            overflow-y: auto;
+        }
+        .room-item {
+            background: #f8f9fa;
+            border-radius: 8px;
+            padding: 12px;
+            margin-bottom: 8px;
+            cursor: pointer;
+            transition: all 0.3s;
+            border-left: 4px solid #667eea;
+        }
+        .room-item:hover {
+            transform: translateX(5px);
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+        }
+        .room-item .room-name { font-weight: 600; color: #333; }
+        .room-item .room-type { font-size: 12px; color: #666; margin-top: 5px; }
+        .room-item .participants { font-size: 12px; color: #48bb78; }
+        .main-content {
+            background: white;
+            border-radius: 20px;
+            padding: 20px;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.2);
+        }
+        .setup-section {
+            background: #f8f9fa;
+            border-radius: 15px;
+            padding: 25px;
+            margin-bottom: 30px;
+        }
+        .room-controls {
+            display: flex;
+            gap: 10px;
+            flex-wrap: wrap;
+            justify-content: center;
+        }
+        .room-controls input,
+        .room-controls select {
+            padding: 15px 20px;
+            border: 2px solid #e0e0e0;
+            border-radius: 10px;
+            font-size: 16px;
+            flex: 1;
+            min-width: 200px;
+        }
+        button {
+            padding: 15px 30px;
+            border: none;
+            border-radius: 10px;
+            font-size: 16px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.3s;
+        }
+        button:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 5px 15px rgba(0,0,0,0.2);
+        }
+        .btn-primary { background: #667eea; color: white; }
+        .btn-success { background: #48bb78; color: white; }
+        .btn-danger { background: #f56565; color: white; }
+        .btn-warning { background: #ed8936; color: white; }
+        .video-section { display: none; }
+        .video-container {
+            display: flex;
+            gap: 20px;
+            flex-wrap: wrap;
+            justify-content: center;
+            margin-bottom: 20px;
+        }
+        .video-wrapper {
+            flex: 1;
+            min-width: 400px;
+            position: relative;
+        }
+        .video-label {
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            background: rgba(0,0,0,0.6);
+            color: white;
+            padding: 5px 15px;
+            border-radius: 20px;
+            font-size: 14px;
+            z-index: 1;
+        }
+        video {
+            width: 100%;
+            height: auto;
+            border-radius: 15px;
+            background: #2d3748;
+            border: 3px solid #e2e8f0;
+            aspect-ratio: 16/9;
+            object-fit: cover;
+        }
+        .audio-only .video-wrapper video { display: none; }
+        .audio-only .video-wrapper {
+            background: #4a5568;
+            border-radius: 15px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            min-height: 200px;
+        }
+        .audio-only .video-wrapper::before {
+            content: "🎤 Аудио звонок";
+            color: white;
+            font-size: 24px;
+        }
+        .controls {
+            display: flex;
+            gap: 10px;
+            justify-content: center;
+            flex-wrap: wrap;
+            margin-top: 20px;
+            padding: 20px;
+            background: #f8f9fa;
+            border-radius: 15px;
+        }
+        .status-message {
+            margin-top: 15px;
+            padding: 10px;
+            border-radius: 8px;
+            text-align: center;
+            font-weight: 500;
+        }
+        .success { background: #c6f6d5; color: #22543d; }
+        .error { background: #fed7d7; color: #742a2a; }
+        .info { background: #bee3f8; color: #2c5282; }
+        .warning { background: #feebc8; color: #744210; }
+        .loader {
+            border: 3px solid #f3f3f3;
+            border-top: 3px solid #667eea;
+            border-radius: 50%;
+            width: 30px;
+            height: 30px;
+            animation: spin 1s linear infinite;
+            display: inline-block;
+        }
+        @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+        .hidden { display: none; }
+        .tabs {
+            display: flex;
+            gap: 10px;
+            margin-bottom: 20px;
+            border-bottom: 2px solid #f0f0f0;
+            padding-bottom: 10px;
+        }
+        .tab {
+            padding: 10px 20px;
+            cursor: pointer;
+            border-radius: 8px 8px 0 0;
+            transition: all 0.3s;
+        }
+        .tab:hover { background: #f0f0f0; }
+        .tab.active { background: #667eea; color: white; }
+        .api-docs {
+            background: #1a202c;
+            color: #a0aec0;
+            padding: 20px;
+            border-radius: 10px;
+            font-family: monospace;
+            margin-top: 20px;
+        }
+        .api-docs h3 { color: white; margin-bottom: 15px; }
+        .api-endpoint {
+            margin: 10px 0;
+            padding: 10px;
+            background: #2d3748;
+            border-radius: 5px;
+        }
+        .method {
+            display: inline-block;
+            padding: 3px 8px;
+            border-radius: 3px;
+            font-weight: bold;
+            margin-right: 10px;
+        }
+        .method.get { background: #48bb78; color: white; }
+        .method.post { background: #4299e1; color: white; }
+        .method.put { background: #ed8936; color: white; }
+        .method.delete { background: #f56565; color: white; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>📹 Beresta - Чат и Видеозвонки</h1>
+        
+        <div class="main-panel">
+            <div class="sidebar">
+                <h2>👤 Пользователь</h2>
+                <div class="user-info">
+                    <input type="text" id="userName" placeholder="Ваше имя" value="Пользователь">
+                    <div class="call-type-selector">
+                        <button class="call-type-btn active" onclick="setCallType('video')" id="typeVideoBtn">📹 Видео</button>
+                        <button class="call-type-btn" onclick="setCallType('audio')" id="typeAudioBtn">🎤 Аудио</button>
+                    </div>
+                </div>
+                
+                <h2>📋 Активные комнаты</h2>
+                <div class="room-list" id="roomList">
+                    <div class="room-item" onclick="joinRoomFromList('default')">
+                        <div class="room-name">default</div>
+                        <div class="room-type">📹 Видео комната</div>
+                        <div class="participants">👥 0 участников</div>
+                    </div>
+                </div>
+                
+                <h2>📊 Статус</h2>
+                <div id="sidebarStatus" class="status-message info">Подключение...</div>
+                
+                <h2>🔧 API</h2>
+                <button onclick="showApiDocs()" class="btn-warning" style="width: 100%;">📚 Показать документацию API</button>
+            </div>
+            
+            <div class="main-content">
+                <div class="tabs">
+                    <div class="tab active" onclick="switchTab('call')" id="tabCall">📞 Звонок</div>
+                    <div class="tab" onclick="switchTab('api')" id="tabApi">🔌 API тестер</div>
+                </div>
+                
+                <div id="callTab">
+                    <div class="setup-section" id="setupSection">
+                        <div class="room-controls">
+                            <input type="text" id="roomInput" placeholder="Название комнаты" value="room1">
+                            <select id="callTypeSelect">
+                                <option value="video">📹 Видеозвонок</option>
+                                <option value="audio">🎤 Аудиозвонок</option>
+                            </select>
+                            <button onclick="joinRoom()" class="btn-primary" id="joinBtn">
+                                <span id="joinBtnText">🔗 Подключиться</span>
+                                <span id="joinBtnLoader" class="loader hidden"></span>
+                            </button>
+                        </div>
+                        <div id="setupStatus" class="status-message"></div>
+                    </div>
+                    
+                    <div class="video-section" id="videoSection">
+                        <div class="video-container" id="videoContainer">
+                            <div class="video-wrapper">
+                                <div class="video-label" id="localLabel">Вы</div>
+                                <video id="localVideo" autoplay playsinline muted></video>
+                            </div>
+                            <div class="video-wrapper">
+                                <div class="video-label" id="remoteLabel">Собеседник</div>
+                                <video id="remoteVideo" autoplay playsinline></video>
+                            </div>
+                        </div>
+                        
+                        <div class="controls">
+                            <button onclick="toggleAudio()" class="btn-success" id="audioBtn">🔊 Выключить микрофон</button>
+                            <button onclick="toggleVideo()" class="btn-success" id="videoBtn" style="display: none;">📹 Выключить камеру</button>
+                            <button onclick="testConnection()" class="btn-warning">🔧 Тест соединения</button>
+                            <button onclick="hangUp()" class="btn-danger">📞 Завершить звонок</button>
+                        </div>
+                        
+                        <div id="callStatus" class="status-message"></div>
+                    </div>
+                </div>
+                
+                <div id="apiTab" style="display: none;">
+                    <h3>🔌 Тестирование API</h3>
+                    
+                    <div class="room-controls" style="margin-bottom: 20px;">
+                        <select id="apiMethod">
+                            <option value="GET">GET</option>
+                            <option value="POST">POST</option>
+                            <option value="PUT">PUT</option>
+                            <option value="DELETE">DELETE</option>
+                        </select>
+                        <input type="text" id="apiEndpoint" placeholder="/api/status" value="/api/status">
+                        <button onclick="testApi()" class="btn-primary">Отправить</button>
+                    </div>
+                    
+                    <div style="margin-bottom: 20px;">
+                        <textarea id="apiBody" placeholder="JSON тело запроса (для POST/PUT)" rows="5" style="width: 100%; padding: 10px; border-radius: 8px; border: 1px solid #e0e0e0;"></textarea>
+                    </div>
+                    
+                    <div id="apiResponse" style="background: #1a202c; color: #a0aec0; padding: 20px; border-radius: 10px; font-family: monospace; white-space: pre-wrap; min-height: 200px;">
+                        Ответ появится здесь...
+                    </div>
+                    
+                    <div class="api-docs" id="apiDocs" style="display: none;">
+                        <h3>📚 Документация API</h3>
+                        <div class="api-endpoint"><span class="method get">GET</span> /api/status - Статус сервера</div>
+                        <div class="api-endpoint"><span class="method get">GET</span> /api/rooms - Список комнат</div>
+                        <div class="api-endpoint"><span class="method get">GET</span> /api/rooms/:roomId - Информация о комнате</div>
+                        <div class="api-endpoint"><span class="method post">POST</span> /api/rooms - Создать комнату</div>
+                        <div class="api-endpoint"><span class="method put">PUT</span> /api/rooms/:roomId - Обновить комнату</div>
+                        <div class="api-endpoint"><span class="method delete">DELETE</span> /api/rooms/:roomId - Удалить комнату</div>
+                        <div class="api-endpoint"><span class="method get">GET</span> /api/users/:socketId - Информация о пользователе</div>
+                        <div class="api-endpoint"><span class="method get">GET</span> /api/calls/history - История звонков</div>
+                        <div class="api-endpoint"><span class="method get">GET</span> /api/calls/active - Активные звонки</div>
+                        <div class="api-endpoint"><span class="method post">POST</span> /api/calls/start - Инициировать звонок</div>
+                        <div class="api-endpoint"><span class="method post">POST</span> /api/calls/end/:callId - Завершить звонок</div>
+                        <div class="api-endpoint"><span class="method get">GET</span> /api/stats - Статистика сервера</div>
+                        <div class="api-endpoint"><span class="method post">POST</span> /api/webhook/:event - Webhook для внешних сервисов</div>
+                        <div class="api-endpoint"><span class="method get">GET</span> /health - Health check</div>
+                        <div class="api-endpoint"><span class="method get">GET</span> /users - Список пользователей</div>
+                        <div class="api-endpoint"><span class="method get">GET</span> /user/:email - Информация о пользователе</div>
+                        <div class="api-endpoint"><span class="method get">GET</span> /chats/:userEmail - Чаты пользователя</div>
+                        <div class="api-endpoint"><span class="method get">GET</span> /messages/:userEmail/:friendEmail - Сообщения</div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script src="/socket.io/socket.io.js"></script>
+    <script>
+        const socket = io({
+            reconnection: true,
+            reconnectionAttempts: 10,
+            reconnectionDelay: 1000
+        });
+        
+        let localStream = null;
+        let peerConnection = null;
+        let currentRoom = null;
+        let currentCallType = 'video';
+        let isAudioEnabled = true;
+        let isVideoEnabled = true;
+        let userName = 'Пользователь';
+        let mySocketId = null;
+        
+        const configuration = {
+            iceServers: [
+                { urls: 'stun:stun.l.google.com:19302' },
+                { urls: 'stun:stun1.l.google.com:19302' },
+                { urls: 'stun:stun2.l.google.com:19302' },
+                { urls: 'stun:stun3.l.google.com:19302' },
+                { urls: 'stun:stun4.l.google.com:19302' }
+            ],
+            iceCandidatePoolSize: 10
+        };
+        
+        function updateStatus(elementId, message, type) {
+            const element = document.getElementById(elementId);
+            if (element) {
+                element.textContent = message;
+                element.className = 'status-message ' + type;
+            }
+            console.log('[' + type + '] ' + message);
+        }
+        
+        function setCallType(type) {
+            currentCallType = type;
+            document.getElementById('typeVideoBtn').classList.toggle('active', type === 'video');
+            document.getElementById('typeAudioBtn').classList.toggle('active', type === 'audio');
+            document.getElementById('callTypeSelect').value = type;
+            document.getElementById('videoBtn').style.display = type === 'video' ? 'inline-block' : 'none';
+            const container = document.getElementById('videoContainer');
+            if (type === 'audio') {
+                container.classList.add('audio-only');
+            } else {
+                container.classList.remove('audio-only');
+            }
+        }
+        
+        async function testApi() {
+            const method = document.getElementById('apiMethod').value;
+            let endpoint = document.getElementById('apiEndpoint').value;
+            const body = document.getElementById('apiBody').value;
+            
+            if (!endpoint.startsWith('http')) {
+                endpoint = window.location.origin + endpoint;
+            }
+            
+            const options = {
+                method: method,
+                headers: { 'Content-Type': 'application/json' }
+            };
+            
+            if ((method === 'POST' || method === 'PUT') && body) {
+                options.body = body;
+            }
+            
+            try {
+                const response = await fetch(endpoint, options);
+                const data = await response.json();
+                document.getElementById('apiResponse').innerHTML = JSON.stringify(data, null, 2);
+            } catch (err) {
+                document.getElementById('apiResponse').innerHTML = '❌ Ошибка: ' + err.message;
+            }
+        }
+        
+        function showApiDocs() {
+            const docs = document.getElementById('apiDocs');
+            docs.style.display = docs.style.display === 'none' ? 'block' : 'none';
+        }
+        
+        function switchTab(tab) {
+            const callTab = document.getElementById('callTab');
+            const apiTab = document.getElementById('apiTab');
+            const tabCall = document.getElementById('tabCall');
+            const tabApi = document.getElementById('tabApi');
+            
+            if (tab === 'call') {
+                callTab.style.display = 'block';
+                apiTab.style.display = 'none';
+                tabCall.classList.add('active');
+                tabApi.classList.remove('active');
+            } else {
+                callTab.style.display = 'none';
+                apiTab.style.display = 'block';
+                tabCall.classList.remove('active');
+                tabApi.classList.add('active');
+            }
+        }
+        
+        async function updateRoomList() {
+            try {
+                const response = await fetch('/api/rooms');
+                const data = await response.json();
+                const roomList = document.getElementById('roomList');
+                roomList.innerHTML = '';
+                
+                data.rooms.forEach(room => {
+                    const type = room.roomInfo?.type || 'video';
+                    const typeIcon = type === 'video' ? '📹' : '🎤';
+                    const roomItem = document.createElement('div');
+                    roomItem.className = 'room-item';
+                    roomItem.onclick = () => joinRoomFromList(room.roomId);
+                    roomItem.innerHTML = '<div class="room-name">' + room.roomId + '</div>' +
+                        '<div class="room-type">' + typeIcon + ' ' + (type === 'video' ? 'Видео' : 'Аудио') + ' комната</div>' +
+                        '<div class="participants">👥 ' + room.participants + ' участников</div>';
+                    roomList.appendChild(roomItem);
+                });
+                
+                updateStatus('sidebarStatus', '✅ Онлайн: ' + data.total + ' комнат', 'success');
+            } catch (err) {
+                updateStatus('sidebarStatus', '❌ Ошибка загрузки', 'error');
+            }
+        }
+        
+        function joinRoomFromList(roomId) {
+            document.getElementById('roomInput').value = roomId;
+            joinRoom();
+        }
+        
+        async function testConnection() {
+            updateStatus('callStatus', '🔄 Тестирование соединения...', 'info');
+            try {
+                const testPC = new RTCPeerConnection(configuration);
+                let candidates = [];
+                
+                testPC.onicecandidate = (event) => {
+                    if (event.candidate) {
+                        candidates.push(event.candidate.candidate);
+                    }
+                };
+                
+                const constraints = currentCallType === 'video' 
+                    ? { video: true, audio: true }
+                    : { audio: true };
+                
+                const testStream = await navigator.mediaDevices.getUserMedia(constraints).catch(() => null);
+                
+                if (testStream) {
+                    testStream.getTracks().forEach(track => track.stop());
+                }
+                
+                await new Promise(resolve => setTimeout(resolve, 2000));
+                
+                if (candidates.length > 0) {
+                    updateStatus('callStatus', '✅ Найдено ' + candidates.length + ' ICE кандидатов', 'success');
+                } else {
+                    updateStatus('callStatus', '⚠️ Нет ICE кандидатов', 'warning');
+                }
+                
+                testPC.close();
+            } catch (err) {
+                updateStatus('callStatus', '❌ Ошибка: ' + err.message, 'error');
+            }
+        }
+        
+        async function joinRoom() {
+            const roomId = document.getElementById('roomInput').value.trim();
+            const callType = document.getElementById('callTypeSelect').value;
+            
+            if (!roomId) {
+                alert('Введите название комнаты');
+                return;
+            }
+            
+            setCallType(callType);
+            
+            document.getElementById('joinBtn').disabled = true;
+            document.getElementById('joinBtnText').classList.add('hidden');
+            document.getElementById('joinBtnLoader').classList.remove('hidden');
+            
+            updateStatus('setupStatus', 'Запрос доступа к устройствам...', 'info');
+            
+            try {
+                const constraints = callType === 'video' 
+                    ? { 
+                        video: {
+                            width: { ideal: 640 },
+                            height: { ideal: 480 },
+                            frameRate: { ideal: 30 }
+                        }, 
+                        audio: {
+                            echoCancellation: true,
+                            noiseSuppression: true
+                        }
+                    }
+                    : { 
+                        audio: {
+                            echoCancellation: true,
+                            noiseSuppression: true,
+                            autoGainControl: true
+                        } 
+                    };
+                
+                localStream = await navigator.mediaDevices.getUserMedia(constraints);
+                
+                const localVideo = document.getElementById('localVideo');
+                if (callType === 'video') {
+                    localVideo.srcObject = localStream;
+                } else {
+                    localVideo.srcObject = null;
+                }
+                
+                userName = document.getElementById('userName').value.trim() || 'Пользователь';
+                
+                if (mySocketId) {
+                    await fetch('/api/users/' + mySocketId, {
+                        method: 'PUT',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ 
+                            name: userName,
+                            type: callType,
+                            joinedAt: new Date().toISOString()
+                        })
+                    });
+                }
+                
+                currentRoom = roomId;
+                socket.emit('join-room', { roomId: roomId, userInfo: { name: userName, type: callType } });
+                
+            } catch (err) {
+                updateStatus('setupStatus', 'Ошибка: ' + err.message, 'error');
+                document.getElementById('joinBtn').disabled = false;
+                document.getElementById('joinBtnText').classList.remove('hidden');
+                document.getElementById('joinBtnLoader').classList.add('hidden');
+            }
+        }
+        
+        function createPeerConnection(peerId) {
+            const pc = new RTCPeerConnection(configuration);
+            
+            if (localStream) {
+                localStream.getTracks().forEach(track => {
+                    pc.addTrack(track, localStream);
+                });
+            }
+            
+            pc.onicecandidate = (event) => {
+                if (event.candidate) {
+                    socket.emit('ice-candidate', {
+                        target: peerId,
+                        candidate: event.candidate
+                    });
+                }
+            };
+            
+            pc.oniceconnectionstatechange = () => {
+                console.log('ICE состояние:', pc.iceConnectionState);
+                if (pc.iceConnectionState === 'connected') {
+                    updateStatus('callStatus', '✅ Соединение установлено', 'success');
+                    
+                    fetch('/api/calls/start', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            roomId: currentRoom,
+                            callerId: mySocketId,
+                            type: currentCallType
+                        })
+                    });
+                }
+            };
+            
+            pc.ontrack = (event) => {
+                console.log('Получен удаленный трек');
+                const remoteVideo = document.getElementById('remoteVideo');
+                remoteVideo.srcObject = event.streams[0];
+            };
+            
+            return pc;
+        }
+        
+        socket.on('connect', () => {
+            mySocketId = socket.id;
+            updateStatus('setupStatus', '✅ Подключено к серверу', 'success');
+            updateRoomList();
+            setInterval(updateRoomList, 5000);
+        });
+        
+        socket.on('join-success', (data) => {
+            console.log('Подключились к комнате:', data);
+            document.getElementById('setupSection').style.display = 'none';
+            document.getElementById('videoSection').style.display = 'block';
+            updateStatus('callStatus', '🟡 Ожидание собеседника...', 'info');
+            document.getElementById('joinBtn').disabled = false;
+            document.getElementById('joinBtnText').classList.remove('hidden');
+            document.getElementById('joinBtnLoader').classList.add('hidden');
+        });
+        
+        socket.on('peer-joined', async (peerId) => {
+            console.log('Собеседник подключился:', peerId);
+            updateStatus('callStatus', '🟡 Собеседник найден, соединение...', 'info');
+            
+            try {
+                await new Promise(resolve => setTimeout(resolve, 500));
+                peerConnection = createPeerConnection(peerId);
+                const offer = await peerConnection.createOffer({
+                    offerToReceiveAudio: true,
+                    offerToReceiveVideo: currentCallType === 'video'
+                });
+                await peerConnection.setLocalDescription(offer);
+                socket.emit('offer', {
+                    target: peerId,
+                    offer: offer
+                });
+            } catch (err) {
+                updateStatus('callStatus', 'Ошибка: ' + err.message, 'error');
+            }
+        });
+        
+        socket.on('offer', async ({ offer, sender }) => {
+            console.log('Получен оффер');
+            updateStatus('callStatus', '🟡 Получен запрос на соединение...', 'info');
+            
+            try {
+                if (!peerConnection) {
+                    peerConnection = createPeerConnection(sender);
+                }
+                await peerConnection.setRemoteDescription(new RTCSessionDescription(offer));
+                const answer = await peerConnection.createAnswer();
+                await peerConnection.setLocalDescription(answer);
+                socket.emit('answer', {
+                    target: sender,
+                    answer: answer
+                });
+            } catch (err) {
+                updateStatus('callStatus', 'Ошибка: ' + err.message, 'error');
+            }
+        });
+        
+        socket.on('answer', async ({ answer }) => {
+            console.log('Получен ответ');
+            try {
+                if (peerConnection && !peerConnection.currentRemoteDescription) {
+                    await peerConnection.setRemoteDescription(new RTCSessionDescription(answer));
+                }
+            } catch (err) {
+                console.error('Ошибка:', err);
+            }
+        });
+        
+        socket.on('ice-candidate', async ({ candidate }) => {
+            console.log('Получен ICE кандидат');
+            if (peerConnection) {
+                try {
+                    await peerConnection.addIceCandidate(new RTCIceCandidate(candidate));
+                } catch (err) {
+                    console.error('Ошибка:', err);
+                }
+            }
+        });
+        
+        socket.on('peer-disconnected', () => {
+            console.log('Собеседник отключился');
+            updateStatus('callStatus', '🔴 Собеседник отключился', 'error');
+            if (peerConnection) {
+                peerConnection.close();
+                peerConnection = null;
+            }
+            document.getElementById('remoteVideo').srcObject = null;
+            updateStatus('callStatus', '🟡 Ожидание нового собеседника...', 'info');
+        });
+        
+        socket.on('room-full', () => {
+            alert('Комната переполнена! Максимум 2 участника.');
+            hangUp();
+        });
+        
+        function toggleAudio() {
+            if (localStream) {
+                const audioTrack = localStream.getAudioTracks()[0];
+                if (audioTrack) {
+                    audioTrack.enabled = !audioTrack.enabled;
+                    isAudioEnabled = audioTrack.enabled;
+                    document.getElementById('audioBtn').innerHTML = isAudioEnabled ? 
+                        '🔊 Выключить микрофон' : '🔇 Включить микрофон';
+                }
+            }
+        }
+        
+        function toggleVideo() {
+            if (localStream && currentCallType === 'video') {
+                const videoTrack = localStream.getVideoTracks()[0];
+                if (videoTrack) {
+                    videoTrack.enabled = !videoTrack.enabled;
+                    isVideoEnabled = videoTrack.enabled;
+                    document.getElementById('videoBtn').innerHTML = isVideoEnabled ? 
+                        '📹 Выключить камеру' : '📹 Включить камеру';
+                }
+            }
+        }
+        
+        function hangUp() {
+            if (currentRoom && mySocketId) {
+                fetch('/api/calls/active')
+                    .then(res => res.json())
+                    .then(data => {
+                        const myCall = data.calls.find(call => 
+                            call.roomId === currentRoom && 
+                            call.participants && call.participants.includes(mySocketId)
+                        );
+                        if (myCall) {
+                            fetch('/api/calls/end/' + myCall.callId, {
+                                method: 'POST',
+                                headers: { 'Content-Type': 'application/json' },
+                                body: JSON.stringify({ endedBy: mySocketId })
+                            });
+                        }
+                    })
+                    .catch(err => console.error('Ошибка при завершении звонка:', err));
+            }
+            
+            if (peerConnection) {
+                peerConnection.close();
+                peerConnection = null;
+            }
+            
+            if (localStream) {
+                localStream.getTracks().forEach(track => track.stop());
+                localStream = null;
+            }
+            
+            document.getElementById('localVideo').srcObject = null;
+            document.getElementById('remoteVideo').srcObject = null;
+            
+            if (currentRoom) {
+                socket.emit('leave-room', currentRoom);
+                currentRoom = null;
+            }
+            
+            document.getElementById('setupSection').style.display = 'block';
+            document.getElementById('videoSection').style.display = 'none';
+            document.getElementById('joinBtn').disabled = false;
+            document.getElementById('joinBtnText').classList.remove('hidden');
+            document.getElementById('joinBtnLoader').classList.add('hidden');
+        }
+    </script>
+</body>
+</html>
+  `);
+});
+
 // ===== ЗАПУСК СЕРВЕРА =====
 server.listen(PORT, '0.0.0.0', async () => {
-    console.log('\n' + '='.repeat(50));
-    console.log('🚀 ЗАПУСК СЕРВЕРА BERE');
-    console.log('='.repeat(50));
+    console.log('\n' + '='.repeat(60));
+    console.log('🚀 ЗАПУСК ОБЪЕДИНЕННОГО СЕРВЕРА BERESTA');
+    console.log('='.repeat(60));
     console.log(`📡 Порт: ${PORT}`);
     console.log(`🆔 Server ID: ${SERVER_ID}`);
     console.log(`🌐 Режим: ${process.env.NODE_ENV || 'development'}`);
-    console.log(`📡 Socket.IO (чат) активен на /socket.io`);
-    console.log(`📞 Сервис звонков: ${CALL_SERVICE_URL}`);
+    console.log(`📡 Веб-интерфейс: http://localhost:${PORT}`);
+    console.log(`🔌 API Endpoint: http://localhost:${PORT}/api`);
+    console.log(`📡 Socket.IO (чат и звонки) активен на /socket.io`);
     console.log(`💾 База данных: Supabase (${supabaseUrl})`);
     console.log(`📁 Папка загрузок: ${uploadDir}`);
-    console.log('='.repeat(50) + '\n');
-    
-    // Проверяем доступность сервиса звонков
-    const callServiceStatus = await checkCallServiceStatus();
-    if (callServiceStatus.online) {
-        console.log('✅ Сервис звонков доступен');
-    } else {
-        console.log('⚠️ Сервис звонков недоступен:', callServiceStatus.error);
-    }
+    console.log('='.repeat(60) + '\n');
 });
 
 // ===== Graceful shutdown =====
