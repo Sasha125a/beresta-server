@@ -1,4 +1,4 @@
-// server.js - Объединенный сервер чата и звонков
+// server.js - Объединенный сервер чата и звонков с поддержкой видео
 // ==================== ИМПОРТЫ ====================
 const express = require('express');
 const http = require('http');
@@ -32,7 +32,8 @@ const io = socketIo(server, {
     },
     transports: ['websocket', 'polling'],
     pingTimeout: 60000,
-    pingInterval: 25000
+    pingInterval: 25000,
+    maxHttpBufferSize: 1e8 // Увеличиваем размер буфера для медиаданных
 });
 
 // ==================== SUPABASE ====================
@@ -66,7 +67,6 @@ const tempDir = path.join(uploadDir, 'temp');
 const permanentDir = path.join(uploadDir, 'permanent');
 const thumbnailsDir = path.join(uploadDir, 'thumbnails');
 
-// Создаем папки, если их нет
 [uploadDir, tempDir, permanentDir, thumbnailsDir].forEach(dir => {
     if (!fs.existsSync(dir)) {
         fs.mkdirSync(dir, { recursive: true });
@@ -103,17 +103,17 @@ ffmpeg.setFfprobePath(ffprobePath);
 
 // ==================== ХРАНИЛИЩА ДАННЫХ ====================
 const rooms = new Map();           // Комнаты и их участники
-const roomsInfo = new Map();       // Информация о комнатах (название, создатель и т.д.)
+const roomsInfo = new Map();       // Информация о комнатах
 const users = new Map();           // Информация о пользователях
 const callHistory = new Map();     // История звонков
 const activeCalls = new Map();     // Активные звонки
 const emailToSocket = new Map();   // Маппинг email -> socket.id для звонков
+const socketToEmail = new Map();   // Обратный маппинг socket.id -> email
 
-// Периодическая очистка старых звонков (раз в 5 минут)
+// Периодическая очистка старых звонков
 setInterval(() => {
     const now = Date.now();
     for (const [roomId, callData] of activeCalls.entries()) {
-        // Удаляем звонки старше 1 часа
         const startedAt = new Date(callData.startedAt || callData.startTime).getTime();
         if (now - startedAt > 60 * 60 * 1000) {
             activeCalls.delete(roomId);
@@ -124,9 +124,6 @@ setInterval(() => {
 
 // ==================== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ====================
 
-/**
- * Определение типа файла по MIME-типу и расширению
- */
 function getFileType(mimetype, filename) {
     if (mimetype.startsWith('image/')) return 'image';
     if (mimetype.startsWith('video/')) return 'video';
@@ -142,9 +139,6 @@ function getFileType(mimetype, filename) {
     return 'file';
 }
 
-/**
- * Перемещение файла из временной папки в постоянную
- */
 function moveFileToPermanent(filename) {
     const tempPath = path.join(tempDir, filename);
     const permanentPath = path.join(permanentDir, filename);
@@ -163,9 +157,6 @@ function moveFileToPermanent(filename) {
     return false;
 }
 
-/**
- * Получение длительности видео через ffprobe
- */
 function getVideoDuration(videoPath, callback) {
     ffmpeg.ffprobe(videoPath, (err, metadata) => {
         if (err) {
@@ -177,9 +168,6 @@ function getVideoDuration(videoPath, callback) {
     });
 }
 
-/**
- * Создание превью для видео или изображения
- */
 function createMediaPreview(filePath, outputPath, fileType, callback) {
     if (fileType === 'video') {
         ffmpeg(filePath)
@@ -215,9 +203,6 @@ function createMediaPreview(filePath, outputPath, fileType, callback) {
     }
 }
 
-/**
- * Обновление статуса присутствия пользователя
- */
 async function updateUserPresence(email, socketId, status = 'online') {
     try {
         const { error } = await supabase
@@ -238,13 +223,9 @@ async function updateUserPresence(email, socketId, status = 'online') {
     }
 }
 
-/**
- * Получение информации о пользователе по email
- */
 async function getUserInfo(email) {
     const normalizedEmail = email.toLowerCase();
     
-    // Ищем в regular_users
     const { data: regularUser, error: regularError } = await supabase
         .from('regular_users')
         .select('*')
@@ -255,7 +236,6 @@ async function getUserInfo(email) {
         return { ...regularUser, userType: 'regular' };
     }
 
-    // Ищем в beresta_users
     const { data: berestaUser, error: berestaError } = await supabase
         .from('beresta_users')
         .select('*')
@@ -269,23 +249,16 @@ async function getUserInfo(email) {
     return null;
 }
 
-/**
- * Проверка существования пользователя
- */
 async function userExists(email) {
     const user = await getUserInfo(email);
     return user !== null;
 }
 
-/**
- * Автоматическое добавление в чаты при первом сообщении
- */
 async function addToChatsAutomatically(user1, user2) {
     try {
         const user1Email = user1.toLowerCase();
         const user2Email = user2.toLowerCase();
 
-        // Добавляем запись для user1
         await supabase
             .from('friends')
             .upsert({ 
@@ -296,7 +269,6 @@ async function addToChatsAutomatically(user1, user2) {
                 ignoreDuplicates: true 
             });
 
-        // Добавляем запись для user2
         await supabase
             .from('friends')
             .upsert({ 
@@ -313,15 +285,12 @@ async function addToChatsAutomatically(user1, user2) {
     }
 }
 
-/**
- * Очистка устаревших записей присутствия
- */
 async function cleanupOldPresence() {
     try {
         const { error } = await supabase
             .from('user_presence')
             .delete()
-            .lt('last_seen', new Date(Date.now() - 60000).toISOString()); // старше 1 минуты
+            .lt('last_seen', new Date(Date.now() - 60000).toISOString());
 
         if (error) throw error;
     } catch (error) {
@@ -329,7 +298,6 @@ async function cleanupOldPresence() {
     }
 }
 
-// Запускаем очистку раз в минуту
 setInterval(cleanupOldPresence, 60000);
 
 function calculateDuration(startTime) {
@@ -368,16 +336,16 @@ io.on('connection', (socket) => {
                 const email = data.email.toLowerCase();
                 socket.userEmail = email;
                 
-                // Сохраняем маппинг email -> socket.id
+                // Сохраняем маппинги
                 emailToSocket.set(email, socket.id);
+                socketToEmail.set(socket.id, email);
+                
                 console.log(`📧 Маппинг: ${email} -> ${socket.id}`);
                 
-                // Сохраняем в Supabase
                 await updateUserPresence(email, socket.id, 'online');
                 
                 console.log(`👤 Пользователь онлайн: ${email} на сервере ${SERVER_ID}`);
                 
-                // Оповещаем всех о смене статуса
                 socket.broadcast.emit('user_status_changed', {
                     email: email,
                     status: 'online',
@@ -397,7 +365,6 @@ io.on('connection', (socket) => {
         }
     });
 
-    // Обработчик пинга
     socket.on('ping', (data) => {
         socket.emit('pong', {
             ...data,
@@ -412,9 +379,9 @@ io.on('connection', (socket) => {
         
         console.log('📢 ' + socket.id + ' подключается к комнате звонка: ' + roomId);
         
-        // Сохраняем маппинг email -> socket.id (если есть email)
         if (userInfo.email) {
             emailToSocket.set(userInfo.email, socket.id);
+            socketToEmail.set(socket.id, userInfo.email);
             console.log(`📧 Маппинг (join-room): ${userInfo.email} -> ${socket.id}`);
         }
         
@@ -441,7 +408,8 @@ io.on('connection', (socket) => {
                 name: roomId,
                 createdAt: new Date().toISOString(),
                 createdBy: socket.id,
-                type: userInfo?.type || 'video'
+                type: userInfo?.type || 'video',
+                callType: userInfo?.type || 'video'
             });
         }
         
@@ -450,89 +418,110 @@ io.on('connection', (socket) => {
         socket.emit('join-success', { roomId: roomId, participants: Array.from(room) });
         
         if (room.size > 1) {
-            io.to(roomId).emit('peer-joined', socket.id);
+            // Уведомляем всех в комнате о новом участнике
+            io.to(roomId).emit('peer-joined', {
+                peerId: socket.id,
+                userInfo: userInfo
+            });
         }
         
         io.emit('rooms-updated');
     });
 
-    // Обработчики WebRTC сигнализации
+    // Обработчики WebRTC сигнализации для видеозвонков
     socket.on('offer', (data) => {
-        console.log('='.repeat(40));
+        console.log('='.repeat(50));
         console.log('📤 Оффер от ' + socket.id + ' к ' + data.target);
         
-        // Проверяем, является ли target email'ом
         let targetSocketId = data.target;
+        
+        // Если target - email, конвертируем в socket.id
         if (typeof data.target === 'string' && data.target.includes('@')) {
-            // Это email, ищем socket.id
             targetSocketId = emailToSocket.get(data.target);
-            console.log(`🔍 Поиск socket.id для email ${data.target}: ${targetSocketId}`);
+            console.log(`🔍 Email ${data.target} -> socket ${targetSocketId}`);
         }
         
         if (targetSocketId) {
-            console.log(`✅ Найден целевой сокет: ${targetSocketId}`);
-            socket.to(targetSocketId).emit('offer', {
-                offer: data.offer,
-                sender: socket.id
-            });
-            console.log(`✅ Оффер отправлен на ${targetSocketId}`);
+            const targetSocket = io.sockets.sockets.get(targetSocketId);
+            if (targetSocket) {
+                console.log(`✅ Отправка оффера на ${targetSocketId}`);
+                socket.to(targetSocketId).emit('offer', {
+                    offer: data.offer,
+                    sender: socket.id,
+                    senderEmail: socketToEmail.get(socket.id)
+                });
+            } else {
+                console.log(`❌ Сокет ${targetSocketId} не найден`);
+            }
         } else {
-            console.log(`❌ Целевой сокет не найден для ${data.target}`);
-            console.log('📋 Текущий маппинг emailToSocket:', Array.from(emailToSocket.entries()));
+            console.log(`❌ Не найден target для ${data.target}`);
         }
-        console.log('='.repeat(40));
+        console.log('='.repeat(50));
     });
 
     socket.on('answer', (data) => {
-        console.log('='.repeat(40));
+        console.log('='.repeat(50));
         console.log('📤 Ответ от ' + socket.id + ' к ' + data.target);
-        console.log('📦 Данные ответа:', {
-            target: data.target,
-            hasAnswer: !!data.answer,
-            answerLength: data.answer?.length
-        });
         
-        // Проверяем, является ли target email'ом
         let targetSocketId = data.target;
+        
         if (typeof data.target === 'string' && data.target.includes('@')) {
             targetSocketId = emailToSocket.get(data.target);
-            console.log(`🔍 Поиск socket.id для email ${data.target}: ${targetSocketId}`);
+            console.log(`🔍 Email ${data.target} -> socket ${targetSocketId}`);
         }
         
-        // Проверяем, существует ли целевой сокет
-        const targetSocket = io.sockets.sockets.get(targetSocketId);
-        if (targetSocket) {
-            console.log(`✅ Целевой сокет ${targetSocketId} найден`);
-            socket.to(targetSocketId).emit('answer', {
-                answer: data.answer,
-                sender: socket.id
-            });
-            console.log(`✅ Ответ отправлен на ${targetSocketId}`);
+        if (targetSocketId) {
+            const targetSocket = io.sockets.sockets.get(targetSocketId);
+            if (targetSocket) {
+                console.log(`✅ Отправка ответа на ${targetSocketId}`);
+                socket.to(targetSocketId).emit('answer', {
+                    answer: data.answer,
+                    sender: socket.id,
+                    senderEmail: socketToEmail.get(socket.id)
+                });
+            } else {
+                console.log(`❌ Сокет ${targetSocketId} не найден`);
+            }
         } else {
-            console.log(`❌ Целевой сокет ${targetSocketId} не найден!`);
-            console.log('📋 Доступные сокеты:', Array.from(io.sockets.sockets.keys()));
+            console.log(`❌ Не найден target для ${data.target}`);
         }
-        console.log('='.repeat(40));
+        console.log('='.repeat(50));
     });
 
     socket.on('ice-candidate', (data) => {
         console.log('📤 ICE кандидат от ' + socket.id + ' к ' + data.target);
         
-        // Проверяем, является ли target email'ом
+        // Определяем тип кандидата для отладки
+        let candidateType = 'unknown';
+        if (data.candidate) {
+            if (data.candidate.includes('typ host')) candidateType = 'host';
+            else if (data.candidate.includes('typ srflx')) candidateType = 'srflx';
+            else if (data.candidate.includes('typ relay')) candidateType = 'relay';
+            console.log(`   Тип кандидата: ${candidateType}`);
+        }
+        
         let targetSocketId = data.target;
+        
         if (typeof data.target === 'string' && data.target.includes('@')) {
             targetSocketId = emailToSocket.get(data.target);
         }
         
         if (targetSocketId) {
-            socket.to(targetSocketId).emit('ice-candidate', {
-                candidate: data.candidate,
-                sdpMid: data.sdpMid,
-                sdpMLineIndex: data.sdpMLineIndex,
-                sender: socket.id
-            });
+            const targetSocket = io.sockets.sockets.get(targetSocketId);
+            if (targetSocket) {
+                socket.to(targetSocketId).emit('ice-candidate', {
+                    candidate: data.candidate,
+                    sdpMid: data.sdpMid,
+                    sdpMLineIndex: data.sdpMLineIndex,
+                    sender: socket.id,
+                    senderEmail: socketToEmail.get(socket.id)
+                });
+                console.log(`✅ ICE кандидат отправлен на ${targetSocketId}`);
+            } else {
+                console.log(`❌ Сокет ${targetSocketId} не найден`);
+            }
         } else {
-            console.log(`❌ Целевой сокет не найден для ${data.target}`);
+            console.log(`❌ Не найден target для ${data.target}`);
         }
     });
 
@@ -544,16 +533,16 @@ io.on('connection', (socket) => {
     socket.on('disconnect', async (reason) => {
         console.log(`❌ WebSocket отключен: ${socket.id}, причина: ${reason}`);
         
-        // Удаляем маппинг email -> socket.id
-        if (socket.userEmail) {
-            emailToSocket.delete(socket.userEmail);
-            console.log(`📧 Удален маппинг для ${socket.userEmail}`);
+        const email = socketToEmail.get(socket.id);
+        if (email) {
+            emailToSocket.delete(email);
+            socketToEmail.delete(socket.id);
+            console.log(`📧 Удален маппинг для ${email}`);
         }
         
         handleDisconnect(socket);
         
         if (socket.userEmail) {
-            // Помечаем как оффлайн в Supabase
             await updateUserPresence(socket.userEmail, socket.id, 'offline');
             
             socket.broadcast.emit('user_status_changed', {
@@ -564,7 +553,6 @@ io.on('connection', (socket) => {
         }
     });
 
-    // Обработчик ошибок
     socket.on('error', (error) => {
         console.error('💥 WebSocket ошибка:', error);
     });
@@ -586,9 +574,10 @@ function handleDisconnect(socket, specificRoom = null) {
         const room = rooms.get(roomId);
         room.delete(socket.id);
         
-        io.to(roomId).emit('peer-disconnected');
+        io.to(roomId).emit('peer-disconnected', {
+            peerId: socket.id
+        });
         
-        // Если в комнате никого не осталось, удаляем информацию о ней
         if (room.size === 0) {
             rooms.delete(roomId);
             roomsInfo.delete(roomId);
@@ -603,22 +592,18 @@ function handleDisconnect(socket, specificRoom = null) {
 
 // ==================== API ЭНДПОИНТЫ ====================
 
-// ===== Health check =====
 app.get('/health', async (req, res) => {
     try {
-        // Проверка подключения к Supabase
         const { error } = await supabase.from('regular_users').select('count', { count: 'exact', head: true });
         
         if (error) throw error;
         
-        // Получаем количество онлайн пользователей
         const { count } = await supabase
             .from('user_presence')
             .select('*', { count: 'exact', head: true })
             .eq('status', 'online')
             .gte('last_seen', new Date(Date.now() - 30000).toISOString());
 
-        // Проверка доступности директорий
         const dirs = [uploadDir, tempDir, permanentDir, thumbnailsDir];
         const dirStatus = {};
         dirs.forEach(dir => {
@@ -651,7 +636,6 @@ app.get('/health', async (req, res) => {
     }
 });
 
-// ===== Статус сервера =====
 app.get('/api/status', (req, res) => {
     res.json({
         status: 'online',
@@ -666,7 +650,6 @@ app.get('/api/status', (req, res) => {
     });
 });
 
-// ===== Список всех комнат =====
 app.get('/api/rooms', (req, res) => {
     const roomsList = [];
     for (const [roomId, participants] of rooms.entries()) {
@@ -689,7 +672,6 @@ app.get('/api/rooms', (req, res) => {
     });
 });
 
-// ===== Информация о конкретной комнате =====
 app.get('/api/rooms/:roomId', (req, res) => {
     const { roomId } = req.params;
     const participants = rooms.get(roomId);
@@ -712,7 +694,6 @@ app.get('/api/rooms/:roomId', (req, res) => {
     });
 });
 
-// ===== Создать комнату (через API) =====
 app.post('/api/rooms', (req, res) => {
     const { roomId, roomName, createdBy, type = 'video' } = req.body;
     
@@ -741,7 +722,6 @@ app.post('/api/rooms', (req, res) => {
     });
 });
 
-// ===== Обновить информацию о комнате =====
 app.put('/api/rooms/:roomId', (req, res) => {
     const { roomId } = req.params;
     const updates = req.body;
@@ -762,7 +742,6 @@ app.put('/api/rooms/:roomId', (req, res) => {
     });
 });
 
-// ===== Удалить комнату =====
 app.delete('/api/rooms/:roomId', (req, res) => {
     const { roomId } = req.params;
     
@@ -781,7 +760,6 @@ app.delete('/api/rooms/:roomId', (req, res) => {
     });
 });
 
-// ===== Информация о пользователе по socketId =====
 app.get('/api/users/:socketId', (req, res) => {
     const { socketId } = req.params;
     const userInfo = users.get(socketId);
@@ -793,7 +771,6 @@ app.get('/api/users/:socketId', (req, res) => {
     res.json(userInfo);
 });
 
-// ===== Обновить информацию о пользователе =====
 app.put('/api/users/:socketId', (req, res) => {
     const { socketId } = req.params;
     const updates = req.body;
@@ -807,7 +784,6 @@ app.put('/api/users/:socketId', (req, res) => {
     });
 });
 
-// ===== История звонков =====
 app.get('/api/calls/history', (req, res) => {
     const { limit = 50, roomId } = req.query;
     let history = Array.from(callHistory.values());
@@ -825,7 +801,6 @@ app.get('/api/calls/history', (req, res) => {
     });
 });
 
-// ===== Активные звонки =====
 app.get('/api/calls/active', (req, res) => {
     const active = Array.from(activeCalls.values());
     res.json({
@@ -834,7 +809,6 @@ app.get('/api/calls/active', (req, res) => {
     });
 });
 
-// ===== Инициировать звонок через API =====
 app.post('/api/calls/start', (req, res) => {
     const { roomId, callerId, calleeId, type = 'video' } = req.body;
     
@@ -863,7 +837,6 @@ app.post('/api/calls/start', (req, res) => {
     res.status(201).json(callInfo);
 });
 
-// ===== Завершить звонок через API =====
 app.post('/api/calls/end/:callId', (req, res) => {
     const { callId } = req.params;
     const { endedBy } = req.body;
@@ -895,7 +868,6 @@ app.post('/api/calls/end/:callId', (req, res) => {
     res.json(endedCall);
 });
 
-// ===== Статистика =====
 app.get('/api/stats', (req, res) => {
     const stats = {
         timestamp: new Date().toISOString(),
@@ -925,7 +897,6 @@ app.get('/api/stats', (req, res) => {
     res.json(stats);
 });
 
-// ===== Webhook для внешних сервисов =====
 app.post('/api/webhook/:event', (req, res) => {
     const { event } = req.params;
     const data = req.body;
@@ -940,20 +911,17 @@ app.post('/api/webhook/:event', (req, res) => {
     });
 });
 
-// ===== НОВЫЕ ЭНДПОИНТЫ ДЛЯ ЗВОНКОВ (ПРОСТАЯ РЕАЛИЗАЦИЯ) =====
+// ===== ЭНДПОИНТЫ ДЛЯ ВИДЕОЗВОНКОВ =====
 
 app.post('/api/calls/initiate', async (req, res) => {
     try {
         const { callerEmail, receiverEmail, callType } = req.body;
         
         console.log('='.repeat(60));
-        console.log(`📞 Инициирование звонка: ${callerEmail} -> ${receiverEmail}`);
-        console.log(`📋 Данные запроса:`, req.body);
+        console.log(`📞 Инициирование ${callType} звонка: ${callerEmail} -> ${receiverEmail}`);
         
-        // Генерируем уникальный ID комнаты
         const roomId = `call_${Date.now()}_${Math.random().toString(36).substring(2, 10)}`;
         
-        // Создаем запись о звонке
         const callData = {
             roomId,
             caller: callerEmail,
@@ -966,36 +934,36 @@ app.post('/api/calls/initiate', async (req, res) => {
         
         activeCalls.set(roomId, callData);
         
-        // ПРОВЕРЯЕМ ПОДКЛЮЧЕННЫХ КЛИЕНТОВ
-        const clients = Array.from(io.sockets.sockets.keys());
-        console.log(`🟢 Подключенные клиенты (${clients.length}):`, clients);
+        // Проверяем онлайн статус получателя
+        const receiverSocketId = emailToSocket.get(receiverEmail);
+        const isReceiverOnline = !!receiverSocketId;
         
-        // Получаем все комнаты (для отладки)
-        const rooms = io.sockets.adapter.rooms;
-        console.log('📋 Активные комнаты:', Array.from(rooms.keys()));
+        console.log(`📊 Статус получателя: ${isReceiverOnline ? 'онлайн' : 'оффлайн'}`);
         
-        // ОТПРАВЛЯЕМ УВЕДОМЛЕНИЕ
-        const callEventName = `call:${receiverEmail}`;
-        console.log(`📤 Отправка события: ${callEventName}`);
-        
-        const emitResult = io.emit(callEventName, {
-            type: 'incoming-call',
-            roomId: roomId,
-            caller: callerEmail,
-            callType: callType || 'audio',
-            timestamp: new Date().toISOString()
-        });
-        
-        console.log(`📊 Результат отправки:`, emitResult);
-        
-        // Также отправляем общее событие
-        io.emit('incoming-call', {
-            roomId: roomId,
-            caller: callerEmail,
-            receiver: receiverEmail,
-            callType: callType || 'audio',
-            timestamp: new Date().toISOString()
-        });
+        if (isReceiverOnline) {
+            // Отправляем персональное событие
+            const callEventName = `call:${receiverEmail}`;
+            io.emit(callEventName, {
+                type: 'incoming-call',
+                roomId: roomId,
+                caller: callerEmail,
+                callType: callType || 'audio',
+                timestamp: new Date().toISOString()
+            });
+            
+            // Также отправляем общее событие
+            io.emit('incoming-call', {
+                roomId: roomId,
+                caller: callerEmail,
+                receiver: receiverEmail,
+                callType: callType || 'audio',
+                timestamp: new Date().toISOString()
+            });
+            
+            console.log(`✅ Уведомление отправлено на ${receiverEmail}`);
+        } else {
+            console.log(`⚠️ Получатель ${receiverEmail} не в сети`);
+        }
         
         console.log('✅ Звонок инициирован, комната:', roomId);
         console.log('='.repeat(60));
@@ -1003,6 +971,7 @@ app.post('/api/calls/initiate', async (req, res) => {
         res.json({
             success: true,
             roomId: roomId,
+            isReceiverOnline: isReceiverOnline,
             message: 'Звонок инициирован'
         });
         
@@ -1019,7 +988,6 @@ app.get('/api/debug/socket/:email', (req, res) => {
     try {
         const { email } = req.params;
         
-        // Получаем информацию о сокетах
         const sockets = Array.from(io.sockets.sockets.values()).map(socket => ({
             id: socket.id,
             email: socket.userEmail,
@@ -1027,7 +995,6 @@ app.get('/api/debug/socket/:email', (req, res) => {
             rooms: Array.from(socket.rooms)
         }));
         
-        // Проверяем, есть ли пользователь онлайн
         const userSockets = sockets.filter(s => s.email === email);
         const socketId = emailToSocket.get(email);
         
@@ -1057,14 +1024,12 @@ app.get('/api/debug/webrtc/:roomId', (req, res) => {
         roomInfo: roomsInfo.get(roomId) || null,
         participantsInfo: room ? Array.from(room).map(socketId => ({
             socketId,
-            userInfo: users.get(socketId) || null
+            userInfo: users.get(socketId) || null,
+            email: socketToEmail.get(socketId)
         })) : []
     });
 });
 
-/**
- * Принять звонок
- */
 app.post('/api/calls/accept', async (req, res) => {
     try {
         const { roomId, userEmail } = req.body;
@@ -1076,7 +1041,6 @@ app.post('/api/calls/accept', async (req, res) => {
             });
         }
         
-        // Получаем информацию о звонке
         const callData = activeCalls.get(roomId);
         
         if (!callData) {
@@ -1086,7 +1050,6 @@ app.post('/api/calls/accept', async (req, res) => {
             });
         }
         
-        // Проверяем, что принимает именно тот, кому звонят
         if (callData.receiver !== userEmail) {
             return res.status(403).json({
                 success: false,
@@ -1094,13 +1057,12 @@ app.post('/api/calls/accept', async (req, res) => {
             });
         }
         
-        // Обновляем статус
         callData.status = 'connected';
         callData.participants.push(userEmail);
         callData.answeredAt = new Date().toISOString();
         activeCalls.set(roomId, callData);
         
-        // Уведомляем звонящего, что звонок принят
+        // Уведомляем звонящего
         io.emit(`call:${callData.caller}`, {
             type: 'call-accepted',
             roomId: roomId,
@@ -1125,9 +1087,6 @@ app.post('/api/calls/accept', async (req, res) => {
     }
 });
 
-/**
- * Отклонить звонок
- */
 app.post('/api/calls/reject', async (req, res) => {
     try {
         const { roomId, userEmail } = req.body;
@@ -1142,7 +1101,6 @@ app.post('/api/calls/reject', async (req, res) => {
         const callData = activeCalls.get(roomId);
         
         if (callData) {
-            // Уведомляем звонящего об отказе
             io.emit(`call:${callData.caller}`, {
                 type: 'call-rejected',
                 roomId: roomId,
@@ -1150,7 +1108,6 @@ app.post('/api/calls/reject', async (req, res) => {
                 timestamp: new Date().toISOString()
             });
             
-            // Удаляем звонок
             activeCalls.delete(roomId);
         }
         
@@ -1170,9 +1127,6 @@ app.post('/api/calls/reject', async (req, res) => {
     }
 });
 
-/**
- * Завершить звонок
- */
 app.post('/api/calls/end', async (req, res) => {
     try {
         const { roomId, userEmail } = req.body;
@@ -1187,7 +1141,6 @@ app.post('/api/calls/end', async (req, res) => {
         const callData = activeCalls.get(roomId);
         
         if (callData) {
-            // Уведомляем всех участников о завершении
             callData.participants.forEach(email => {
                 if (email !== userEmail) {
                     io.emit(`call:${email}`, {
@@ -1199,7 +1152,6 @@ app.post('/api/calls/end', async (req, res) => {
                 }
             });
             
-            // Сохраняем в историю
             const endedCall = {
                 ...callData,
                 endedBy: userEmail || 'system',
@@ -1211,7 +1163,6 @@ app.post('/api/calls/end', async (req, res) => {
             const historyId = 'hist_' + Date.now();
             callHistory.set(historyId, endedCall);
             
-            // Удаляем из активных
             activeCalls.delete(roomId);
         }
         
@@ -1231,9 +1182,6 @@ app.post('/api/calls/end', async (req, res) => {
     }
 });
 
-/**
- * Получить информацию о звонке
- */
 app.get('/api/calls/:roomId', async (req, res) => {
     try {
         const { roomId } = req.params;
@@ -1261,9 +1209,6 @@ app.get('/api/calls/:roomId', async (req, res) => {
     }
 });
 
-/**
- * Получить активные звонки пользователя
- */
 app.get('/api/calls/user/:email', async (req, res) => {
     try {
         const { email } = req.params;
@@ -1294,9 +1239,6 @@ app.get('/api/calls/user/:email', async (req, res) => {
     }
 });
 
-/**
- * Проверить, свободен ли пользователь (не в звонке)
- */
 app.get('/api/calls/check-availability/:email', async (req, res) => {
     try {
         const { email } = req.params;
@@ -1328,7 +1270,7 @@ app.get('/api/calls/check-availability/:email', async (req, res) => {
     }
 });
 
-// ===== Регистрация обычного пользователя =====
+// ===== Регистрация и пользователи =====
 app.post('/register', async (req, res) => {
     try {
         const { email, firstName, lastName } = req.body;
@@ -1370,7 +1312,6 @@ app.post('/register', async (req, res) => {
     }
 });
 
-// ===== Регистрация Beresta ID пользователя =====
 app.post('/register-beresta', async (req, res) => {
     try {
         const { email, firstName, lastName, berestaId } = req.body;
@@ -1413,7 +1354,6 @@ app.post('/register-beresta', async (req, res) => {
     }
 });
 
-// ===== Получение всех пользователей =====
 app.get('/users', async (req, res) => {
     try {
         const [regularResult, berestaResult] = await Promise.all([
@@ -1439,7 +1379,6 @@ app.get('/users', async (req, res) => {
     }
 });
 
-// ===== Получение информации о пользователе =====
 app.get('/user/:email', async (req, res) => {
     try {
         const email = decodeURIComponent(req.params.email).toLowerCase();
@@ -1468,14 +1407,12 @@ app.get('/user/:email', async (req, res) => {
     }
 });
 
-// ===== Получение чатов пользователя =====
 app.get('/chats/:userEmail', async (req, res) => {
     try {
         const userEmail = req.params.userEmail.toLowerCase();
 
         console.log('🔄 Получение чатов для:', userEmail);
 
-        // Получаем всех друзей пользователя
         const { data: friends, error: friendsError } = await supabase
             .from('friends')
             .select('friend_email, created_at')
@@ -1490,12 +1427,10 @@ app.get('/chats/:userEmail', async (req, res) => {
             });
         }
 
-        // Получаем информацию о каждом друге и последнее сообщение
         const chats = await Promise.all(friends.map(async (friend) => {
             const friendEmail = friend.friend_email;
             const friendInfo = await getUserInfo(friendEmail);
 
-            // Получаем последнее сообщение
             const { data: messages, error: msgError } = await supabase
                 .from('messages')
                 .select('timestamp')
@@ -1514,7 +1449,6 @@ app.get('/chats/:userEmail', async (req, res) => {
             };
         }));
 
-        // Сортируем по времени последнего сообщения
         chats.sort((a, b) => new Date(b.lastMessageTime) - new Date(a.lastMessageTime));
 
         console.log('✅ Найдено чатов:', chats.length);
@@ -1533,7 +1467,6 @@ app.get('/chats/:userEmail', async (req, res) => {
     }
 });
 
-// ===== Получение сообщений между двумя пользователями =====
 app.get('/messages/:userEmail/:friendEmail', async (req, res) => {
     try {
         const userEmail = req.params.userEmail.toLowerCase();
@@ -1557,7 +1490,6 @@ app.get('/messages/:userEmail/:friendEmail', async (req, res) => {
     }
 });
 
-// ===== Отправка текстового сообщения =====
 app.post('/send-message', async (req, res) => {
     try {
         const { senderEmail, receiverEmail, message, duration } = req.body;
@@ -1591,7 +1523,6 @@ app.post('/send-message', async (req, res) => {
 
         if (error) throw error;
 
-        // Автоматически добавляем в чаты
         await addToChatsAutomatically(senderEmail, receiverEmail);
 
         res.json({
@@ -1604,7 +1535,6 @@ app.post('/send-message', async (req, res) => {
     }
 });
 
-// ===== Загрузка файла с сообщением =====
 app.post('/upload', upload.single('file'), async (req, res) => {
     try {
         if (!req.file) {
@@ -1630,7 +1560,6 @@ app.post('/upload', upload.single('file'), async (req, res) => {
         let thumbnailFilename = '';
         let videoDuration = 0;
 
-        // Функция завершения загрузки
         const completeFileUpload = async (thumbnail = '') => {
             try {
                 const { data, error } = await supabase
@@ -1665,7 +1594,6 @@ app.post('/upload', upload.single('file'), async (req, res) => {
                     throw new Error('Ошибка перемещения файла');
                 }
             } catch (error) {
-                // Очистка при ошибке
                 fs.unlinkSync(req.file.path);
                 if (thumbnail) {
                     const thumbPath = path.join(thumbnailsDir, thumbnail);
@@ -1675,7 +1603,6 @@ app.post('/upload', upload.single('file'), async (req, res) => {
             }
         };
 
-        // Создаем превью для видео и изображений
         if (fileType === 'image' || fileType === 'video') {
             const previewName = `preview_${path.parse(req.file.filename).name}.jpg`;
             const previewPath = path.join(thumbnailsDir, previewName);
@@ -1707,7 +1634,6 @@ app.post('/upload', upload.single('file'), async (req, res) => {
     }
 });
 
-// ===== Загрузка файла (без сообщения) =====
 app.post('/upload-file', upload.single('file'), async (req, res) => {
     try {
         if (!req.file) {
@@ -1738,7 +1664,6 @@ app.post('/upload-file', upload.single('file'), async (req, res) => {
     }
 });
 
-// ===== Скачивание файла =====
 app.get('/download/:filename', async (req, res) => {
     try {
         const filename = req.params.filename;
@@ -1762,7 +1687,6 @@ app.get('/download/:filename', async (req, res) => {
     }
 });
 
-// ===== Информация о файле =====
 app.get('/file-info/:messageId', async (req, res) => {
     try {
         const messageId = req.params.messageId;
@@ -1795,7 +1719,6 @@ app.get('/file-info/:messageId', async (req, res) => {
     }
 });
 
-// ===== Добавление друга =====
 app.post('/add-friend', async (req, res) => {
     try {
         const { userEmail, friendEmail } = req.body;
@@ -1824,7 +1747,6 @@ app.post('/add-friend', async (req, res) => {
             });
         }
 
-        // Добавляем для первого пользователя
         await supabase
             .from('friends')
             .upsert({
@@ -1835,7 +1757,6 @@ app.post('/add-friend', async (req, res) => {
                 ignoreDuplicates: true
             });
 
-        // Добавляем для второго пользователя
         await supabase
             .from('friends')
             .upsert({
@@ -1860,7 +1781,6 @@ app.post('/add-friend', async (req, res) => {
     }
 });
 
-// ===== Удаление друга =====
 app.post('/remove-friend', async (req, res) => {
     try {
         const { userEmail, friendEmail } = req.body;
@@ -1885,7 +1805,6 @@ app.post('/remove-friend', async (req, res) => {
     }
 });
 
-// ===== Обновление профиля =====
 app.post('/update-profile', upload.single('avatar'), async (req, res) => {
     try {
         const { email, firstName, lastName, removeAvatar } = req.body;
@@ -1939,7 +1858,6 @@ app.post('/update-profile', upload.single('avatar'), async (req, res) => {
     }
 });
 
-// ===== Удаление аккаунта =====
 app.delete('/delete-account/:userEmail', async (req, res) => {
     try {
         const userEmail = req.params.userEmail.toLowerCase();
@@ -1968,7 +1886,6 @@ app.delete('/delete-account/:userEmail', async (req, res) => {
     }
 });
 
-// ===== Очистка истории чата =====
 app.post('/clear-chat', async (req, res) => {
     try {
         const { userEmail, friendEmail } = req.body;
@@ -1994,7 +1911,6 @@ app.post('/clear-chat', async (req, res) => {
     }
 });
 
-// ===== Создание группы =====
 app.post('/create-group', async (req, res) => {
     try {
         const { name, description, createdBy, members } = req.body;
@@ -2008,7 +1924,6 @@ app.post('/create-group', async (req, res) => {
             return res.status(404).json({ success: false, error: 'Создатель не найден' });
         }
 
-        // Создаем группу
         const { data: group, error: groupError } = await supabase
             .from('groups')
             .insert([{
@@ -2021,7 +1936,6 @@ app.post('/create-group', async (req, res) => {
 
         if (groupError) throw groupError;
 
-        // Добавляем создателя как администратора
         await supabase
             .from('group_members')
             .insert([{
@@ -2030,7 +1944,6 @@ app.post('/create-group', async (req, res) => {
                 role: 'admin'
             }]);
 
-        // Добавляем остальных участников
         if (members && members.length > 0) {
             const memberInserts = members
                 .filter(member => member !== createdBy)
@@ -2057,7 +1970,6 @@ app.post('/create-group', async (req, res) => {
     }
 });
 
-// ===== Получение групп пользователя =====
 app.get('/groups/:userEmail', async (req, res) => {
     try {
         const userEmail = req.params.userEmail.toLowerCase();
@@ -2079,7 +1991,6 @@ app.get('/groups/:userEmail', async (req, res) => {
 
         if (error) throw error;
 
-        // Получаем количество участников для каждой группы
         const groups = await Promise.all((data || []).map(async (item) => {
             const { count } = await supabase
                 .from('group_members')
@@ -2107,7 +2018,6 @@ app.get('/groups/:userEmail', async (req, res) => {
     }
 });
 
-// ===== Получение участников группы =====
 app.get('/group-members/:groupId', async (req, res) => {
     try {
         const groupId = req.params.groupId;
@@ -2123,7 +2033,6 @@ app.get('/group-members/:groupId', async (req, res) => {
 
         if (error) throw error;
 
-        // Получаем информацию о каждом участнике
         const members = await Promise.all((data || []).map(async (m) => {
             const userInfo = await getUserInfo(m.user_email);
             return {
@@ -2145,7 +2054,6 @@ app.get('/group-members/:groupId', async (req, res) => {
     }
 });
 
-// ===== Добавление участника в группу =====
 app.post('/add-group-member', async (req, res) => {
     try {
         const { groupId, userEmail } = req.body;
@@ -2179,7 +2087,6 @@ app.post('/add-group-member', async (req, res) => {
     }
 });
 
-// ===== Удаление участника из группы =====
 app.post('/remove-group-member', async (req, res) => {
     try {
         const { groupId, userEmail } = req.body;
@@ -2204,7 +2111,6 @@ app.post('/remove-group-member', async (req, res) => {
     }
 });
 
-// ===== Удаление группы =====
 app.delete('/group/:groupId', async (req, res) => {
     try {
         const groupId = req.params.groupId;
@@ -2224,7 +2130,6 @@ app.delete('/group/:groupId', async (req, res) => {
     }
 });
 
-// ===== Отправка сообщения в группу =====
 app.post('/send-group-message', async (req, res) => {
     try {
         const { groupId, senderEmail, message, duration } = req.body;
@@ -2260,7 +2165,6 @@ app.post('/send-group-message', async (req, res) => {
     }
 });
 
-// ===== Получение сообщений группы =====
 app.get('/group-messages/:groupId', async (req, res) => {
     try {
         const groupId = req.params.groupId;
@@ -2273,7 +2177,6 @@ app.get('/group-messages/:groupId', async (req, res) => {
 
         if (error) throw error;
 
-        // Добавляем информацию об отправителях
         const messages = await Promise.all((data || []).map(async (m) => {
             const senderInfo = await getUserInfo(m.sender_email);
             return {
@@ -2293,7 +2196,6 @@ app.get('/group-messages/:groupId', async (req, res) => {
     }
 });
 
-// ===== Загрузка файла в группу =====
 app.post('/upload-group', upload.single('file'), async (req, res) => {
     try {
         if (!req.file) {
@@ -2388,7 +2290,6 @@ app.post('/upload-group', upload.single('file'), async (req, res) => {
     }
 });
 
-// ===== Информация о групповом файле =====
 app.get('/group-file-info/:filename', async (req, res) => {
     try {
         const filename = req.params.filename;
@@ -2421,7 +2322,6 @@ app.get('/group-file-info/:filename', async (req, res) => {
     }
 });
 
-// ===== Получение онлайн пользователей =====
 app.get('/online-users', async (req, res) => {
     try {
         const { data, error } = await supabase
@@ -2469,6 +2369,7 @@ server.listen(PORT, '0.0.0.0', async () => {
     console.log(`💾 База данных: Supabase (${supabaseUrl})`);
     console.log(`📁 Папка загрузок: ${uploadDir}`);
     console.log(`📧 Маппинг email->socketId активен для звонков`);
+    console.log(`🎥 Поддержка видеозвонков: ДА`);
     console.log('='.repeat(60) + '\n');
 });
 
@@ -2476,7 +2377,6 @@ server.listen(PORT, '0.0.0.0', async () => {
 process.on('SIGINT', async () => {
     console.log('\n🛑 Остановка сервера...');
     
-    // Очищаем присутствие всех пользователей на этом сервере
     try {
         await supabase
             .from('user_presence')
