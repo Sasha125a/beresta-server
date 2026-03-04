@@ -14,6 +14,7 @@ const ffmpeg = require('fluent-ffmpeg');
 const ffmpegPath = require('ffmpeg-static');
 const ffprobePath = require('ffprobe-static').path;
 const { createClient } = require('@supabase/supabase-js');
+const Agora = require('agora-access-token');
 
 // ==================== КОНФИГУРАЦИЯ ====================
 const isRender = process.env.NODE_ENV === 'production';
@@ -3157,22 +3158,41 @@ app.get('/', (req, res) => {
   `);
 });
 
-// Добавьте в server.js после других эндпоинтов
+// Добавьте после других переменных окружения:
+const AGORA_APP_ID = process.env.AGORA_APP_ID;
+const AGORA_APP_CERTIFICATE = process.env.AGORA_APP_CERTIFICATE;
 
-// ==================== AGORA.IO ====================
-const Agora = require('agora-access-token');
-const AGORA_APP_ID = process.env.AGORA_APP_ID || 'your_app_id';
-const AGORA_APP_CERTIFICATE = process.env.AGORA_APP_CERTIFICATE || 'your_app_certificate';
+// Эндпоинт для получения App ID
+app.get('/api/agora/app-id', (req, res) => {
+    if (!AGORA_APP_ID) {
+        return res.status(500).json({
+            success: false,
+            error: 'AGORA_APP_ID not configured'
+        });
+    }
+    
+    res.json({
+        success: true,
+        appId: AGORA_APP_ID
+    });
+});
 
-// Эндпоинт для получения токена Agora
+// Эндпоинт для получения токена
 app.post('/api/agora/token', (req, res) => {
     try {
-        const { channelName, uid = 0, role = 1 } = req.body;
+        const { channelName, uid = 0 } = req.body;
         
         if (!channelName) {
             return res.status(400).json({ 
                 success: false, 
-                error: 'channelName обязателен' 
+                error: 'channelName is required' 
+            });
+        }
+
+        if (!AGORA_APP_ID || !AGORA_APP_CERTIFICATE) {
+            return res.status(500).json({
+                success: false,
+                error: 'Agora credentials not configured'
             });
         }
 
@@ -3187,11 +3207,11 @@ app.post('/api/agora/token', (req, res) => {
             AGORA_APP_CERTIFICATE,
             channelName,
             uid,
-            role,
+            Agora.RtcRole.PUBLISHER,
             privilegeExpiredTs
         );
 
-        console.log(`🔑 Agora токен сгенерирован для канала ${channelName}`);
+        console.log(`✅ Токен сгенерирован для канала ${channelName}, uid ${uid}`);
         
         res.json({
             success: true,
@@ -3202,20 +3222,12 @@ app.post('/api/agora/token', (req, res) => {
             expirationTime: privilegeExpiredTs
         });
     } catch (error) {
-        console.error('❌ Ошибка генерации токена Agora:', error);
+        console.error('❌ Ошибка генерации токена:', error);
         res.status(500).json({
             success: false,
             error: error.message
         });
     }
-});
-
-// Эндпоинт для получения App ID
-app.get('/api/agora/app-id', (req, res) => {
-    res.json({
-        success: true,
-        appId: AGORA_APP_ID
-    });
 });
 
 // ===== ЗАПУСК СЕРВЕРА =====
