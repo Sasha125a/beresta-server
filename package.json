@@ -1,43 +1,64 @@
 {
-  "name": "beresta-unified-server",
+  "name": "beresta-server",
   "version": "1.0.0",
-  "description": "Объединенный сервер чата и звонков Beresta",
+  "description": "Backend server for Beresta messaging application with WebRTC, WebSocket, and file sharing support",
   "main": "server.js",
+  "type": "commonjs",
   "scripts": {
     "start": "node server.js",
+    "ping": "curl -f https://your-app-name.onrender.com/health || exit 1",
     "dev": "nodemon server.js",
+    "setup": "node -e \"console.log('Running initial setup...'); require('./server.js');\"",
+    "backup": "node -e \"require('./fileStorage.js').createBackup()\"",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "keywords": [
     "messaging",
     "chat",
-    "websocket",
     "webrtc",
     "video-call",
     "audio-call",
-    "supabase"
+    "websocket",
+    "file-sharing",
+    "sqlite",
+    "express",
+    "agora",
+    "real-time"
   ],
-  "author": "",
-  "license": "ISC",
+  "author": "Beresta Team",
+  "license": "MIT",
   "dependencies": {
-    "@supabase/supabase-js": "^2.38.0",
-    "axios": "^1.6.2",
-    "body-parser": "^1.20.2",
-    "cors": "^2.8.5",
     "express": "^4.18.2",
+    "cors": "^2.8.5",
+    "body-parser": "^1.20.2",
+    "sqlite3": "^5.1.6",
+    "multer": "^1.4.5-lts.1",
+    "mime-types": "^2.1.35",
+    "uuid": "^9.0.1",
+    "fluent-ffmpeg": "^2.1.2",
     "ffmpeg-static": "^5.2.0",
     "ffprobe-static": "^3.1.0",
-    "fluent-ffmpeg": "^2.1.2",
-    "mime-types": "^2.1.35",
-    "multer": "^1.4.5-lts.1",
-    "socket.io": "^4.6.1",
-    "uuid": "^9.0.0",
-    "ws": "^8.14.2"
+    "agora-access-token": "^2.0.4",
+    "socket.io": "^4.7.4",
+    "firebase-admin": "^11.11.1"
   },
   "devDependencies": {
     "nodemon": "^3.0.1"
   },
   "engines": {
-    "node": ">=16.0.0"
+    "node": ">=16.0.0",
+    "npm": ">=8.0.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/beresta-team/beresta-server.git"
+  },
+  "bugs": {
+    "url": "https://github.com/beresta-team/beresta-server/issues"
+  },
+  "homepage": "https://github.com/beresta-team/beresta-server#readme",
+  "optionalDependencies": {
+    "ffmpeg-static": "^5.2.0",
+    "ffprobe-static": "^3.1.0"
   }
 }
