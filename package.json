@@ -40,7 +40,8 @@
     "ffprobe-static": "^3.1.0",
     "agora-access-token": "^2.0.4",
     "socket.io": "^4.7.4",
-    "firebase-admin": "^11.11.1"
+    "firebase-admin": "^11.11.1",
+    "@supabase/supabase-js": "^2.39.0"
   },
   "devDependencies": {
     "nodemon": "^3.0.1"
@@ -62,3 +63,4 @@
     "ffprobe-static": "^3.1.0"
   }
 }
+
