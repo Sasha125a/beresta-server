@@ -1,7 +1,7 @@
 {
-  "name": "beresta-server",
+  "name": "beresta-unified-server",
   "version": "1.0.0",
-  "description": "Beresta messaging server with multi-server support",
+  "description": "Объединенный сервер чата и звонков Beresta",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
@@ -13,7 +13,8 @@
     "chat",
     "websocket",
     "webrtc",
-    "render",
+    "video-call",
+    "audio-call",
     "supabase"
   ],
   "author": "",
