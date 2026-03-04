@@ -1,4 +1,8 @@
+// server.js - Объединенный сервер чата и звонков
+// ==================== ИМПОРТЫ ====================
 const express = require('express');
+const http = require('http');
+const socketIo = require('socket.io');
 const cors = require('cors');
 const bodyParser = require('body-parser');
 const path = require('path');
@@ -9,39 +13,40 @@ const { v4: uuidv4 } = require('uuid');
 const ffmpeg = require('fluent-ffmpeg');
 const ffmpegPath = require('ffmpeg-static');
 const ffprobePath = require('ffprobe-static').path;
-const Agora = require('agora-access-token');
-const http = require('http');
-const socketIo = require('socket.io');
 const { createClient } = require('@supabase/supabase-js');
 
+// ==================== КОНФИГУРАЦИЯ ====================
 const isRender = process.env.NODE_ENV === 'production';
-const activeCalls = new Map();
-const pendingCalls = new Map();
+const SERVER_ID = process.env.RENDER_SERVICE_ID || `server-${Math.random().toString(36).substring(2, 10)}`;
 
 const app = express();
+const server = http.createServer(app);
 const PORT = process.env.PORT || 3000;
 
-const server = http.createServer(app);
+// ==================== SOCKET.IO (для чата и звонков) ====================
 const io = socketIo(server, {
-  cors: {
-    origin: isRender ? ["https://beresta-server-5udn.onrender.com", "https://your-client-domain.com"] : "*",
-    methods: ["GET", "POST"],
-    credentials: true
-  },
-  transports: ['websocket', 'polling'],
-  pingTimeout: 60000,
-  pingInterval: 25000,
-  allowEIO3: true,
-  maxHttpBufferSize: 1e8,
-  connectTimeout: 45000
+    cors: {
+        origin: isRender ? ["https://beresta-server-5udn.onrender.com"] : "*",
+        methods: ["GET", "POST", "PUT", "DELETE"],
+        credentials: true
+    },
+    transports: ['websocket', 'polling'],
+    pingTimeout: 60000,
+    pingInterval: 25000
 });
 
-// Инициализация Supabase
+// ==================== SUPABASE ====================
 const supabaseUrl = process.env.SUPABASE_URL;
-const supabaseKey = process.env.SUPABASE_SERVICE_KEY; // Используйте service_role key для сервера
+const supabaseKey = process.env.SUPABASE_SERVICE_KEY;
+
+if (!supabaseUrl || !supabaseKey) {
+    console.error('❌ ОШИБКА: SUPABASE_URL и SUPABASE_SERVICE_KEY должны быть указаны в .env');
+    process.exit(1);
+}
+
 const supabase = createClient(supabaseUrl, supabaseKey);
 
-// Middleware
+// ==================== MIDDLEWARE ====================
 app.use(cors({
     origin: process.env.CLIENT_URL || "*",
     methods: ['GET', 'POST', 'DELETE', 'PUT', 'OPTIONS'],
@@ -52,20 +57,24 @@ app.use(cors({
 app.options('*', cors());
 app.use(bodyParser.json({ limit: '100mb' }));
 app.use(bodyParser.urlencoded({ extended: true, limit: '100mb' }));
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
 
-// Настройка загрузки файлов
+// ==================== ФАЙЛОВОЕ ХРАНИЛИЩЕ ====================
 const uploadDir = process.env.UPLOAD_DIR || path.join(__dirname, 'uploads');
 const tempDir = path.join(uploadDir, 'temp');
 const permanentDir = path.join(uploadDir, 'permanent');
 const thumbnailsDir = path.join(uploadDir, 'thumbnails');
 
+// Создаем папки, если их нет
 [uploadDir, tempDir, permanentDir, thumbnailsDir].forEach(dir => {
     if (!fs.existsSync(dir)) {
         fs.mkdirSync(dir, { recursive: true });
-        console.log('📁 Создана папка:', dir);
+        console.log(`📁 Создана папка: ${dir}`);
     }
 });
 
+// Настройка multer для загрузки файлов
 const multerStorage = multer.diskStorage({
     destination: (req, file, cb) => {
         cb(null, tempDir);
@@ -80,7 +89,7 @@ const multerStorage = multer.diskStorage({
 const upload = multer({
     storage: multerStorage,
     limits: {
-        fileSize: 100 * 1024 * 1024,
+        fileSize: 100 * 1024 * 1024, // 100MB
         fieldSize: 50 * 1024 * 1024
     },
     fileFilter: (req, file, cb) => {
@@ -88,80 +97,88 @@ const upload = multer({
     }
 });
 
-// Устанавливаем пути к ffmpeg
+// ==================== FFMPEG ====================
 ffmpeg.setFfmpegPath(ffmpegPath);
 ffmpeg.setFfprobePath(ffprobePath);
 
-// Функция само-пинга для Render.com (только для поддержания активности сервера)
-function startSelfPing() {
-    const selfPingUrl = process.env.RENDER_SELF_PING_URL || `http://localhost:${PORT}`;
-    
-    if (isRender && selfPingUrl.includes('onrender.com')) {
-        console.log('🔔 Активирован внутренний само-пинг для Render.com');
-        
-        const pingInterval = setInterval(() => {
-            const url = new URL(selfPingUrl);
-            const isHttps = url.protocol === 'https:';
-            
-            const httpModule = isHttps ? require('https') : require('http');
-            
-            httpModule.get(`${selfPingUrl}/health`, (res) => {
-                let data = '';
-                res.on('data', chunk => data += chunk);
-                res.on('end', () => {
-                    console.log('✅ Внутренний само-пинг успешен:', {
-                        timestamp: new Date().toISOString(),
-                        statusCode: res.statusCode
-                    });
-                });
-            }).on('error', (err) => {
-                console.error('❌ Ошибка внутреннего само-пинга:', err.message);
-            });
-        }, 4 * 60 * 1000); // Пинг каждые 4 минуты
+// ==================== ХРАНИЛИЩА ДАННЫХ ====================
+const rooms = new Map();           // Комнаты и их участники
+const roomsInfo = new Map();       // Информация о комнатах (название, создатель и т.д.)
+const users = new Map();           // Информация о пользователях
+const callHistory = new Map();     // История звонков
+const activeCalls = new Map();     // Активные звонки
 
-        process.on('SIGINT', () => {
-            clearInterval(pingInterval);
-            console.log('🛑 Внутренний само-пинг остановлен');
-        });
-        
-        process.on('SIGTERM', () => {
-            clearInterval(pingInterval);
-            console.log('🛑 Внутренний само-пинг остановлен');
-        });
-        
-        return pingInterval;
-    } else {
-        console.log('ℹ️ Внутренний само-пинг отключен (не продакшен режим)');
-        return null;
+// Периодическая очистка старых звонков (раз в 5 минут)
+setInterval(() => {
+    const now = Date.now();
+    for (const [roomId, callData] of activeCalls.entries()) {
+        // Удаляем звонки старше 1 часа
+        const startedAt = new Date(callData.startedAt || callData.startTime).getTime();
+        if (now - startedAt > 60 * 60 * 1000) {
+            activeCalls.delete(roomId);
+            console.log(`🧹 Очищен старый звонок: ${roomId}`);
+        }
     }
-}
+}, 5 * 60 * 1000);
 
-// Функция определения типа файла
+// ==================== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ====================
+
+/**
+ * Определение типа файла по MIME-типу и расширению
+ */
 function getFileType(mimetype, filename) {
     if (mimetype.startsWith('image/')) return 'image';
     if (mimetype.startsWith('video/')) return 'video';
     if (mimetype.startsWith('audio/')) return 'audio';
-    if (mimetype === 'application/pdf') return 'document';
-    if (mimetype.includes('word') || mimetype.includes('excel') || mimetype.includes('powerpoint') || 
-        mimetype.includes('document') || mimetype.includes('presentation') || mimetype.includes('sheet')) {
-        return 'document';
-    }
-    if (mimetype.includes('zip') || mimetype.includes('rar') || mimetype.includes('tar') || 
-        mimetype.includes('7z') || mimetype.includes('compressed')) {
-        return 'archive';
-    }
     
     const ext = path.extname(filename).toLowerCase();
     if (['.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp'].includes(ext)) return 'image';
     if (['.mp4', '.avi', '.mov', '.mkv', '.webm', '.3gp'].includes(ext)) return 'video';
     if (['.mp3', '.wav', '.aac', '.flac', '.ogg', '.m4a'].includes(ext)) return 'audio';
     if (['.pdf', '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx', '.txt'].includes(ext)) return 'document';
-    if (['.zip', '.rar', '.7z', '.tar'].includes(ext)) return 'archive';
+    if (['.zip', '.rar', '.7z', '.tar', '.gz'].includes(ext)) return 'archive';
     
     return 'file';
 }
 
-// Функция создания превью для медиафайлов
+/**
+ * Перемещение файла из временной папки в постоянную
+ */
+function moveFileToPermanent(filename) {
+    const tempPath = path.join(tempDir, filename);
+    const permanentPath = path.join(permanentDir, filename);
+    
+    if (fs.existsSync(tempPath)) {
+        try {
+            fs.renameSync(tempPath, permanentPath);
+            console.log(`✅ Файл перемещен: ${filename}`);
+            return true;
+        } catch (error) {
+            console.error(`❌ Ошибка перемещения файла ${filename}:`, error);
+            return false;
+        }
+    }
+    console.error(`❌ Временный файл не найден: ${tempPath}`);
+    return false;
+}
+
+/**
+ * Получение длительности видео через ffprobe
+ */
+function getVideoDuration(videoPath, callback) {
+    ffmpeg.ffprobe(videoPath, (err, metadata) => {
+        if (err) {
+            console.error('❌ Ошибка получения длительности видео:', err);
+            return callback(err);
+        }
+        const duration = Math.round(metadata.format.duration || 0);
+        callback(null, duration);
+    });
+}
+
+/**
+ * Создание превью для видео или изображения
+ */
 function createMediaPreview(filePath, outputPath, fileType, callback) {
     if (fileType === 'video') {
         ffmpeg(filePath)
@@ -190,69 +207,59 @@ function createMediaPreview(filePath, outputPath, fileType, callback) {
             .on('error', (err) => {
                 console.error('❌ Ошибка создания превью изображения:', err);
                 callback(err);
-            });
+            })
+            .run();
     } else {
         callback(new Error('Unsupported file type for preview'));
     }
 }
 
-// Функция получения длительности видео
-function getVideoDuration(videoPath, callback) {
-    ffmpeg.ffprobe(videoPath, (err, metadata) => {
-        if (err) {
-            console.error('❌ Ошибка получения длительности видео:', err);
-            return callback(err);
-        }
-        const duration = Math.round(metadata.format.duration || 0);
-        callback(null, duration);
-    });
-}
+/**
+ * Обновление статуса присутствия пользователя
+ */
+async function updateUserPresence(email, socketId, status = 'online') {
+    try {
+        const { error } = await supabase
+            .from('user_presence')
+            .upsert({
+                user_email: email.toLowerCase(),
+                socket_id: socketId,
+                server_id: SERVER_ID,
+                last_seen: new Date().toISOString(),
+                status: status
+            }, { 
+                onConflict: 'user_email' 
+            });
 
-// Функция перемещения файла
-function moveFileToPermanent(filename) {
-    const tempPath = path.join(tempDir, filename);
-    const permanentPath = path.join(permanentDir, filename);
-    
-    if (fs.existsSync(tempPath)) {
-        try {
-            fs.renameSync(tempPath, permanentPath);
-            console.log(`✅ Файл перемещен: ${filename} -> ${permanentPath}`);
-            return true;
-        } catch (error) {
-            console.error(`❌ Ошибка перемещения файла ${filename}:`, error);
-            return false;
-        }
-    } else {
-        console.error(`❌ Временный файл не найден: ${tempPath}`);
-        return false;
+        if (error) throw error;
+    } catch (error) {
+        console.error('❌ Ошибка обновления присутствия:', error);
     }
 }
 
-// Валидация имени канала Agora
-function isValidChannelName(channelName) {
-    const pattern = /^[a-zA-Z0-9!#$%&()+\-:;<=>.?@[\]^_{}|~]{1,64}$/;
-    return pattern.test(channelName) && channelName.length <= 64;
-}
-
-// Функции для работы с Supabase
-
-// Получение информации о пользователе
+/**
+ * Получение информации о пользователе по email
+ */
 async function getUserInfo(email) {
+    const normalizedEmail = email.toLowerCase();
+    
+    // Ищем в regular_users
     const { data: regularUser, error: regularError } = await supabase
         .from('regular_users')
         .select('*')
-        .eq('email', email.toLowerCase())
-        .single();
+        .eq('email', normalizedEmail)
+        .maybeSingle();
 
     if (regularUser) {
         return { ...regularUser, userType: 'regular' };
     }
 
+    // Ищем в beresta_users
     const { data: berestaUser, error: berestaError } = await supabase
         .from('beresta_users')
         .select('*')
-        .eq('email', email.toLowerCase())
-        .single();
+        .eq('email', normalizedEmail)
+        .maybeSingle();
 
     if (berestaUser) {
         return { ...berestaUser, userType: 'beresta' };
@@ -261,29 +268,28 @@ async function getUserInfo(email) {
     return null;
 }
 
-// Проверка существования пользователя
+/**
+ * Проверка существования пользователя
+ */
 async function userExists(email) {
     const user = await getUserInfo(email);
     return user !== null;
 }
 
-// Автоматическое добавление в чаты
+/**
+ * Автоматическое добавление в чаты при первом сообщении
+ */
 async function addToChatsAutomatically(user1, user2) {
     try {
-        const user1Info = await getUserInfo(user1);
-        const user2Info = await getUserInfo(user2);
-
-        if (!user1Info || !user2Info) {
-            console.log('⚠️ Один или оба пользователя не найдены');
-            return;
-        }
+        const user1Email = user1.toLowerCase();
+        const user2Email = user2.toLowerCase();
 
         // Добавляем запись для user1
         await supabase
             .from('friends')
             .upsert({ 
-                user_email: user1.toLowerCase(), 
-                friend_email: user2.toLowerCase() 
+                user_email: user1Email, 
+                friend_email: user2Email 
             }, { 
                 onConflict: 'user_email,friend_email',
                 ignoreDuplicates: true 
@@ -293,20 +299,239 @@ async function addToChatsAutomatically(user1, user2) {
         await supabase
             .from('friends')
             .upsert({ 
-                user_email: user2.toLowerCase(), 
-                friend_email: user1.toLowerCase() 
+                user_email: user2Email, 
+                friend_email: user1Email 
             }, { 
                 onConflict: 'user_email,friend_email',
                 ignoreDuplicates: true 
             });
 
-        console.log(`✅ Автоматически добавлены чаты: ${user1} ↔️ ${user2}`);
+        console.log(`✅ Автоматически добавлены чаты: ${user1Email} ↔️ ${user2Email}`);
     } catch (error) {
         console.error('❌ Ошибка автоматического добавления в чаты:', error);
     }
 }
 
-// Health check эндпоинт
+/**
+ * Очистка устаревших записей присутствия
+ */
+async function cleanupOldPresence() {
+    try {
+        const { error } = await supabase
+            .from('user_presence')
+            .delete()
+            .lt('last_seen', new Date(Date.now() - 60000).toISOString()); // старше 1 минуты
+
+        if (error) throw error;
+    } catch (error) {
+        console.error('❌ Ошибка очистки присутствия:', error);
+    }
+}
+
+// Запускаем очистку раз в минуту
+setInterval(cleanupOldPresence, 60000);
+
+function calculateDuration(startTime) {
+    const start = new Date(startTime);
+    const now = new Date();
+    const diff = Math.floor((now - start) / 1000);
+    const minutes = Math.floor(diff / 60);
+    const seconds = diff % 60;
+    return minutes + ':' + (seconds < 10 ? '0' + seconds : seconds);
+}
+
+function getTodayCallsCount() {
+    const today = new Date().toDateString();
+    let count = 0;
+    for (const [_, call] of callHistory) {
+        if (new Date(call.startTime || call.startedAt).toDateString() === today) {
+            count++;
+        }
+    }
+    return count;
+}
+
+// ==================== SOCKET.IO ОБРАБОТЧИКИ ====================
+io.on('connection', (socket) => {
+    console.log('👤 Пользователь подключился:', socket.id);
+    
+    users.set(socket.id, {
+        connectedAt: new Date().toISOString(),
+        socketId: socket.id
+    });
+
+    // Обработчик онлайн-статуса
+    socket.on('user_online', async (data) => {
+        try {
+            if (data && data.email) {
+                const email = data.email.toLowerCase();
+                socket.userEmail = email;
+                
+                // Сохраняем в Supabase
+                await updateUserPresence(email, socket.id, 'online');
+                
+                console.log(`👤 Пользователь онлайн: ${email} на сервере ${SERVER_ID}`);
+                
+                // Оповещаем всех о смене статуса
+                socket.broadcast.emit('user_status_changed', {
+                    email: email,
+                    status: 'online',
+                    timestamp: new Date().toISOString(),
+                    server: SERVER_ID
+                });
+
+                socket.emit('user_online_confirmed', {
+                    status: 'confirmed',
+                    email: email,
+                    serverId: SERVER_ID,
+                    timestamp: new Date().toISOString()
+                });
+            }
+        } catch (error) {
+            console.error('❌ Ошибка в user_online:', error);
+        }
+    });
+
+    // Обработчик пинга
+    socket.on('ping', (data) => {
+        socket.emit('pong', {
+            ...data,
+            serverTime: new Date().toISOString()
+        });
+    });
+
+    // Обработчик подключения к комнате звонка
+    socket.on('join-room', (data) => {
+        const roomId = data.roomId;
+        const userInfo = data.userInfo || {};
+        
+        console.log('📢 ' + socket.id + ' подключается к комнате звонка: ' + roomId);
+        
+        if (!rooms.has(roomId)) {
+            rooms.set(roomId, new Set());
+        }
+        
+        const room = rooms.get(roomId);
+        
+        if (room.size >= 2) {
+            console.log('❌ Комната ' + roomId + ' переполнена');
+            socket.emit('room-full');
+            return;
+        }
+        
+        room.add(socket.id);
+        socket.join(roomId);
+        
+        const userData = users.get(socket.id) || {};
+        users.set(socket.id, { ...userData, ...userInfo, roomId, joinedAt: new Date().toISOString() });
+        
+        if (!roomsInfo.has(roomId)) {
+            roomsInfo.set(roomId, {
+                name: roomId,
+                createdAt: new Date().toISOString(),
+                createdBy: socket.id,
+                type: userInfo?.type || 'video'
+            });
+        }
+        
+        console.log('✅ ' + socket.id + ' подключился к ' + roomId + '. Участников: ' + room.size);
+        
+        socket.emit('join-success', { roomId: roomId, participants: Array.from(room) });
+        
+        if (room.size > 1) {
+            io.to(roomId).emit('peer-joined', socket.id);
+        }
+        
+        io.emit('rooms-updated');
+    });
+
+    // Обработчики WebRTC сигнализации
+    socket.on('offer', (data) => {
+        console.log('📤 Оффер от ' + socket.id + ' к ' + data.target);
+        socket.to(data.target).emit('offer', {
+            offer: data.offer,
+            sender: socket.id
+        });
+    });
+
+    socket.on('answer', (data) => {
+        console.log('📤 Ответ от ' + socket.id + ' к ' + data.target);
+        socket.to(data.target).emit('answer', {
+            answer: data.answer,
+            sender: socket.id
+        });
+    });
+
+    socket.on('ice-candidate', (data) => {
+        console.log('📤 ICE кандидат от ' + socket.id + ' к ' + data.target);
+        socket.to(data.target).emit('ice-candidate', {
+            candidate: data.candidate,
+            sender: socket.id
+        });
+    });
+
+    socket.on('leave-room', (roomId) => {
+        handleDisconnect(socket, roomId);
+    });
+
+    // Обработчик отключения
+    socket.on('disconnect', async (reason) => {
+        console.log(`❌ WebSocket отключен: ${socket.id}, причина: ${reason}`);
+        
+        handleDisconnect(socket);
+        
+        if (socket.userEmail) {
+            // Помечаем как оффлайн в Supabase
+            await updateUserPresence(socket.userEmail, socket.id, 'offline');
+            
+            socket.broadcast.emit('user_status_changed', {
+                email: socket.userEmail,
+                status: 'offline',
+                timestamp: new Date().toISOString()
+            });
+        }
+    });
+
+    // Обработчик ошибок
+    socket.on('error', (error) => {
+        console.error('💥 WebSocket ошибка:', error);
+    });
+});
+
+function handleDisconnect(socket, specificRoom = null) {
+    let roomId = specificRoom;
+    
+    if (!roomId) {
+        for (const [rId, members] of rooms.entries()) {
+            if (members.has(socket.id)) {
+                roomId = rId;
+                break;
+            }
+        }
+    }
+    
+    if (roomId && rooms.has(roomId)) {
+        const room = rooms.get(roomId);
+        room.delete(socket.id);
+        
+        io.to(roomId).emit('peer-disconnected');
+        
+        // Если в комнате никого не осталось, удаляем информацию о ней
+        if (room.size === 0) {
+            rooms.delete(roomId);
+            roomsInfo.delete(roomId);
+        }
+        
+        console.log('👋 ' + socket.id + ' покинул комнату ' + roomId);
+    }
+    
+    users.delete(socket.id);
+    io.emit('rooms-updated');
+}
+
+// ==================== API ЭНДПОИНТЫ ====================
+
+// ===== Health check =====
 app.get('/health', async (req, res) => {
     try {
         // Проверка подключения к Supabase
@@ -314,66 +539,688 @@ app.get('/health', async (req, res) => {
         
         if (error) throw error;
         
+        // Получаем количество онлайн пользователей
+        const { count } = await supabase
+            .from('user_presence')
+            .select('*', { count: 'exact', head: true })
+            .eq('status', 'online')
+            .gte('last_seen', new Date(Date.now() - 30000).toISOString());
+
         // Проверка доступности директорий
         const dirs = [uploadDir, tempDir, permanentDir, thumbnailsDir];
         const dirStatus = {};
         dirs.forEach(dir => {
-            dirStatus[dir] = fs.existsSync(dir);
+            dirStatus[path.basename(dir)] = fs.existsSync(dir);
         });
-        
-        const stats = {
-            activeUsers: activeUsers.size,
-            activeCalls: activeCalls.size,
-            pendingCalls: pendingCalls.size,
-            timestamp: new Date().toISOString(),
+
+        res.json({
+            success: true,
+            status: 'Server is running optimally',
+            serverId: SERVER_ID,
+            stats: {
+                activeRooms: rooms.size,
+                totalUsers: users.size,
+                activeCalls: activeCalls.size,
+                onlineUsers: count || 0,
+                totalCallsToday: getTodayCallsCount()
+            },
             uptime: process.uptime(),
             memory: process.memoryUsage(),
-            database: 'Supabase',
-            databaseUrl: supabaseUrl,
-            directories: dirStatus
-        };
-        
-        res.json({ 
-            success: true, 
-            status: 'Server is running optimally',
-            ...stats
+            directories: dirStatus,
+            timestamp: new Date().toISOString()
         });
     } catch (error) {
         console.error('❌ Health check failed:', error);
-        res.status(500).json({ 
-            success: false, 
+        res.status(500).json({
+            success: false,
             error: 'Health check failed',
-            details: error.message 
+            details: error.message
         });
     }
 });
 
-// Регистрация обычного пользователя
+// ===== Статус сервера =====
+app.get('/api/status', (req, res) => {
+    res.json({
+        status: 'online',
+        timestamp: new Date().toISOString(),
+        serverId: SERVER_ID,
+        stats: {
+            activeRooms: rooms.size,
+            totalUsers: users.size,
+            activeCalls: activeCalls.size,
+            totalCallsToday: getTodayCallsCount()
+        }
+    });
+});
+
+// ===== Список всех комнат =====
+app.get('/api/rooms', (req, res) => {
+    const roomsList = [];
+    for (const [roomId, participants] of rooms.entries()) {
+        roomsList.push({
+            roomId: roomId,
+            participants: participants.size,
+            participantsList: Array.from(participants).map(socketId => ({
+                socketId,
+                userInfo: users.get(socketId) || { name: 'Аноним', type: 'unknown' }
+            })),
+            roomInfo: roomsInfo.get(roomId) || {
+                name: roomId,
+                createdAt: new Date().toISOString()
+            }
+        });
+    }
+    res.json({
+        total: roomsList.length,
+        rooms: roomsList
+    });
+});
+
+// ===== Информация о конкретной комнате =====
+app.get('/api/rooms/:roomId', (req, res) => {
+    const { roomId } = req.params;
+    const participants = rooms.get(roomId);
+    
+    if (!participants) {
+        return res.status(404).json({ error: 'Комната не найдена' });
+    }
+    
+    res.json({
+        roomId,
+        participants: participants.size,
+        participantsList: Array.from(participants).map(socketId => ({
+            socketId,
+            userInfo: users.get(socketId) || { name: 'Аноним', type: 'unknown' }
+        })),
+        roomInfo: roomsInfo.get(roomId) || {
+            name: roomId,
+            createdAt: new Date().toISOString()
+        }
+    });
+});
+
+// ===== Создать комнату (через API) =====
+app.post('/api/rooms', (req, res) => {
+    const { roomId, roomName, createdBy, type = 'video' } = req.body;
+    
+    if (!roomId) {
+        return res.status(400).json({ error: 'roomId обязателен' });
+    }
+    
+    if (rooms.has(roomId)) {
+        return res.status(409).json({ error: 'Комната уже существует' });
+    }
+    
+    rooms.set(roomId, new Set());
+    roomsInfo.set(roomId, {
+        name: roomName || roomId,
+        createdBy: createdBy || 'system',
+        createdAt: new Date().toISOString(),
+        type: type,
+        settings: req.body.settings || {}
+    });
+    
+    res.status(201).json({
+        success: true,
+        roomId,
+        message: 'Комната создана',
+        roomInfo: roomsInfo.get(roomId)
+    });
+});
+
+// ===== Обновить информацию о комнате =====
+app.put('/api/rooms/:roomId', (req, res) => {
+    const { roomId } = req.params;
+    const updates = req.body;
+    
+    if (!rooms.has(roomId)) {
+        return res.status(404).json({ error: 'Комната не найдена' });
+    }
+    
+    const currentInfo = roomsInfo.get(roomId) || {};
+    roomsInfo.set(roomId, { ...currentInfo, ...updates, updatedAt: new Date().toISOString() });
+    
+    io.to(roomId).emit('room-updated', roomsInfo.get(roomId));
+    
+    res.json({
+        success: true,
+        roomId,
+        roomInfo: roomsInfo.get(roomId)
+    });
+});
+
+// ===== Удалить комнату =====
+app.delete('/api/rooms/:roomId', (req, res) => {
+    const { roomId } = req.params;
+    
+    if (!rooms.has(roomId)) {
+        return res.status(404).json({ error: 'Комната не найдена' });
+    }
+    
+    io.to(roomId).emit('room-closed', { roomId, reason: 'Комната закрыта администратором' });
+    
+    rooms.delete(roomId);
+    roomsInfo.delete(roomId);
+    
+    res.json({
+        success: true,
+        message: 'Комната удалена'
+    });
+});
+
+// ===== Информация о пользователе по socketId =====
+app.get('/api/users/:socketId', (req, res) => {
+    const { socketId } = req.params;
+    const userInfo = users.get(socketId);
+    
+    if (!userInfo) {
+        return res.status(404).json({ error: 'Пользователь не найден' });
+    }
+    
+    res.json(userInfo);
+});
+
+// ===== Обновить информацию о пользователе =====
+app.put('/api/users/:socketId', (req, res) => {
+    const { socketId } = req.params;
+    const updates = req.body;
+    
+    const currentInfo = users.get(socketId) || {};
+    users.set(socketId, { ...currentInfo, ...updates, updatedAt: new Date().toISOString() });
+    
+    res.json({
+        success: true,
+        userInfo: users.get(socketId)
+    });
+});
+
+// ===== История звонков =====
+app.get('/api/calls/history', (req, res) => {
+    const { limit = 50, roomId } = req.query;
+    let history = Array.from(callHistory.values());
+    
+    if (roomId) {
+        history = history.filter(call => call.roomId === roomId);
+    }
+    
+    history.sort((a, b) => new Date(b.startTime || b.startedAt) - new Date(a.startTime || a.startedAt));
+    history = history.slice(0, parseInt(limit));
+    
+    res.json({
+        total: history.length,
+        calls: history
+    });
+});
+
+// ===== Активные звонки =====
+app.get('/api/calls/active', (req, res) => {
+    const active = Array.from(activeCalls.values());
+    res.json({
+        total: active.length,
+        calls: active
+    });
+});
+
+// ===== Инициировать звонок через API =====
+app.post('/api/calls/start', (req, res) => {
+    const { roomId, callerId, calleeId, type = 'video' } = req.body;
+    
+    if (!roomId || !callerId) {
+        return res.status(400).json({ error: 'roomId и callerId обязательны' });
+    }
+    
+    const callId = 'call_' + Date.now() + '_' + Math.random().toString(36).substr(2, 9);
+    const callInfo = {
+        callId,
+        roomId,
+        callerId,
+        calleeId: calleeId || null,
+        type,
+        startTime: new Date().toISOString(),
+        status: 'initiated',
+        participants: [callerId]
+    };
+    
+    activeCalls.set(callId, callInfo);
+    
+    if (calleeId) {
+        io.to(calleeId).emit('incoming-call', callInfo);
+    }
+    
+    res.status(201).json(callInfo);
+});
+
+// ===== Завершить звонок через API =====
+app.post('/api/calls/end/:callId', (req, res) => {
+    const { callId } = req.params;
+    const { endedBy } = req.body;
+    
+    const call = activeCalls.get(callId);
+    if (!call) {
+        return res.status(404).json({ error: 'Звонок не найден' });
+    }
+    
+    const endedCall = {
+        ...call,
+        endedBy: endedBy || 'system',
+        endTime: new Date().toISOString(),
+        status: 'ended',
+        duration: calculateDuration(call.startTime || call.startedAt)
+    };
+    
+    activeCalls.delete(callId);
+    
+    const historyId = 'hist_' + Date.now();
+    callHistory.set(historyId, endedCall);
+    
+    if (call.participants) {
+        call.participants.forEach(participantId => {
+            io.to(participantId).emit('call-ended', endedCall);
+        });
+    }
+    
+    res.json(endedCall);
+});
+
+// ===== Статистика =====
+app.get('/api/stats', (req, res) => {
+    const stats = {
+        timestamp: new Date().toISOString(),
+        server: {
+            id: SERVER_ID,
+            uptime: process.uptime(),
+            memory: process.memoryUsage(),
+            nodeVersion: process.version
+        },
+        rooms: {
+            total: rooms.size,
+            details: Array.from(rooms.entries()).map(([id, participants]) => ({
+                id,
+                participants: participants.size
+            }))
+        },
+        users: {
+            total: users.size,
+            online: io.engine.clientsCount
+        },
+        calls: {
+            active: activeCalls.size,
+            totalToday: getTodayCallsCount()
+        }
+    };
+    
+    res.json(stats);
+});
+
+// ===== Webhook для внешних сервисов =====
+app.post('/api/webhook/:event', (req, res) => {
+    const { event } = req.params;
+    const data = req.body;
+    
+    console.log('📡 Webhook получен: ' + event, data);
+    
+    res.json({
+        success: true,
+        event,
+        received: data,
+        timestamp: new Date().toISOString()
+    });
+});
+
+// ===== НОВЫЕ ЭНДПОИНТЫ ДЛЯ ЗВОНКОВ (ПРОСТАЯ РЕАЛИЗАЦИЯ) =====
+
+/**
+ * Инициирование звонка (простая версия)
+ */
+app.post('/api/calls/initiate', async (req, res) => {
+    try {
+        const { callerEmail, receiverEmail, callType } = req.body;
+        
+        if (!callerEmail || !receiverEmail) {
+            return res.status(400).json({
+                success: false,
+                error: 'Email звонящего и получателя обязательны'
+            });
+        }
+        
+        console.log(`📞 Инициирование звонка: ${callerEmail} -> ${receiverEmail}`);
+        
+        // Генерируем уникальный ID комнаты
+        const roomId = `call_${Date.now()}_${Math.random().toString(36).substring(2, 10)}`;
+        
+        // Создаем запись о звонке
+        const callData = {
+            roomId,
+            caller: callerEmail,
+            receiver: receiverEmail,
+            type: callType || 'audio',
+            status: 'ringing',
+            startedAt: new Date().toISOString(),
+            participants: [callerEmail]
+        };
+        
+        // Сохраняем в Map
+        activeCalls.set(roomId, callData);
+        
+        // Отправляем уведомление получателю через Socket.IO
+        io.emit(`call:${receiverEmail}`, {
+            type: 'incoming-call',
+            roomId: roomId,
+            caller: callerEmail,
+            callType: callType || 'audio',
+            timestamp: new Date().toISOString()
+        });
+        
+        console.log(`✅ Звонок инициирован, комната: ${roomId}`);
+        
+        res.json({
+            success: true,
+            roomId: roomId,
+            message: 'Звонок инициирован'
+        });
+        
+    } catch (error) {
+        console.error('❌ Ошибка инициации звонка:', error);
+        res.status(500).json({
+            success: false,
+            error: error.message
+        });
+    }
+});
+
+/**
+ * Принять звонок
+ */
+app.post('/api/calls/accept', async (req, res) => {
+    try {
+        const { roomId, userEmail } = req.body;
+        
+        if (!roomId || !userEmail) {
+            return res.status(400).json({
+                success: false,
+                error: 'ID комнаты и email обязательны'
+            });
+        }
+        
+        // Получаем информацию о звонке
+        const callData = activeCalls.get(roomId);
+        
+        if (!callData) {
+            return res.status(404).json({
+                success: false,
+                error: 'Звонок не найден'
+            });
+        }
+        
+        // Проверяем, что принимает именно тот, кому звонят
+        if (callData.receiver !== userEmail) {
+            return res.status(403).json({
+                success: false,
+                error: 'Вы не можете принять этот звонок'
+            });
+        }
+        
+        // Обновляем статус
+        callData.status = 'connected';
+        callData.participants.push(userEmail);
+        callData.answeredAt = new Date().toISOString();
+        activeCalls.set(roomId, callData);
+        
+        // Уведомляем звонящего, что звонок принят
+        io.emit(`call:${callData.caller}`, {
+            type: 'call-accepted',
+            roomId: roomId,
+            receiver: userEmail,
+            timestamp: new Date().toISOString()
+        });
+        
+        console.log(`✅ Звонок ${roomId} принят пользователем ${userEmail}`);
+        
+        res.json({
+            success: true,
+            roomId: roomId,
+            callData: callData
+        });
+        
+    } catch (error) {
+        console.error('❌ Ошибка принятия звонка:', error);
+        res.status(500).json({
+            success: false,
+            error: error.message
+        });
+    }
+});
+
+/**
+ * Отклонить звонок
+ */
+app.post('/api/calls/reject', async (req, res) => {
+    try {
+        const { roomId, userEmail } = req.body;
+        
+        if (!roomId || !userEmail) {
+            return res.status(400).json({
+                success: false,
+                error: 'ID комнаты и email обязательны'
+            });
+        }
+        
+        const callData = activeCalls.get(roomId);
+        
+        if (callData) {
+            // Уведомляем звонящего об отказе
+            io.emit(`call:${callData.caller}`, {
+                type: 'call-rejected',
+                roomId: roomId,
+                receiver: userEmail,
+                timestamp: new Date().toISOString()
+            });
+            
+            // Удаляем звонок
+            activeCalls.delete(roomId);
+        }
+        
+        console.log(`❌ Звонок ${roomId} отклонен пользователем ${userEmail}`);
+        
+        res.json({
+            success: true,
+            message: 'Звонок отклонен'
+        });
+        
+    } catch (error) {
+        console.error('❌ Ошибка отклонения звонка:', error);
+        res.status(500).json({
+            success: false,
+            error: error.message
+        });
+    }
+});
+
+/**
+ * Завершить звонок
+ */
+app.post('/api/calls/end', async (req, res) => {
+    try {
+        const { roomId, userEmail } = req.body;
+        
+        if (!roomId) {
+            return res.status(400).json({
+                success: false,
+                error: 'ID комнаты обязателен'
+            });
+        }
+        
+        const callData = activeCalls.get(roomId);
+        
+        if (callData) {
+            // Уведомляем всех участников о завершении
+            callData.participants.forEach(email => {
+                if (email !== userEmail) {
+                    io.emit(`call:${email}`, {
+                        type: 'call-ended',
+                        roomId: roomId,
+                        endedBy: userEmail,
+                        timestamp: new Date().toISOString()
+                    });
+                }
+            });
+            
+            // Сохраняем в историю
+            const endedCall = {
+                ...callData,
+                endedBy: userEmail || 'system',
+                endTime: new Date().toISOString(),
+                status: 'ended',
+                duration: calculateDuration(callData.startedAt)
+            };
+            
+            const historyId = 'hist_' + Date.now();
+            callHistory.set(historyId, endedCall);
+            
+            // Удаляем из активных
+            activeCalls.delete(roomId);
+        }
+        
+        console.log(`📴 Звонок ${roomId} завершен пользователем ${userEmail || 'system'}`);
+        
+        res.json({
+            success: true,
+            message: 'Звонок завершен'
+        });
+        
+    } catch (error) {
+        console.error('❌ Ошибка завершения звонка:', error);
+        res.status(500).json({
+            success: false,
+            error: error.message
+        });
+    }
+});
+
+/**
+ * Получить информацию о звонке
+ */
+app.get('/api/calls/:roomId', async (req, res) => {
+    try {
+        const { roomId } = req.params;
+        
+        const callData = activeCalls.get(roomId);
+        
+        if (!callData) {
+            return res.status(404).json({
+                success: false,
+                error: 'Звонок не найден'
+            });
+        }
+        
+        res.json({
+            success: true,
+            call: callData
+        });
+        
+    } catch (error) {
+        console.error('❌ Ошибка получения информации о звонке:', error);
+        res.status(500).json({
+            success: false,
+            error: error.message
+        });
+    }
+});
+
+/**
+ * Получить активные звонки пользователя
+ */
+app.get('/api/calls/user/:email', async (req, res) => {
+    try {
+        const { email } = req.params;
+        
+        const userCalls = [];
+        
+        for (const [roomId, callData] of activeCalls.entries()) {
+            if (callData.caller === email || callData.receiver === email || 
+                (callData.participants && callData.participants.includes(email))) {
+                userCalls.push({
+                    roomId,
+                    ...callData
+                });
+            }
+        }
+        
+        res.json({
+            success: true,
+            calls: userCalls
+        });
+        
+    } catch (error) {
+        console.error('❌ Ошибка получения звонков пользователя:', error);
+        res.status(500).json({
+            success: false,
+            error: error.message
+        });
+    }
+});
+
+/**
+ * Проверить, свободен ли пользователь (не в звонке)
+ */
+app.get('/api/calls/check-availability/:email', async (req, res) => {
+    try {
+        const { email } = req.params;
+        
+        let isInCall = false;
+        
+        for (const callData of activeCalls.values()) {
+            if (callData.status === 'connected' && 
+                (callData.caller === email || callData.receiver === email || 
+                 (callData.participants && callData.participants.includes(email)))) {
+                isInCall = true;
+                break;
+            }
+        }
+        
+        res.json({
+            success: true,
+            email: email,
+            available: !isInCall,
+            inCall: isInCall
+        });
+        
+    } catch (error) {
+        console.error('❌ Ошибка проверки доступности:', error);
+        res.status(500).json({
+            success: false,
+            error: error.message
+        });
+    }
+});
+
+// ===== Регистрация обычного пользователя =====
 app.post('/register', async (req, res) => {
     try {
         const { email, firstName, lastName } = req.body;
 
         if (!email || !firstName || !lastName) {
-            return res.status(400).json({ 
-                success: false, 
-                error: 'Все поля обязательны' 
+            return res.status(400).json({
+                success: false,
+                error: 'Все поля обязательны'
             });
         }
 
         const exists = await userExists(email);
         if (exists) {
-            return res.status(409).json({ 
-                success: false, 
-                error: 'Пользователь уже существует' 
+            return res.status(409).json({
+                success: false,
+                error: 'Пользователь уже существует'
             });
         }
 
         const { data, error } = await supabase
             .from('regular_users')
-            .insert([{ 
-                email: email.toLowerCase(), 
-                first_name: firstName, 
-                last_name: lastName 
+            .insert([{
+                email: email.toLowerCase(),
+                first_name: firstName,
+                last_name: lastName
             }])
             .select();
 
@@ -384,40 +1231,39 @@ app.post('/register', async (req, res) => {
             message: 'Пользователь успешно зарегистрирован',
             userId: data[0].id
         });
-
     } catch (error) {
         console.error('❌ Ошибка регистрации:', error);
         res.status(500).json({ success: false, error: 'Internal server error' });
     }
 });
 
-// Регистрация Beresta ID пользователя
+// ===== Регистрация Beresta ID пользователя =====
 app.post('/register-beresta', async (req, res) => {
     try {
         const { email, firstName, lastName, berestaId } = req.body;
 
         if (!email || !firstName || !lastName || !berestaId) {
-            return res.status(400).json({ 
-                success: false, 
-                error: 'Все поля обязательны' 
+            return res.status(400).json({
+                success: false,
+                error: 'Все поля обязательны'
             });
         }
 
         const exists = await userExists(email);
         if (exists) {
-            return res.status(409).json({ 
-                success: false, 
-                error: 'Пользователь уже существует' 
+            return res.status(409).json({
+                success: false,
+                error: 'Пользователь уже существует'
             });
         }
 
         const { data, error } = await supabase
             .from('beresta_users')
-            .insert([{ 
-                email: email.toLowerCase(), 
-                first_name: firstName, 
+            .insert([{
+                email: email.toLowerCase(),
+                first_name: firstName,
                 last_name: lastName,
-                beresta_id: berestaId 
+                beresta_id: berestaId
             }])
             .select();
 
@@ -428,27 +1274,22 @@ app.post('/register-beresta', async (req, res) => {
             message: 'Beresta ID пользователь зарегистрирован',
             userId: data[0].id
         });
-
     } catch (error) {
         console.error('❌ Ошибка регистрации Beresta ID:', error);
         res.status(500).json({ success: false, error: 'Internal server error' });
     }
 });
 
-// Получение всех пользователей
+// ===== Получение всех пользователей =====
 app.get('/users', async (req, res) => {
     try {
-        const { data: regularUsers, error: regularError } = await supabase
-            .from('regular_users')
-            .select('email, first_name, last_name')
-            .order('first_name');
+        const [regularResult, berestaResult] = await Promise.all([
+            supabase.from('regular_users').select('email, first_name, last_name').order('first_name'),
+            supabase.from('beresta_users').select('email, first_name, last_name, beresta_id').order('first_name')
+        ]);
 
-        const { data: berestaUsers, error: berestaError } = await supabase
-            .from('beresta_users')
-            .select('email, first_name, last_name')
-            .order('first_name');
-
-        if (regularError || berestaError) throw regularError || berestaError;
+        const regularUsers = regularResult.data || [];
+        const berestaUsers = berestaResult.data || [];
 
         const allUsers = [
             ...regularUsers.map(u => ({ ...u, userType: 'regular' })),
@@ -465,156 +1306,63 @@ app.get('/users', async (req, res) => {
     }
 });
 
-// Получение информации о пользователе
+// ===== Получение информации о пользователе =====
 app.get('/user/:email', async (req, res) => {
     try {
         const email = decodeURIComponent(req.params.email).toLowerCase();
+        console.log('🔍 Поиск пользователя по email:', email);
+
         const user = await getUserInfo(email);
 
         if (!user) {
-            return res.status(404).json({ success: false, error: 'Пользователь не найден' });
+            return res.status(404).json({
+                success: false,
+                error: 'Пользователь не найден'
+            });
         }
 
         res.json({
             success: true,
-            user: {
-                email: user.email,
-                firstName: user.first_name,
-                lastName: user.last_name,
-                avatarFilename: user.avatar_filename || '',
-                userType: user.userType,
-                berestaId: user.beresta_id
-            }
+            user
         });
-
     } catch (error) {
         console.error('❌ Ошибка получения пользователя:', error);
-        res.status(500).json({ success: false, error: 'Internal server error' });
-    }
-});
-
-// Добавление в друзья
-app.post('/add-friend', async (req, res) => {
-    try {
-        const { userEmail, friendEmail } = req.body;
-
-        console.log('🔄 Добавление друга:', { userEmail, friendEmail });
-
-        if (!userEmail || !friendEmail) {
-            return res.status(400).json({ success: false, error: 'Email обязательны' });
-        }
-
-        const normalizedUserEmail = userEmail.toLowerCase().trim();
-        const normalizedFriendEmail = friendEmail.toLowerCase().trim();
-
-        if (normalizedUserEmail === normalizedFriendEmail) {
-            return res.status(400).json({ 
-                success: false, 
-                error: 'Нельзя добавить самого себя' 
-            });
-        }
-
-        const userExistsCheck = await userExists(normalizedUserEmail);
-        const friendExistsCheck = await userExists(normalizedFriendEmail);
-
-        if (!userExistsCheck || !friendExistsCheck) {
-            return res.status(404).json({ 
-                success: false, 
-                error: 'Пользователи не найдены' 
-            });
-        }
-
-        // Добавляем для первого пользователя
-        const { error: error1 } = await supabase
-            .from('friends')
-            .upsert({ 
-                user_email: normalizedUserEmail, 
-                friend_email: normalizedFriendEmail 
-            }, { 
-                onConflict: 'user_email,friend_email',
-                ignoreDuplicates: true 
-            });
-
-        // Добавляем для второго пользователя
-        const { error: error2 } = await supabase
-            .from('friends')
-            .upsert({ 
-                user_email: normalizedFriendEmail, 
-                friend_email: normalizedUserEmail 
-            }, { 
-                onConflict: 'user_email,friend_email',
-                ignoreDuplicates: true 
-            });
-
-        if (error1 || error2) throw error1 || error2;
-
-        res.json({
-            success: true,
-            message: 'Друг добавлен',
-            inserted: true
-        });
-
-    } catch (error) {
-        console.error('❌ Ошибка добавления друга:', error);
-        res.status(500).json({ 
-            success: false, 
+        res.status(500).json({
+            success: false,
             error: 'Internal server error',
-            details: error.message 
+            details: error.message
         });
     }
 });
 
-// Удаление из друзей
-app.post('/remove-friend', async (req, res) => {
-    try {
-        const { userEmail, friendEmail } = req.body;
-
-        if (!userEmail || !friendEmail) {
-            return res.status(400).json({ success: false, error: 'Email обязательны' });
-        }
-
-        const { error } = await supabase
-            .from('friends')
-            .delete()
-            .eq('user_email', userEmail.toLowerCase())
-            .eq('friend_email', friendEmail.toLowerCase());
-
-        if (error) throw error;
-
-        res.json({
-            success: true,
-            message: 'Друг удален'
-        });
-
-    } catch (error) {
-        console.error('❌ Ошибка удаления друга:', error);
-        res.status(500).json({ success: false, error: 'Internal server error' });
-    }
-});
-
-// Получение чатов пользователя
+// ===== Получение чатов пользователя =====
 app.get('/chats/:userEmail', async (req, res) => {
     try {
         const userEmail = req.params.userEmail.toLowerCase();
 
         console.log('🔄 Получение чатов для:', userEmail);
 
-        const { data: friends, error } = await supabase
+        // Получаем всех друзей пользователя
+        const { data: friends, error: friendsError } = await supabase
             .from('friends')
-            .select(`
-                friend_email,
-                regular_users!friends_friend_email_fkey (first_name, last_name),
-                beresta_users!friends_friend_email_fkey (first_name, last_name)
-            `)
+            .select('friend_email, created_at')
             .eq('user_email', userEmail);
 
-        if (error) throw error;
+        if (friendsError) throw friendsError;
 
-        // Получаем последние сообщения для каждого чата
-        const chats = await Promise.all(friends.map(async (f) => {
-            const friendEmail = f.friend_email;
-            const userData = f.regular_users || f.beresta_users;
-            
+        if (!friends || friends.length === 0) {
+            return res.json({
+                success: true,
+                chats: []
+            });
+        }
+
+        // Получаем информацию о каждом друге и последнее сообщение
+        const chats = await Promise.all(friends.map(async (friend) => {
+            const friendEmail = friend.friend_email;
+            const friendInfo = await getUserInfo(friendEmail);
+
+            // Получаем последнее сообщение
             const { data: messages, error: msgError } = await supabase
                 .from('messages')
                 .select('timestamp')
@@ -622,14 +1370,14 @@ app.get('/chats/:userEmail', async (req, res) => {
                 .order('timestamp', { ascending: false })
                 .limit(1);
 
-            if (msgError) throw msgError;
+            if (msgError) console.error(`❌ Ошибка получения сообщений для ${friendEmail}:`, msgError);
 
             return {
                 contactEmail: friendEmail,
-                firstName: userData?.first_name || '',
-                lastName: userData?.last_name || '',
+                firstName: friendInfo?.first_name || '',
+                lastName: friendInfo?.last_name || '',
                 type: 'friend',
-                lastMessageTime: messages?.[0]?.timestamp || f.created_at
+                lastMessageTime: messages?.[0]?.timestamp || friend.created_at || new Date().toISOString()
             };
         }));
 
@@ -640,15 +1388,19 @@ app.get('/chats/:userEmail', async (req, res) => {
 
         res.json({
             success: true,
-            chats: chats
+            chats
         });
     } catch (error) {
         console.error('❌ Ошибка получения чатов:', error);
-        res.status(500).json({ success: false, error: 'Internal server error' });
+        res.status(500).json({
+            success: false,
+            error: 'Internal server error',
+            details: error.message
+        });
     }
 });
 
-// Получение сообщений
+// ===== Получение сообщений между двумя пользователями =====
 app.get('/messages/:userEmail/:friendEmail', async (req, res) => {
     try {
         const userEmail = req.params.userEmail.toLowerCase();
@@ -664,7 +1416,7 @@ app.get('/messages/:userEmail/:friendEmail', async (req, res) => {
 
         res.json({
             success: true,
-            messages: data
+            messages: data || []
         });
     } catch (error) {
         console.error('❌ Ошибка получения сообщений:', error);
@@ -672,20 +1424,26 @@ app.get('/messages/:userEmail/:friendEmail', async (req, res) => {
     }
 });
 
-// Отправка текстового сообщения
+// ===== Отправка текстового сообщения =====
 app.post('/send-message', async (req, res) => {
     try {
         const { senderEmail, receiverEmail, message, duration } = req.body;
 
         if (!senderEmail || !receiverEmail) {
-            return res.status(400).json({ success: false, error: 'Email обязательны' });
+            return res.status(400).json({
+                success: false,
+                error: 'Email обязательны'
+            });
         }
 
         const senderInfo = await getUserInfo(senderEmail);
         const receiverInfo = await getUserInfo(receiverEmail);
 
         if (!senderInfo || !receiverInfo) {
-            return res.status(404).json({ success: false, error: 'Пользователь не найден' });
+            return res.status(404).json({
+                success: false,
+                error: 'Пользователь не найден'
+            });
         }
 
         const { data, error } = await supabase
@@ -700,98 +1458,27 @@ app.post('/send-message', async (req, res) => {
 
         if (error) throw error;
 
+        // Автоматически добавляем в чаты
+        await addToChatsAutomatically(senderEmail, receiverEmail);
+
         res.json({
             success: true,
             messageId: data[0].id
         });
-
-        addToChatsAutomatically(senderEmail, receiverEmail);
-
     } catch (error) {
         console.error('❌ Ошибка отправки сообщения:', error);
         res.status(500).json({ success: false, error: 'Internal server error' });
     }
 });
 
-// Принять звонок
-app.post('/accept-call', async (req, res) => {
-    try {
-        const { channelName, receiverEmail } = req.body;
-
-        if (!channelName || !receiverEmail) {
-            return res.status(400).json({ 
-                success: false, 
-                error: 'channelName и receiverEmail обязательны' 
-            });
-        }
-
-        pendingCalls.delete(receiverEmail.toLowerCase());
-
-        const { error } = await supabase
-            .from('agora_calls')
-            .update({ status: 'accepted' })
-            .eq('channel_name', channelName);
-
-        if (error) throw error;
-
-        console.log(`✅ Звонок принят: ${channelName} пользователем ${receiverEmail}`);
-
-        res.json({
-            success: true,
-            message: 'Call accepted',
-            channelName: channelName
-        });
-
-    } catch (error) {
-        console.error('❌ Ошибка принятия звонка:', error);
-        res.status(500).json({ 
-            success: false, 
-            error: 'Internal server error' 
-        });
-    }
-});
-
-// Загрузка файла
-app.post('/upload-file', upload.single('file'), async (req, res) => {
-    try {
-        if (!req.file) {
-            return res.status(400).json({ success: false, error: 'Файл не загружен' });
-        }
-
-        const fileType = getFileType(req.file.mimetype, req.file.originalname);
-        const fileUrl = `/uploads/permanent/${req.file.filename}`;
-
-        if (moveFileToPermanent(req.file.filename)) {
-            res.json({
-                success: true,
-                filename: req.file.filename,
-                originalName: req.file.originalname,
-                fileUrl: fileUrl,
-                fileType: fileType,
-                size: req.file.size,
-                mimeType: req.file.mimetype
-            });
-        } else {
-            fs.unlinkSync(req.file.path);
-            res.status(500).json({ success: false, error: 'Ошибка сохранения файла' });
-        }
-    } catch (error) {
-        console.error('❌ Ошибка загрузки файла:', error);
-        if (req.file && fs.existsSync(req.file.path)) {
-            fs.unlinkSync(req.file.path);
-        }
-        res.status(500).json({ success: false, error: 'Internal server error' });
-    }
-});
-
-// Загрузка файла с сообщением
+// ===== Загрузка файла с сообщением =====
 app.post('/upload', upload.single('file'), async (req, res) => {
     try {
         if (!req.file) {
             return res.status(400).json({ success: false, error: 'Файл не загружен' });
         }
 
-        const { senderEmail, receiverEmail, duration, message } = req.body;
+        const { senderEmail, receiverEmail, message } = req.body;
 
         if (!senderEmail || !receiverEmail) {
             fs.unlinkSync(req.file.path);
@@ -808,8 +1495,9 @@ app.post('/upload', upload.single('file'), async (req, res) => {
 
         const fileType = getFileType(req.file.mimetype, req.file.originalname);
         let thumbnailFilename = '';
-        let videoDuration = duration || 0;
+        let videoDuration = 0;
 
+        // Функция завершения загрузки
         const completeFileUpload = async (thumbnail = '') => {
             try {
                 const { data, error } = await supabase
@@ -831,26 +1519,30 @@ app.post('/upload', upload.single('file'), async (req, res) => {
                 if (error) throw error;
 
                 if (moveFileToPermanent(req.file.filename)) {
+                    await addToChatsAutomatically(senderEmail, receiverEmail);
+                    
                     res.json({
                         success: true,
                         messageId: data[0].id,
                         filename: req.file.filename,
-                        thumbnail: thumbnail
+                        thumbnail: thumbnail,
+                        fileType: fileType
                     });
-
-                    addToChatsAutomatically(senderEmail, receiverEmail);
                 } else {
                     throw new Error('Ошибка перемещения файла');
                 }
             } catch (error) {
+                // Очистка при ошибке
                 fs.unlinkSync(req.file.path);
                 if (thumbnail) {
-                    fs.unlinkSync(path.join(thumbnailsDir, thumbnail));
+                    const thumbPath = path.join(thumbnailsDir, thumbnail);
+                    if (fs.existsSync(thumbPath)) fs.unlinkSync(thumbPath);
                 }
                 throw error;
             }
         };
 
+        // Создаем превью для видео и изображений
         if (fileType === 'image' || fileType === 'video') {
             const previewName = `preview_${path.parse(req.file.filename).name}.jpg`;
             const previewPath = path.join(thumbnailsDir, previewName);
@@ -882,87 +1574,45 @@ app.post('/upload', upload.single('file'), async (req, res) => {
     }
 });
 
-// Отправка сообщения с информацией о файле
-app.post('/send-message-with-attachment', async (req, res) => {
+// ===== Загрузка файла (без сообщения) =====
+app.post('/upload-file', upload.single('file'), async (req, res) => {
     try {
-        const { senderEmail, receiverEmail, message, attachmentType, 
-                attachmentFilename, attachmentOriginalName, attachmentUrl } = req.body;
-
-        if (!senderEmail || !receiverEmail) {
-            return res.status(400).json({ success: false, error: 'Email обязательны' });
+        if (!req.file) {
+            return res.status(400).json({ success: false, error: 'Файл не загружен' });
         }
 
-        const senderInfo = await getUserInfo(senderEmail);
-        const receiverInfo = await getUserInfo(receiverEmail);
+        const fileType = getFileType(req.file.mimetype, req.file.originalname);
 
-        if (!senderInfo || !receiverInfo) {
-            return res.status(404).json({ success: false, error: 'Пользователь не найден' });
+        if (moveFileToPermanent(req.file.filename)) {
+            res.json({
+                success: true,
+                filename: req.file.filename,
+                originalName: req.file.originalname,
+                fileType: fileType,
+                size: req.file.size,
+                mimeType: req.file.mimetype
+            });
+        } else {
+            fs.unlinkSync(req.file.path);
+            res.status(500).json({ success: false, error: 'Ошибка сохранения файла' });
         }
-
-        const { data, error } = await supabase
-            .from('messages')
-            .insert([{
-                sender_email: senderEmail.toLowerCase(),
-                receiver_email: receiverEmail.toLowerCase(),
-                message: message || '',
-                attachment_type: attachmentType || '',
-                attachment_filename: attachmentFilename || '',
-                attachment_original_name: attachmentOriginalName || '',
-                attachment_url: attachmentUrl || ''
-            }])
-            .select();
-
-        if (error) throw error;
-
-        res.json({
-            success: true,
-            messageId: data[0].id
-        });
-
-        addToChatsAutomatically(senderEmail, receiverEmail);
-
     } catch (error) {
-        console.error('❌ Ошибка отправки сообщения с вложением:', error);
+        console.error('❌ Ошибка загрузки файла:', error);
+        if (req.file && fs.existsSync(req.file.path)) {
+            fs.unlinkSync(req.file.path);
+        }
         res.status(500).json({ success: false, error: 'Internal server error' });
     }
 });
 
-// Скачивание файла
+// ===== Скачивание файла =====
 app.get('/download/:filename', async (req, res) => {
     try {
         const filename = req.params.filename;
-        const messageId = req.query.messageId;
-        const userEmail = req.query.userEmail;
-        const isSender = req.query.isSender === 'true';
-
         const filePath = path.join(permanentDir, filename);
 
         if (!fs.existsSync(filePath)) {
             return res.status(404).json({ success: false, error: 'Файл не найден' });
-        }
-
-        if (messageId && userEmail) {
-            const field = isSender ? 'downloaded_by_sender' : 'downloaded_by_receiver';
-            
-            await supabase
-                .from('messages')
-                .update({ [field]: true })
-                .eq('id', messageId);
-
-            // Проверяем, нужно ли удалить файл
-            const { data } = await supabase
-                .from('messages')
-                .select('downloaded_by_sender, downloaded_by_receiver, attachment_filename')
-                .eq('id', messageId)
-                .single();
-
-            if (data?.downloaded_by_sender && data?.downloaded_by_receiver && data?.attachment_filename) {
-                const fileToDelete = path.join(permanentDir, data.attachment_filename);
-                if (fs.existsSync(fileToDelete)) {
-                    fs.unlinkSync(fileToDelete);
-                    console.log(`🗑️ Файл удален: ${data.attachment_filename}`);
-                }
-            }
         }
 
         const mimeType = mime.lookup(filename) || 'application/octet-stream';
@@ -973,14 +1623,13 @@ app.get('/download/:filename', async (req, res) => {
         
         const fileStream = fs.createReadStream(filePath);
         fileStream.pipe(res);
-
     } catch (error) {
         console.error('❌ Ошибка скачивания файла:', error);
         res.status(500).json({ success: false, error: 'Internal server error' });
     }
 });
 
-// Получение информации о файле по ID сообщения
+// ===== Информация о файле =====
 app.get('/file-info/:messageId', async (req, res) => {
     try {
         const messageId = req.params.messageId;
@@ -1000,7 +1649,7 @@ app.get('/file-info/:messageId', async (req, res) => {
 
         res.json({
             success: true,
-            exists: exists,
+            exists,
             filename: data.attachment_filename,
             originalName: data.attachment_original_name,
             mimeType: data.attachment_mime_type,
@@ -1013,236 +1662,97 @@ app.get('/file-info/:messageId', async (req, res) => {
     }
 });
 
-// Создание группы
-app.post('/create-group', async (req, res) => {
+// ===== Добавление друга =====
+app.post('/add-friend', async (req, res) => {
     try {
-        const { name, description, createdBy, members } = req.body;
+        const { userEmail, friendEmail } = req.body;
 
-        if (!name || !createdBy) {
-            return res.status(400).json({ success: false, error: 'Название и создатель обязательны' });
+        if (!userEmail || !friendEmail) {
+            return res.status(400).json({ success: false, error: 'Email обязательны' });
         }
 
-        const createdByInfo = await getUserInfo(createdBy);
-        if (!createdByInfo) {
-            return res.status(404).json({ success: false, error: 'Создатель не найден' });
+        const normalizedUserEmail = userEmail.toLowerCase().trim();
+        const normalizedFriendEmail = friendEmail.toLowerCase().trim();
+
+        if (normalizedUserEmail === normalizedFriendEmail) {
+            return res.status(400).json({
+                success: false,
+                error: 'Нельзя добавить самого себя'
+            });
         }
 
-        // Создаем группу
-        const { data: group, error: groupError } = await supabase
-            .from('groups')
-            .insert([{
-                name: name,
-                description: description || '',
-                created_by: createdBy.toLowerCase()
-            }])
-            .select()
-            .single();
+        const userExistsCheck = await userExists(normalizedUserEmail);
+        const friendExistsCheck = await userExists(normalizedFriendEmail);
 
-        if (groupError) throw groupError;
-
-        // Добавляем создателя как администратора
-        const { error: memberError1 } = await supabase
-            .from('group_members')
-            .insert([{
-                group_id: group.id,
-                user_email: createdBy.toLowerCase(),
-                role: 'admin'
-            }]);
-
-        if (memberError1) throw memberError1;
-
-        // Добавляем остальных участников
-        if (members && members.length > 0) {
-            const memberInserts = members
-                .filter(member => member !== createdBy)
-                .map(member => ({
-                    group_id: group.id,
-                    user_email: member.toLowerCase()
-                }));
-
-            if (memberInserts.length > 0) {
-                const { error: memberError2 } = await supabase
-                    .from('group_members')
-                    .insert(memberInserts, { ignoreDuplicates: true });
-
-                if (memberError2) throw memberError2;
-            }
+        if (!userExistsCheck || !friendExistsCheck) {
+            return res.status(404).json({
+                success: false,
+                error: 'Пользователи не найдены'
+            });
         }
+
+        // Добавляем для первого пользователя
+        await supabase
+            .from('friends')
+            .upsert({
+                user_email: normalizedUserEmail,
+                friend_email: normalizedFriendEmail
+            }, {
+                onConflict: 'user_email,friend_email',
+                ignoreDuplicates: true
+            });
+
+        // Добавляем для второго пользователя
+        await supabase
+            .from('friends')
+            .upsert({
+                user_email: normalizedFriendEmail,
+                friend_email: normalizedUserEmail
+            }, {
+                onConflict: 'user_email,friend_email',
+                ignoreDuplicates: true
+            });
 
         res.json({
             success: true,
-            groupId: group.id,
-            message: 'Группа создана'
+            message: 'Друг добавлен'
         });
-
     } catch (error) {
-        console.error('❌ Ошибка создания группы:', error);
+        console.error('❌ Ошибка добавления друга:', error);
+        res.status(500).json({
+            success: false,
+            error: 'Internal server error',
+            details: error.message
+        });
+    }
+});
+
+// ===== Удаление друга =====
+app.post('/remove-friend', async (req, res) => {
+    try {
+        const { userEmail, friendEmail } = req.body;
+
+        if (!userEmail || !friendEmail) {
+            return res.status(400).json({ success: false, error: 'Email обязательны' });
+        }
+
+        await supabase
+            .from('friends')
+            .delete()
+            .eq('user_email', userEmail.toLowerCase())
+            .eq('friend_email', friendEmail.toLowerCase());
+
+        res.json({
+            success: true,
+            message: 'Друг удален'
+        });
+    } catch (error) {
+        console.error('❌ Ошибка удаления друга:', error);
         res.status(500).json({ success: false, error: 'Internal server error' });
     }
 });
 
-// Получение списка групп пользователя
-app.get('/groups/:userEmail', async (req, res) => {
-    try {
-        const userEmail = req.params.userEmail.toLowerCase();
-
-        const { data, error } = await supabase
-            .from('group_members')
-            .select(`
-                group_id,
-                role,
-                groups (
-                    id,
-                    name,
-                    description,
-                    created_by,
-                    created_at
-                )
-            `)
-            .eq('user_email', userEmail);
-
-        if (error) throw error;
-
-        // Получаем количество участников для каждой группы
-        const groups = await Promise.all(data.map(async (item) => {
-            const { count } = await supabase
-                .from('group_members')
-                .select('*', { count: 'exact', head: true })
-                .eq('group_id', item.group_id);
-
-            return {
-                id: item.groups.id,
-                name: item.groups.name,
-                description: item.groups.description,
-                created_by: item.groups.created_by,
-                created_at: item.groups.created_at,
-                role: item.role,
-                member_count: count
-            };
-        }));
-
-        res.json({
-            success: true,
-            groups: groups
-        });
-    } catch (error) {
-        console.error('❌ Ошибка получения групп:', error);
-        res.status(500).json({ success: false, error: 'Internal server error' });
-    }
-});
-
-// Получение участников группы
-app.get('/group-members/:groupId', async (req, res) => {
-    try {
-        const groupId = req.params.groupId;
-
-        const { data, error } = await supabase
-            .from('group_members')
-            .select(`
-                user_email,
-                role,
-                joined_at,
-                regular_users!group_members_user_email_fkey (first_name, last_name),
-                beresta_users!group_members_user_email_fkey (first_name, last_name)
-            `)
-            .eq('group_id', groupId);
-
-        if (error) throw error;
-
-        const members = data.map(m => {
-            const userData = m.regular_users || m.beresta_users;
-            return {
-                email: m.user_email,
-                first_name: userData?.first_name || '',
-                last_name: userData?.last_name || '',
-                role: m.role,
-                joined_at: m.joined_at
-            };
-        });
-
-        res.json({
-            success: true,
-            members: members
-        });
-    } catch (error) {
-        console.error('❌ Ошибка получения участников группы:', error);
-        res.status(500).json({ success: false, error: 'Internal server error' });
-    }
-});
-
-// Отправка сообщения в группу
-app.post('/send-group-message', async (req, res) => {
-    try {
-        const { groupId, senderEmail, message, duration } = req.body;
-
-        if (!groupId || !senderEmail) {
-            return res.status(400).json({ success: false, error: 'Группа и отправитель обязательны' });
-        }
-
-        const senderInfo = await getUserInfo(senderEmail);
-        if (!senderInfo) {
-            return res.status(404).json({ success: false, error: 'Отправитель не найден' });
-        }
-
-        const { data, error } = await supabase
-            .from('group_messages')
-            .insert([{
-                group_id: groupId,
-                sender_email: senderEmail.toLowerCase(),
-                message: message || '',
-                duration: duration || 0
-            }])
-            .select();
-
-        if (error) throw error;
-
-        res.json({
-            success: true,
-            messageId: data[0].id
-        });
-    } catch (error) {
-        console.error('❌ Ошибка отправки группового сообщения:', error);
-        res.status(500).json({ success: false, error: 'Internal server error' });
-    }
-});
-
-// Получение сообщений группы
-app.get('/group-messages/:groupId', async (req, res) => {
-    try {
-        const groupId = req.params.groupId;
-
-        const { data, error } = await supabase
-            .from('group_messages')
-            .select(`
-                *,
-                regular_users!group_messages_sender_email_fkey (first_name, last_name),
-                beresta_users!group_messages_sender_email_fkey (first_name, last_name)
-            `)
-            .eq('group_id', groupId)
-            .order('timestamp', { ascending: true });
-
-        if (error) throw error;
-
-        const messages = data.map(m => {
-            const userData = m.regular_users || m.beresta_users;
-            return {
-                ...m,
-                first_name: userData?.first_name || '',
-                last_name: userData?.last_name || ''
-            };
-        });
-
-        res.json({
-            success: true,
-            messages: messages
-        });
-    } catch (error) {
-        console.error('❌ Ошибка получения групповых сообщений:', error);
-        res.status(500).json({ success: false, error: 'Internal server error' });
-    }
-});
-
-// Обновление профиля
+// ===== Обновление профиля =====
 app.post('/update-profile', upload.single('avatar'), async (req, res) => {
     try {
         const { email, firstName, lastName, removeAvatar } = req.body;
@@ -1296,447 +1806,7 @@ app.post('/update-profile', upload.single('avatar'), async (req, res) => {
     }
 });
 
-// Agora токен
-app.get('/agora/token/:channelName/:userId', (req, res) => {
-    try {
-        const { channelName, userId } = req.params;
-
-        console.log(`🔑 Запрос токена: channel=${channelName}, userId=${userId}`);
-
-        if (!channelName) {
-            console.log('❌ Пустое имя канала');
-            return res.status(400).json({ success: false, error: 'Channel name обязателен' });
-        }
-
-        if (!isValidChannelName(channelName)) {
-            console.log(`❌ Недопустимое имя канала: ${channelName}`);
-            return res.status(400).json({ 
-                success: false, 
-                error: 'Недопустимое имя канала' 
-            });
-        }
-
-        const appId = process.env.AGORA_APP_ID || '0eef2fbc530f4d27a19a18f6527dda20';
-        const appCertificate = process.env.AGORA_APP_CERTIFICATE || '5ffaa1348ef5433b8fbb37d22772ca0e';
-        const expirationTimeInSeconds = 3600;
-
-        const currentTimestamp = Math.floor(Date.now() / 1000);
-        const privilegeExpiredTs = currentTimestamp + expirationTimeInSeconds;
-
-        const uid = Math.abs(parseInt(userId) || 0);
-        
-        console.log(`🛠️ Генерация токена: appId=${appId}, uid=${uid}, channel=${channelName}`);
-        
-        const token = Agora.RtcTokenBuilder.buildTokenWithUid(
-            appId,
-            appCertificate,
-            channelName,
-            uid,
-            Agora.RtcRole.PUBLISHER,
-            privilegeExpiredTs
-        );
-
-        console.log(`✅ Токен сгенерирован успешно для канала: ${channelName}`);
-
-        res.json({
-            success: true,
-            token: token,
-            appId: appId,
-            channelName: channelName
-        });
-
-    } catch (error) {
-        console.error('❌ Ошибка генерации Agora токена:', error);
-        res.status(500).json({ success: false, error: 'Internal server error' });
-    }
-});
-
-// Создание Agora звонка
-app.post('/agora/create-call', async (req, res) => {
-    try {
-        console.log('📞 Данные создания звонка:', req.body);
-        
-        const { callerEmail, receiverEmail, callType, channelName } = req.body;
-
-        if (!callerEmail || !receiverEmail || !channelName) {
-            console.log('❌ Отсутствуют обязательные поля');
-            return res.status(400).json({ success: false, error: 'Все поля обязательны' });
-        }
-
-        const callerInfo = await getUserInfo(callerEmail);
-        const receiverInfo = await getUserInfo(receiverEmail);
-
-        if (!callerInfo || !receiverInfo) {
-            return res.status(404).json({ success: false, error: 'Пользователь не найден' });
-        }
-
-        if (!isValidChannelName(channelName)) {
-            console.log('❌ Невалидное имя канала:', channelName);
-            return res.status(400).json({ 
-                success: false, 
-                error: 'Недопустимое имя канала' 
-            });
-        }
-
-        const { data, error } = await supabase
-            .from('agora_calls')
-            .insert([{
-                channel_name: channelName,
-                caller_email: callerEmail.toLowerCase(),
-                receiver_email: receiverEmail.toLowerCase(),
-                call_type: callType || 'audio',
-                status: 'ringing'
-            }])
-            .select();
-
-        if (error) throw error;
-
-        console.log('✅ Запись звонка создана');
-        
-        res.json({
-            success: true,
-            callId: data[0].id,
-            channelName: channelName
-        });
-
-    } catch (error) {
-        console.error('❌ Ошибка создания Agora звонка:', error);
-        res.status(500).json({ success: false, error: 'Internal server error' });
-    }
-});
-
-// WebSocket соединения
-const activeUsers = new Map();
-
-io.on('connection', (socket) => {
-  console.log('✅ WebSocket подключение установлено:', socket.id);
-  
-  if (socket.userEmail) {
-    activeUsers.set(socket.userEmail, socket.id);
-    
-    console.log(`👤 Пользователь онлайн: ${socket.userEmail} (socket: ${socket.id})`);
-    console.log(`📊 Всего онлайн: ${activeUsers.size} пользователей`);
-
-    socket.emit('connection_established', {
-      status: 'connected',
-      email: socket.userEmail,
-      socketId: socket.id,
-      timestamp: new Date().toISOString()
-    });
-
-    socket.broadcast.emit('user_status_changed', {
-      email: socket.userEmail,
-      status: 'online',
-      timestamp: new Date().toISOString()
-    });
-  }
-
-  socket.on('ping', (data) => {
-    socket.emit('pong', {
-      ...data,
-      serverTime: new Date().toISOString()
-    });
-  });
-
-  socket.on('user_online', (data) => {
-    try {
-      if (data && data.email) {
-        const email = data.email.toLowerCase();
-        activeUsers.set(email, socket.id);
-        socket.userEmail = email;
-        
-        console.log(`👤 Явный user_online: ${email}`);
-        
-        socket.emit('user_online_confirmed', {
-          status: 'confirmed',
-          email: email,
-          timestamp: new Date().toISOString()
-        });
-      }
-    } catch (error) {
-      console.error('❌ Ошибка в user_online:', error);
-    }
-  });
-
-  socket.on('call_notification', (data) => {
-    try {
-      console.log('📞 Получен call_notification:', data);
-      
-      if (!data || !data.receiverEmail) {
-        socket.emit('call_notification_failed', {
-          error: 'No receiver email'
-        });
-        return;
-      }
-
-      const receiverEmail = data.receiverEmail.toLowerCase();
-      const receiverSocketId = activeUsers.get(receiverEmail);
-      
-      console.log(`🔍 Поиск получателя: ${receiverEmail} -> ${receiverSocketId}`);
-
-      if (receiverSocketId && io.sockets.sockets.has(receiverSocketId)) {
-        const callData = {
-          type: 'incoming_call',
-          channelName: data.channelName,
-          callerEmail: data.callerEmail,
-          callerName: data.callerName || data.callerEmail,
-          callType: data.callType || 'audio',
-          timestamp: new Date().toISOString(),
-          callId: data.callId || Date.now().toString()
-        };
-
-        io.to(receiverSocketId).emit('incoming_call', callData);
-        
-        console.log(`✅ Уведомление отправлено: ${receiverEmail}`);
-        
-        socket.emit('call_notification_sent', {
-          success: true,
-          receiver: receiverEmail,
-          timestamp: new Date().toISOString()
-        });
-      } else {
-        console.log(`❌ Пользователь оффлайн: ${receiverEmail}`);
-        
-        socket.emit('call_notification_failed', {
-          success: false,
-          error: 'USER_OFFLINE',
-          receiver: receiverEmail
-        });
-      }
-    } catch (error) {
-      console.error('❌ Ошибка в call_notification:', error);
-      socket.emit('call_notification_failed', {
-        error: 'INTERNAL_ERROR',
-        details: error.message
-      });
-    }
-  });
-
-  socket.on('disconnect', (reason) => {
-    console.log(`❌ WebSocket отключен: ${socket.id}, причина: ${reason}`);
-    
-    if (socket.userEmail) {
-      activeUsers.delete(socket.userEmail);
-      console.log(`👤 Удален из онлайн: ${socket.userEmail}`);
-      
-      socket.broadcast.emit('user_status_changed', {
-        email: socket.userEmail,
-        status: 'offline',
-        timestamp: new Date().toISOString(),
-        reason: reason
-      });
-    }
-    
-    console.log(`📊 Осталось онлайн: ${activeUsers.size} пользователей`);
-  });
-
-  socket.on('error', (error) => {
-    console.error('💥 WebSocket ошибка:', error);
-  });
-});
-
-// Отправка звонка
-app.post('/send-call', async (req, res) => {
-    try {
-        const { channelName, callerEmail, receiverEmail, callType, callerName } = req.body;
-
-        console.log('📞 Отправка звонка:', { channelName, callerEmail, receiverEmail, callType });
-
-        if (!channelName || !callerEmail || !receiverEmail) {
-            return res.status(400).json({ 
-                success: false, 
-                error: 'channelName, callerEmail, receiverEmail обязательны' 
-            });
-        }
-
-        const callerInfo = await getUserInfo(callerEmail);
-        const receiverInfo = await getUserInfo(receiverEmail);
-
-        if (!callerInfo || !receiverInfo) {
-            return res.status(404).json({ success: false, error: 'Пользователь не найден' });
-        }
-
-        const normalizedReceiver = receiverEmail.toLowerCase();
-        
-        const callData = {
-            channelName: channelName,
-            callerEmail: callerEmail,
-            receiverEmail: normalizedReceiver,
-            callType: callType || 'audio',
-            callerName: callerName || callerEmail,
-            timestamp: new Date().toISOString(),
-            callId: Date.now().toString()
-        };
-
-        await supabase
-            .from('agora_calls')
-            .upsert({
-                channel_name: channelName,
-                caller_email: callerEmail,
-                receiver_email: normalizedReceiver,
-                call_type: callType || 'audio',
-                status: 'ringing'
-            }, {
-                onConflict: 'channel_name'
-            });
-
-        pendingCalls.set(normalizedReceiver, callData);
-        
-        setTimeout(() => {
-            if (pendingCalls.get(normalizedReceiver)?.callId === callData.callId) {
-                pendingCalls.delete(normalizedReceiver);
-                console.log(`🗑️ Очищен ожидающий звонок для: ${normalizedReceiver}`);
-            }
-        }, 60000);
-
-        console.log(`✅ Звонок отправлен: ${callerEmail} -> ${normalizedReceiver}`);
-
-        res.json({
-            success: true,
-            message: 'Call sent successfully',
-            callId: callData.callId
-        });
-
-    } catch (error) {
-        console.error('❌ Ошибка отправки звонка:', error);
-        res.status(500).json({ 
-            success: false, 
-            error: 'Internal server error',
-            details: error.message 
-        });
-    }
-});
-
-// Проверка входящих звонков
-app.get('/check-incoming-calls/:userEmail', async (req, res) => {
-    try {
-        const userEmail = req.params.userEmail.toLowerCase();
-        const timeout = parseInt(req.query.timeout) || 30000;
-
-        console.log(`🔍 Проверка звонков для: ${userEmail}, timeout: ${timeout}ms`);
-
-        const existingCall = pendingCalls.get(userEmail);
-        if (existingCall) {
-            pendingCalls.delete(userEmail);
-            return res.json({
-                success: true,
-                hasCall: true,
-                call: existingCall
-            });
-        }
-
-        const checkCall = () => {
-            const call = pendingCalls.get(userEmail);
-            if (call) {
-                pendingCalls.delete(userEmail);
-                res.json({
-                    success: true,
-                    hasCall: true,
-                    call: call
-                });
-                return true;
-            }
-            return false;
-        };
-
-        if (checkCall()) return;
-
-        const interval = setInterval(() => {
-            if (checkCall()) {
-                clearInterval(interval);
-            }
-        }, 1000);
-
-        setTimeout(() => {
-            clearInterval(interval);
-            if (!res.headersSent) {
-                res.json({
-                    success: true,
-                    hasCall: false,
-                    message: 'No incoming calls'
-                });
-            }
-        }, timeout);
-
-    } catch (error) {
-        console.error('❌ Ошибка проверки звонков:', error);
-        if (!res.headersSent) {
-            res.status(500).json({ 
-                success: false, 
-                error: 'Internal server error' 
-            });
-        }
-    }
-});
-
-// Завершение звонка
-app.post('/end-call', async (req, res) => {
-    try {
-        const { channelName, receiverEmail } = req.body;
-
-        if (!channelName) {
-            return res.status(400).json({ 
-                success: false, 
-                error: 'channelName обязателен' 
-            });
-        }
-
-        if (receiverEmail) {
-            pendingCalls.delete(receiverEmail.toLowerCase());
-        }
-
-        const { error } = await supabase
-            .from('agora_calls')
-            .update({ 
-                status: 'ended', 
-                ended_at: new Date().toISOString() 
-            })
-            .eq('channel_name', channelName);
-
-        if (error) throw error;
-
-        res.json({
-            success: true,
-            message: 'Call ended'
-        });
-
-    } catch (error) {
-        console.error('❌ Ошибка завершения звонка:', error);
-        res.status(500).json({ 
-            success: false, 
-            error: 'Internal server error' 
-        });
-    }
-});
-
-// Очистка истории чата
-app.post('/clear-chat', async (req, res) => {
-    try {
-        const { userEmail, friendEmail } = req.body;
-
-        if (!userEmail || !friendEmail) {
-            return res.status(400).json({ success: false, error: 'Email обязательны' });
-        }
-
-        const { error } = await supabase
-            .from('messages')
-            .delete()
-            .or(`and(sender_email.eq.${userEmail.toLowerCase()},receiver_email.eq.${friendEmail.toLowerCase()}),and(sender_email.eq.${friendEmail.toLowerCase()},receiver_email.eq.${userEmail.toLowerCase()})`);
-
-        if (error) throw error;
-
-        res.json({
-            success: true,
-            message: 'История чата очищена',
-            deletedCount: 0
-        });
-    } catch (error) {
-        console.error('❌ Ошибка очистки чата:', error);
-        res.status(500).json({ success: false, error: 'Internal server error' });
-    }
-});
-
-// Удаление аккаунта
+// ===== Удаление аккаунта =====
 app.delete('/delete-account/:userEmail', async (req, res) => {
     try {
         const userEmail = req.params.userEmail.toLowerCase();
@@ -1757,8 +1827,7 @@ app.delete('/delete-account/:userEmail', async (req, res) => {
 
         res.json({
             success: true,
-            message: 'Аккаунт удален',
-            deletedCount: 1
+            message: 'Аккаунт удален'
         });
     } catch (error) {
         console.error('❌ Ошибка удаления аккаунта:', error);
@@ -1766,7 +1835,332 @@ app.delete('/delete-account/:userEmail', async (req, res) => {
     }
 });
 
-// Загрузка файла в группу
+// ===== Очистка истории чата =====
+app.post('/clear-chat', async (req, res) => {
+    try {
+        const { userEmail, friendEmail } = req.body;
+
+        if (!userEmail || !friendEmail) {
+            return res.status(400).json({ success: false, error: 'Email обязательны' });
+        }
+
+        const { error } = await supabase
+            .from('messages')
+            .delete()
+            .or(`and(sender_email.eq.${userEmail.toLowerCase()},receiver_email.eq.${friendEmail.toLowerCase()}),and(sender_email.eq.${friendEmail.toLowerCase()},receiver_email.eq.${userEmail.toLowerCase()})`);
+
+        if (error) throw error;
+
+        res.json({
+            success: true,
+            message: 'История чата очищена'
+        });
+    } catch (error) {
+        console.error('❌ Ошибка очистки чата:', error);
+        res.status(500).json({ success: false, error: 'Internal server error' });
+    }
+});
+
+// ===== Создание группы =====
+app.post('/create-group', async (req, res) => {
+    try {
+        const { name, description, createdBy, members } = req.body;
+
+        if (!name || !createdBy) {
+            return res.status(400).json({ success: false, error: 'Название и создатель обязательны' });
+        }
+
+        const createdByInfo = await getUserInfo(createdBy);
+        if (!createdByInfo) {
+            return res.status(404).json({ success: false, error: 'Создатель не найден' });
+        }
+
+        // Создаем группу
+        const { data: group, error: groupError } = await supabase
+            .from('groups')
+            .insert([{
+                name: name,
+                description: description || '',
+                created_by: createdBy.toLowerCase()
+            }])
+            .select()
+            .single();
+
+        if (groupError) throw groupError;
+
+        // Добавляем создателя как администратора
+        await supabase
+            .from('group_members')
+            .insert([{
+                group_id: group.id,
+                user_email: createdBy.toLowerCase(),
+                role: 'admin'
+            }]);
+
+        // Добавляем остальных участников
+        if (members && members.length > 0) {
+            const memberInserts = members
+                .filter(member => member !== createdBy)
+                .map(member => ({
+                    group_id: group.id,
+                    user_email: member.toLowerCase()
+                }));
+
+            if (memberInserts.length > 0) {
+                await supabase
+                    .from('group_members')
+                    .insert(memberInserts, { ignoreDuplicates: true });
+            }
+        }
+
+        res.json({
+            success: true,
+            groupId: group.id,
+            message: 'Группа создана'
+        });
+    } catch (error) {
+        console.error('❌ Ошибка создания группы:', error);
+        res.status(500).json({ success: false, error: 'Internal server error' });
+    }
+});
+
+// ===== Получение групп пользователя =====
+app.get('/groups/:userEmail', async (req, res) => {
+    try {
+        const userEmail = req.params.userEmail.toLowerCase();
+
+        const { data, error } = await supabase
+            .from('group_members')
+            .select(`
+                group_id,
+                role,
+                groups (
+                    id,
+                    name,
+                    description,
+                    created_by,
+                    created_at
+                )
+            `)
+            .eq('user_email', userEmail);
+
+        if (error) throw error;
+
+        // Получаем количество участников для каждой группы
+        const groups = await Promise.all((data || []).map(async (item) => {
+            const { count } = await supabase
+                .from('group_members')
+                .select('*', { count: 'exact', head: true })
+                .eq('group_id', item.group_id);
+
+            return {
+                id: item.groups.id,
+                name: item.groups.name,
+                description: item.groups.description,
+                created_by: item.groups.created_by,
+                created_at: item.groups.created_at,
+                role: item.role,
+                member_count: count
+            };
+        }));
+
+        res.json({
+            success: true,
+            groups
+        });
+    } catch (error) {
+        console.error('❌ Ошибка получения групп:', error);
+        res.status(500).json({ success: false, error: 'Internal server error' });
+    }
+});
+
+// ===== Получение участников группы =====
+app.get('/group-members/:groupId', async (req, res) => {
+    try {
+        const groupId = req.params.groupId;
+
+        const { data, error } = await supabase
+            .from('group_members')
+            .select(`
+                user_email,
+                role,
+                joined_at
+            `)
+            .eq('group_id', groupId);
+
+        if (error) throw error;
+
+        // Получаем информацию о каждом участнике
+        const members = await Promise.all((data || []).map(async (m) => {
+            const userInfo = await getUserInfo(m.user_email);
+            return {
+                email: m.user_email,
+                first_name: userInfo?.first_name || '',
+                last_name: userInfo?.last_name || '',
+                role: m.role,
+                joined_at: m.joined_at
+            };
+        }));
+
+        res.json({
+            success: true,
+            members
+        });
+    } catch (error) {
+        console.error('❌ Ошибка получения участников группы:', error);
+        res.status(500).json({ success: false, error: 'Internal server error' });
+    }
+});
+
+// ===== Добавление участника в группу =====
+app.post('/add-group-member', async (req, res) => {
+    try {
+        const { groupId, userEmail } = req.body;
+
+        if (!groupId || !userEmail) {
+            return res.status(400).json({ success: false, error: 'Группа и пользователь обязательны' });
+        }
+
+        const userInfo = await getUserInfo(userEmail);
+        if (!userInfo) {
+            return res.status(404).json({ success: false, error: 'Пользователь не найден' });
+        }
+
+        await supabase
+            .from('group_members')
+            .upsert({
+                group_id: groupId,
+                user_email: userEmail.toLowerCase()
+            }, {
+                onConflict: 'group_id,user_email',
+                ignoreDuplicates: true
+            });
+
+        res.json({
+            success: true,
+            message: 'Участник добавлен'
+        });
+    } catch (error) {
+        console.error('❌ Ошибка добавления участника:', error);
+        res.status(500).json({ success: false, error: 'Internal server error' });
+    }
+});
+
+// ===== Удаление участника из группы =====
+app.post('/remove-group-member', async (req, res) => {
+    try {
+        const { groupId, userEmail } = req.body;
+
+        if (!groupId || !userEmail) {
+            return res.status(400).json({ success: false, error: 'Группа и пользователь обязательны' });
+        }
+
+        await supabase
+            .from('group_members')
+            .delete()
+            .eq('group_id', groupId)
+            .eq('user_email', userEmail.toLowerCase());
+
+        res.json({
+            success: true,
+            message: 'Участник удален'
+        });
+    } catch (error) {
+        console.error('❌ Ошибка удаления участника:', error);
+        res.status(500).json({ success: false, error: 'Internal server error' });
+    }
+});
+
+// ===== Удаление группы =====
+app.delete('/group/:groupId', async (req, res) => {
+    try {
+        const groupId = req.params.groupId;
+
+        await supabase
+            .from('groups')
+            .delete()
+            .eq('id', groupId);
+
+        res.json({
+            success: true,
+            message: 'Группа удалена'
+        });
+    } catch (error) {
+        console.error('❌ Ошибка удаления группы:', error);
+        res.status(500).json({ success: false, error: 'Internal server error' });
+    }
+});
+
+// ===== Отправка сообщения в группу =====
+app.post('/send-group-message', async (req, res) => {
+    try {
+        const { groupId, senderEmail, message, duration } = req.body;
+
+        if (!groupId || !senderEmail) {
+            return res.status(400).json({ success: false, error: 'Группа и отправитель обязательны' });
+        }
+
+        const senderInfo = await getUserInfo(senderEmail);
+        if (!senderInfo) {
+            return res.status(404).json({ success: false, error: 'Отправитель не найден' });
+        }
+
+        const { data, error } = await supabase
+            .from('group_messages')
+            .insert([{
+                group_id: groupId,
+                sender_email: senderEmail.toLowerCase(),
+                message: message || '',
+                duration: duration || 0
+            }])
+            .select();
+
+        if (error) throw error;
+
+        res.json({
+            success: true,
+            messageId: data[0].id
+        });
+    } catch (error) {
+        console.error('❌ Ошибка отправки группового сообщения:', error);
+        res.status(500).json({ success: false, error: 'Internal server error' });
+    }
+});
+
+// ===== Получение сообщений группы =====
+app.get('/group-messages/:groupId', async (req, res) => {
+    try {
+        const groupId = req.params.groupId;
+
+        const { data, error } = await supabase
+            .from('group_messages')
+            .select('*')
+            .eq('group_id', groupId)
+            .order('timestamp', { ascending: true });
+
+        if (error) throw error;
+
+        // Добавляем информацию об отправителях
+        const messages = await Promise.all((data || []).map(async (m) => {
+            const senderInfo = await getUserInfo(m.sender_email);
+            return {
+                ...m,
+                first_name: senderInfo?.first_name || '',
+                last_name: senderInfo?.last_name || ''
+            };
+        }));
+
+        res.json({
+            success: true,
+            messages
+        });
+    } catch (error) {
+        console.error('❌ Ошибка получения групповых сообщений:', error);
+        res.status(500).json({ success: false, error: 'Internal server error' });
+    }
+});
+
+// ===== Загрузка файла в группу =====
 app.post('/upload-group', upload.single('file'), async (req, res) => {
     try {
         if (!req.file) {
@@ -1823,7 +2217,8 @@ app.post('/upload-group', upload.single('file'), async (req, res) => {
             } catch (error) {
                 fs.unlinkSync(req.file.path);
                 if (thumbnail) {
-                    fs.unlinkSync(path.join(thumbnailsDir, thumbnail));
+                    const thumbPath = path.join(thumbnailsDir, thumbnail);
+                    if (fs.existsSync(thumbPath)) fs.unlinkSync(thumbPath);
                 }
                 throw error;
             }
@@ -1860,7 +2255,7 @@ app.post('/upload-group', upload.single('file'), async (req, res) => {
     }
 });
 
-// Информация о групповом файле
+// ===== Информация о групповом файле =====
 app.get('/group-file-info/:filename', async (req, res) => {
     try {
         const filename = req.params.filename;
@@ -1880,7 +2275,7 @@ app.get('/group-file-info/:filename', async (req, res) => {
 
         res.json({
             success: true,
-            exists: exists,
+            exists,
             filename: data.attachment_filename,
             originalName: data.attachment_original_name,
             mimeType: data.attachment_mime_type,
@@ -1893,150 +2288,921 @@ app.get('/group-file-info/:filename', async (req, res) => {
     }
 });
 
-// Проверка активных звонков
-app.get('/check-calls/:userEmail', async (req, res) => {
+// ===== Получение онлайн пользователей =====
+app.get('/online-users', async (req, res) => {
     try {
-        const userEmail = req.params.userEmail.toLowerCase();
-        
-        console.log(`🔍 Проверка звонков для: ${userEmail}`);
-        
         const { data, error } = await supabase
-            .from('agora_calls')
-            .select('channel_name, caller_email, receiver_email, call_type, status, created_at')
-            .eq('receiver_email', userEmail)
-            .eq('status', 'ringing')
-            .gte('created_at', new Date(Date.now() - 5 * 60 * 1000).toISOString())
-            .order('created_at', { ascending: false })
-            .limit(5);
+            .from('user_presence')
+            .select('user_email, server_id, last_seen')
+            .eq('status', 'online')
+            .gte('last_seen', new Date(Date.now() - 30000).toISOString());
 
         if (error) throw error;
 
-        console.log(`📞 Найдено активных звонков: ${data.length}`);
-        
         res.json({
             success: true,
-            calls: data.map(call => ({
-                channelName: call.channel_name,
-                callerEmail: call.caller_email,
-                receiverEmail: call.receiver_email,
-                callType: call.call_type,
-                status: call.status,
-                createdAt: call.created_at
+            online: (data || []).map(u => ({
+                email: u.user_email,
+                server: u.server_id,
+                lastSeen: u.last_seen
             })),
-            timestamp: new Date().toISOString()
-        });
-
-    } catch (error) {
-        console.error('❌ Ошибка проверки звонков:', error);
-        res.status(500).json({ 
-            success: false, 
-            error: 'Internal server error' 
-        });
-    }
-});
-
-// Добавление участника в группу
-app.post('/add-group-member', async (req, res) => {
-    try {
-        const { groupId, userEmail } = req.body;
-
-        if (!groupId || !userEmail) {
-            return res.status(400).json({ success: false, error: 'Группа и пользователь обязательны' });
-        }
-
-        const userInfo = await getUserInfo(userEmail);
-        if (!userInfo) {
-            return res.status(404).json({ success: false, error: 'Пользователь не найден' });
-        }
-
-        const { error } = await supabase
-            .from('group_members')
-            .upsert({
-                group_id: groupId,
-                user_email: userEmail.toLowerCase()
-            }, {
-                onConflict: 'group_id,user_email',
-                ignoreDuplicates: true
-            });
-
-        if (error) throw error;
-
-        res.json({
-            success: true,
-            message: 'Участник добавлен'
+            count: data?.length || 0
         });
     } catch (error) {
-        console.error('❌ Ошибка добавления участника:', error);
+        console.error('❌ Ошибка получения онлайн пользователей:', error);
         res.status(500).json({ success: false, error: 'Internal server error' });
     }
 });
 
-// Удаление участника из группы
-app.post('/remove-group-member', async (req, res) => {
-    try {
-        const { groupId, userEmail } = req.body;
-
-        if (!groupId || !userEmail) {
-            return res.status(400).json({ success: false, error: 'Группа и пользователь обязательны' });
-        }
-
-        const { error } = await supabase
-            .from('group_members')
-            .delete()
-            .eq('group_id', groupId)
-            .eq('user_email', userEmail.toLowerCase());
-
-        if (error) throw error;
-
-        res.json({
-            success: true,
-            message: 'Участник удален'
-        });
-    } catch (error) {
-        console.error('❌ Ошибка удаления участника:', error);
-        res.status(500).json({ success: false, error: 'Internal server error' });
-    }
-});
-
-// Удаление группы
-app.delete('/group/:groupId', async (req, res) => {
-    try {
-        const groupId = req.params.groupId;
-
-        const { error } = await supabase
-            .from('groups')
-            .delete()
-            .eq('id', groupId);
-
-        if (error) throw error;
-
-        res.json({
-            success: true,
-            message: 'Группа удалена'
-        });
-    } catch (error) {
-        console.error('❌ Ошибка удаления группы:', error);
-        res.status(500).json({ success: false, error: 'Internal server error' });
-    }
-});
-
-// Статические файлы
+// ===== СТАТИЧЕСКИЕ ФАЙЛЫ =====
 app.use('/uploads', express.static(uploadDir));
 
-// Запуск сервера
-server.listen(PORT, '0.0.0.0', async () => {
-    console.log(`🚀 Сервер запущен на порту ${PORT}`);
-    console.log(`🌐 URL: http://0.0.0.0:${PORT}`);
-    console.log(`📡 WebSocket сервер активен: ws://0.0.0.0:${PORT}`);
-    console.log(`🔧 Режим: ${process.env.NODE_ENV || 'development'}`);
-    console.log(`🔗 Внешний URL: https://beresta-server-5udn.onrender.com`);
-    console.log(`💾 База данных: Supabase (${supabaseUrl})`);
-    
-    console.log('✅ Сервер готов к работе');
+// ===== ВЕБ-ИНТЕРФЕЙС =====
+app.get('/', (req, res) => {
+    res.send(`
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Beresta - Чат и Видеозвонки</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            padding: 20px;
+        }
+        .container { max-width: 1400px; margin: 0 auto; }
+        h1 {
+            text-align: center;
+            color: white;
+            margin-bottom: 30px;
+            font-size: 2.5em;
+            text-shadow: 2px 2px 4px rgba(0,0,0,0.2);
+        }
+        .main-panel {
+            display: grid;
+            grid-template-columns: 300px 1fr;
+            gap: 20px;
+        }
+        .sidebar {
+            background: white;
+            border-radius: 20px;
+            padding: 20px;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.2);
+        }
+        .sidebar h2 {
+            color: #333;
+            margin-bottom: 20px;
+            font-size: 1.3em;
+            border-bottom: 2px solid #f0f0f0;
+            padding-bottom: 10px;
+        }
+        .user-info {
+            background: #f8f9fa;
+            border-radius: 10px;
+            padding: 15px;
+            margin-bottom: 20px;
+        }
+        .user-info input {
+            width: 100%;
+            padding: 10px;
+            margin: 10px 0;
+            border: 2px solid #e0e0e0;
+            border-radius: 8px;
+            font-size: 14px;
+        }
+        .call-type-selector {
+            display: flex;
+            gap: 10px;
+            margin: 15px 0;
+        }
+        .call-type-btn {
+            flex: 1;
+            padding: 10px;
+            border: 2px solid #e0e0e0;
+            background: white;
+            border-radius: 8px;
+            cursor: pointer;
+            transition: all 0.3s;
+        }
+        .call-type-btn.active {
+            background: #667eea;
+            color: white;
+            border-color: #667eea;
+        }
+        .room-list {
+            max-height: 300px;
+            overflow-y: auto;
+        }
+        .room-item {
+            background: #f8f9fa;
+            border-radius: 8px;
+            padding: 12px;
+            margin-bottom: 8px;
+            cursor: pointer;
+            transition: all 0.3s;
+            border-left: 4px solid #667eea;
+        }
+        .room-item:hover {
+            transform: translateX(5px);
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+        }
+        .room-item .room-name { font-weight: 600; color: #333; }
+        .room-item .room-type { font-size: 12px; color: #666; margin-top: 5px; }
+        .room-item .participants { font-size: 12px; color: #48bb78; }
+        .main-content {
+            background: white;
+            border-radius: 20px;
+            padding: 20px;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.2);
+        }
+        .setup-section {
+            background: #f8f9fa;
+            border-radius: 15px;
+            padding: 25px;
+            margin-bottom: 30px;
+        }
+        .room-controls {
+            display: flex;
+            gap: 10px;
+            flex-wrap: wrap;
+            justify-content: center;
+        }
+        .room-controls input,
+        .room-controls select {
+            padding: 15px 20px;
+            border: 2px solid #e0e0e0;
+            border-radius: 10px;
+            font-size: 16px;
+            flex: 1;
+            min-width: 200px;
+        }
+        button {
+            padding: 15px 30px;
+            border: none;
+            border-radius: 10px;
+            font-size: 16px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.3s;
+        }
+        button:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 5px 15px rgba(0,0,0,0.2);
+        }
+        .btn-primary { background: #667eea; color: white; }
+        .btn-success { background: #48bb78; color: white; }
+        .btn-danger { background: #f56565; color: white; }
+        .btn-warning { background: #ed8936; color: white; }
+        .video-section { display: none; }
+        .video-container {
+            display: flex;
+            gap: 20px;
+            flex-wrap: wrap;
+            justify-content: center;
+            margin-bottom: 20px;
+        }
+        .video-wrapper {
+            flex: 1;
+            min-width: 400px;
+            position: relative;
+        }
+        .video-label {
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            background: rgba(0,0,0,0.6);
+            color: white;
+            padding: 5px 15px;
+            border-radius: 20px;
+            font-size: 14px;
+            z-index: 1;
+        }
+        video {
+            width: 100%;
+            height: auto;
+            border-radius: 15px;
+            background: #2d3748;
+            border: 3px solid #e2e8f0;
+            aspect-ratio: 16/9;
+            object-fit: cover;
+        }
+        .audio-only .video-wrapper video { display: none; }
+        .audio-only .video-wrapper {
+            background: #4a5568;
+            border-radius: 15px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            min-height: 200px;
+        }
+        .audio-only .video-wrapper::before {
+            content: "🎤 Аудио звонок";
+            color: white;
+            font-size: 24px;
+        }
+        .controls {
+            display: flex;
+            gap: 10px;
+            justify-content: center;
+            flex-wrap: wrap;
+            margin-top: 20px;
+            padding: 20px;
+            background: #f8f9fa;
+            border-radius: 15px;
+        }
+        .status-message {
+            margin-top: 15px;
+            padding: 10px;
+            border-radius: 8px;
+            text-align: center;
+            font-weight: 500;
+        }
+        .success { background: #c6f6d5; color: #22543d; }
+        .error { background: #fed7d7; color: #742a2a; }
+        .info { background: #bee3f8; color: #2c5282; }
+        .warning { background: #feebc8; color: #744210; }
+        .loader {
+            border: 3px solid #f3f3f3;
+            border-top: 3px solid #667eea;
+            border-radius: 50%;
+            width: 30px;
+            height: 30px;
+            animation: spin 1s linear infinite;
+            display: inline-block;
+        }
+        @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+        .hidden { display: none; }
+        .tabs {
+            display: flex;
+            gap: 10px;
+            margin-bottom: 20px;
+            border-bottom: 2px solid #f0f0f0;
+            padding-bottom: 10px;
+        }
+        .tab {
+            padding: 10px 20px;
+            cursor: pointer;
+            border-radius: 8px 8px 0 0;
+            transition: all 0.3s;
+        }
+        .tab:hover { background: #f0f0f0; }
+        .tab.active { background: #667eea; color: white; }
+        .api-docs {
+            background: #1a202c;
+            color: #a0aec0;
+            padding: 20px;
+            border-radius: 10px;
+            font-family: monospace;
+            margin-top: 20px;
+        }
+        .api-docs h3 { color: white; margin-bottom: 15px; }
+        .api-endpoint {
+            margin: 10px 0;
+            padding: 10px;
+            background: #2d3748;
+            border-radius: 5px;
+        }
+        .method {
+            display: inline-block;
+            padding: 3px 8px;
+            border-radius: 3px;
+            font-weight: bold;
+            margin-right: 10px;
+        }
+        .method.get { background: #48bb78; color: white; }
+        .method.post { background: #4299e1; color: white; }
+        .method.put { background: #ed8936; color: white; }
+        .method.delete { background: #f56565; color: white; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>📹 Beresta - Чат и Видеозвонки</h1>
+        
+        <div class="main-panel">
+            <div class="sidebar">
+                <h2>👤 Пользователь</h2>
+                <div class="user-info">
+                    <input type="text" id="userName" placeholder="Ваше имя" value="Пользователь">
+                    <div class="call-type-selector">
+                        <button class="call-type-btn active" onclick="setCallType('video')" id="typeVideoBtn">📹 Видео</button>
+                        <button class="call-type-btn" onclick="setCallType('audio')" id="typeAudioBtn">🎤 Аудио</button>
+                    </div>
+                </div>
+                
+                <h2>📋 Активные комнаты</h2>
+                <div class="room-list" id="roomList">
+                    <div class="room-item" onclick="joinRoomFromList('default')">
+                        <div class="room-name">default</div>
+                        <div class="room-type">📹 Видео комната</div>
+                        <div class="participants">👥 0 участников</div>
+                    </div>
+                </div>
+                
+                <h2>📊 Статус</h2>
+                <div id="sidebarStatus" class="status-message info">Подключение...</div>
+                
+                <h2>🔧 API</h2>
+                <button onclick="showApiDocs()" class="btn-warning" style="width: 100%;">📚 Показать документацию API</button>
+            </div>
+            
+            <div class="main-content">
+                <div class="tabs">
+                    <div class="tab active" onclick="switchTab('call')" id="tabCall">📞 Звонок</div>
+                    <div class="tab" onclick="switchTab('api')" id="tabApi">🔌 API тестер</div>
+                </div>
+                
+                <div id="callTab">
+                    <div class="setup-section" id="setupSection">
+                        <div class="room-controls">
+                            <input type="text" id="roomInput" placeholder="Название комнаты" value="room1">
+                            <select id="callTypeSelect">
+                                <option value="video">📹 Видеозвонок</option>
+                                <option value="audio">🎤 Аудиозвонок</option>
+                            </select>
+                            <button onclick="joinRoom()" class="btn-primary" id="joinBtn">
+                                <span id="joinBtnText">🔗 Подключиться</span>
+                                <span id="joinBtnLoader" class="loader hidden"></span>
+                            </button>
+                        </div>
+                        <div id="setupStatus" class="status-message"></div>
+                    </div>
+                    
+                    <div class="video-section" id="videoSection">
+                        <div class="video-container" id="videoContainer">
+                            <div class="video-wrapper">
+                                <div class="video-label" id="localLabel">Вы</div>
+                                <video id="localVideo" autoplay playsinline muted></video>
+                            </div>
+                            <div class="video-wrapper">
+                                <div class="video-label" id="remoteLabel">Собеседник</div>
+                                <video id="remoteVideo" autoplay playsinline></video>
+                            </div>
+                        </div>
+                        
+                        <div class="controls">
+                            <button onclick="toggleAudio()" class="btn-success" id="audioBtn">🔊 Выключить микрофон</button>
+                            <button onclick="toggleVideo()" class="btn-success" id="videoBtn" style="display: none;">📹 Выключить камеру</button>
+                            <button onclick="testConnection()" class="btn-warning">🔧 Тест соединения</button>
+                            <button onclick="hangUp()" class="btn-danger">📞 Завершить звонок</button>
+                        </div>
+                        
+                        <div id="callStatus" class="status-message"></div>
+                    </div>
+                </div>
+                
+                <div id="apiTab" style="display: none;">
+                    <h3>🔌 Тестирование API</h3>
+                    
+                    <div class="room-controls" style="margin-bottom: 20px;">
+                        <select id="apiMethod">
+                            <option value="GET">GET</option>
+                            <option value="POST">POST</option>
+                            <option value="PUT">PUT</option>
+                            <option value="DELETE">DELETE</option>
+                        </select>
+                        <input type="text" id="apiEndpoint" placeholder="/api/status" value="/api/status">
+                        <button onclick="testApi()" class="btn-primary">Отправить</button>
+                    </div>
+                    
+                    <div style="margin-bottom: 20px;">
+                        <textarea id="apiBody" placeholder="JSON тело запроса (для POST/PUT)" rows="5" style="width: 100%; padding: 10px; border-radius: 8px; border: 1px solid #e0e0e0;"></textarea>
+                    </div>
+                    
+                    <div id="apiResponse" style="background: #1a202c; color: #a0aec0; padding: 20px; border-radius: 10px; font-family: monospace; white-space: pre-wrap; min-height: 200px;">
+                        Ответ появится здесь...
+                    </div>
+                    
+                    <div class="api-docs" id="apiDocs" style="display: none;">
+                        <h3>📚 Документация API</h3>
+                        <div class="api-endpoint"><span class="method get">GET</span> /api/status - Статус сервера</div>
+                        <div class="api-endpoint"><span class="method get">GET</span> /api/rooms - Список комнат</div>
+                        <div class="api-endpoint"><span class="method get">GET</span> /api/rooms/:roomId - Информация о комнате</div>
+                        <div class="api-endpoint"><span class="method post">POST</span> /api/rooms - Создать комнату</div>
+                        <div class="api-endpoint"><span class="method put">PUT</span> /api/rooms/:roomId - Обновить комнату</div>
+                        <div class="api-endpoint"><span class="method delete">DELETE</span> /api/rooms/:roomId - Удалить комнату</div>
+                        <div class="api-endpoint"><span class="method get">GET</span> /api/users/:socketId - Информация о пользователе</div>
+                        <div class="api-endpoint"><span class="method get">GET</span> /api/calls/history - История звонков</div>
+                        <div class="api-endpoint"><span class="method get">GET</span> /api/calls/active - Активные звонки</div>
+                        <div class="api-endpoint"><span class="method post">POST</span> /api/calls/start - Инициировать звонок</div>
+                        <div class="api-endpoint"><span class="method post">POST</span> /api/calls/end/:callId - Завершить звонок</div>
+                        <div class="api-endpoint"><span class="method get">GET</span> /api/stats - Статистика сервера</div>
+                        <div class="api-endpoint"><span class="method post">POST</span> /api/webhook/:event - Webhook для внешних сервисов</div>
+                        <div class="api-endpoint"><span class="method get">GET</span> /health - Health check</div>
+                        <div class="api-endpoint"><span class="method get">GET</span> /users - Список пользователей</div>
+                        <div class="api-endpoint"><span class="method get">GET</span> /user/:email - Информация о пользователе</div>
+                        <div class="api-endpoint"><span class="method get">GET</span> /chats/:userEmail - Чаты пользователя</div>
+                        <div class="api-endpoint"><span class="method get">GET</span> /messages/:userEmail/:friendEmail - Сообщения</div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script src="/socket.io/socket.io.js"></script>
+    <script>
+        const socket = io({
+            reconnection: true,
+            reconnectionAttempts: 10,
+            reconnectionDelay: 1000
+        });
+        
+        let localStream = null;
+        let peerConnection = null;
+        let currentRoom = null;
+        let currentCallType = 'video';
+        let isAudioEnabled = true;
+        let isVideoEnabled = true;
+        let userName = 'Пользователь';
+        let mySocketId = null;
+        
+        const configuration = {
+            iceServers: [
+                { urls: 'stun:stun.l.google.com:19302' },
+                { urls: 'stun:stun1.l.google.com:19302' },
+                { urls: 'stun:stun2.l.google.com:19302' },
+                { urls: 'stun:stun3.l.google.com:19302' },
+                { urls: 'stun:stun4.l.google.com:19302' }
+            ],
+            iceCandidatePoolSize: 10
+        };
+        
+        function updateStatus(elementId, message, type) {
+            const element = document.getElementById(elementId);
+            if (element) {
+                element.textContent = message;
+                element.className = 'status-message ' + type;
+            }
+            console.log('[' + type + '] ' + message);
+        }
+        
+        function setCallType(type) {
+            currentCallType = type;
+            document.getElementById('typeVideoBtn').classList.toggle('active', type === 'video');
+            document.getElementById('typeAudioBtn').classList.toggle('active', type === 'audio');
+            document.getElementById('callTypeSelect').value = type;
+            document.getElementById('videoBtn').style.display = type === 'video' ? 'inline-block' : 'none';
+            const container = document.getElementById('videoContainer');
+            if (type === 'audio') {
+                container.classList.add('audio-only');
+            } else {
+                container.classList.remove('audio-only');
+            }
+        }
+        
+        async function testApi() {
+            const method = document.getElementById('apiMethod').value;
+            let endpoint = document.getElementById('apiEndpoint').value;
+            const body = document.getElementById('apiBody').value;
+            
+            if (!endpoint.startsWith('http')) {
+                endpoint = window.location.origin + endpoint;
+            }
+            
+            const options = {
+                method: method,
+                headers: { 'Content-Type': 'application/json' }
+            };
+            
+            if ((method === 'POST' || method === 'PUT') && body) {
+                options.body = body;
+            }
+            
+            try {
+                const response = await fetch(endpoint, options);
+                const data = await response.json();
+                document.getElementById('apiResponse').innerHTML = JSON.stringify(data, null, 2);
+            } catch (err) {
+                document.getElementById('apiResponse').innerHTML = '❌ Ошибка: ' + err.message;
+            }
+        }
+        
+        function showApiDocs() {
+            const docs = document.getElementById('apiDocs');
+            docs.style.display = docs.style.display === 'none' ? 'block' : 'none';
+        }
+        
+        function switchTab(tab) {
+            const callTab = document.getElementById('callTab');
+            const apiTab = document.getElementById('apiTab');
+            const tabCall = document.getElementById('tabCall');
+            const tabApi = document.getElementById('tabApi');
+            
+            if (tab === 'call') {
+                callTab.style.display = 'block';
+                apiTab.style.display = 'none';
+                tabCall.classList.add('active');
+                tabApi.classList.remove('active');
+            } else {
+                callTab.style.display = 'none';
+                apiTab.style.display = 'block';
+                tabCall.classList.remove('active');
+                tabApi.classList.add('active');
+            }
+        }
+        
+        async function updateRoomList() {
+            try {
+                const response = await fetch('/api/rooms');
+                const data = await response.json();
+                const roomList = document.getElementById('roomList');
+                roomList.innerHTML = '';
+                
+                data.rooms.forEach(room => {
+                    const type = room.roomInfo?.type || 'video';
+                    const typeIcon = type === 'video' ? '📹' : '🎤';
+                    const roomItem = document.createElement('div');
+                    roomItem.className = 'room-item';
+                    roomItem.onclick = () => joinRoomFromList(room.roomId);
+                    roomItem.innerHTML = '<div class="room-name">' + room.roomId + '</div>' +
+                        '<div class="room-type">' + typeIcon + ' ' + (type === 'video' ? 'Видео' : 'Аудио') + ' комната</div>' +
+                        '<div class="participants">👥 ' + room.participants + ' участников</div>';
+                    roomList.appendChild(roomItem);
+                });
+                
+                updateStatus('sidebarStatus', '✅ Онлайн: ' + data.total + ' комнат', 'success');
+            } catch (err) {
+                updateStatus('sidebarStatus', '❌ Ошибка загрузки', 'error');
+            }
+        }
+        
+        function joinRoomFromList(roomId) {
+            document.getElementById('roomInput').value = roomId;
+            joinRoom();
+        }
+        
+        async function testConnection() {
+            updateStatus('callStatus', '🔄 Тестирование соединения...', 'info');
+            try {
+                const testPC = new RTCPeerConnection(configuration);
+                let candidates = [];
+                
+                testPC.onicecandidate = (event) => {
+                    if (event.candidate) {
+                        candidates.push(event.candidate.candidate);
+                    }
+                };
+                
+                const constraints = currentCallType === 'video' 
+                    ? { video: true, audio: true }
+                    : { audio: true };
+                
+                const testStream = await navigator.mediaDevices.getUserMedia(constraints).catch(() => null);
+                
+                if (testStream) {
+                    testStream.getTracks().forEach(track => track.stop());
+                }
+                
+                await new Promise(resolve => setTimeout(resolve, 2000));
+                
+                if (candidates.length > 0) {
+                    updateStatus('callStatus', '✅ Найдено ' + candidates.length + ' ICE кандидатов', 'success');
+                } else {
+                    updateStatus('callStatus', '⚠️ Нет ICE кандидатов', 'warning');
+                }
+                
+                testPC.close();
+            } catch (err) {
+                updateStatus('callStatus', '❌ Ошибка: ' + err.message, 'error');
+            }
+        }
+        
+        async function joinRoom() {
+            const roomId = document.getElementById('roomInput').value.trim();
+            const callType = document.getElementById('callTypeSelect').value;
+            
+            if (!roomId) {
+                alert('Введите название комнаты');
+                return;
+            }
+            
+            setCallType(callType);
+            
+            document.getElementById('joinBtn').disabled = true;
+            document.getElementById('joinBtnText').classList.add('hidden');
+            document.getElementById('joinBtnLoader').classList.remove('hidden');
+            
+            updateStatus('setupStatus', 'Запрос доступа к устройствам...', 'info');
+            
+            try {
+                const constraints = callType === 'video' 
+                    ? { 
+                        video: {
+                            width: { ideal: 640 },
+                            height: { ideal: 480 },
+                            frameRate: { ideal: 30 }
+                        }, 
+                        audio: {
+                            echoCancellation: true,
+                            noiseSuppression: true
+                        }
+                    }
+                    : { 
+                        audio: {
+                            echoCancellation: true,
+                            noiseSuppression: true,
+                            autoGainControl: true
+                        } 
+                    };
+                
+                localStream = await navigator.mediaDevices.getUserMedia(constraints);
+                
+                const localVideo = document.getElementById('localVideo');
+                if (callType === 'video') {
+                    localVideo.srcObject = localStream;
+                } else {
+                    localVideo.srcObject = null;
+                }
+                
+                userName = document.getElementById('userName').value.trim() || 'Пользователь';
+                
+                if (mySocketId) {
+                    await fetch('/api/users/' + mySocketId, {
+                        method: 'PUT',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ 
+                            name: userName,
+                            type: callType,
+                            joinedAt: new Date().toISOString()
+                        })
+                    });
+                }
+                
+                currentRoom = roomId;
+                socket.emit('join-room', { roomId: roomId, userInfo: { name: userName, type: callType } });
+                
+            } catch (err) {
+                updateStatus('setupStatus', 'Ошибка: ' + err.message, 'error');
+                document.getElementById('joinBtn').disabled = false;
+                document.getElementById('joinBtnText').classList.remove('hidden');
+                document.getElementById('joinBtnLoader').classList.add('hidden');
+            }
+        }
+        
+        function createPeerConnection(peerId) {
+            const pc = new RTCPeerConnection(configuration);
+            
+            if (localStream) {
+                localStream.getTracks().forEach(track => {
+                    pc.addTrack(track, localStream);
+                });
+            }
+            
+            pc.onicecandidate = (event) => {
+                if (event.candidate) {
+                    socket.emit('ice-candidate', {
+                        target: peerId,
+                        candidate: event.candidate
+                    });
+                }
+            };
+            
+            pc.oniceconnectionstatechange = () => {
+                console.log('ICE состояние:', pc.iceConnectionState);
+                if (pc.iceConnectionState === 'connected') {
+                    updateStatus('callStatus', '✅ Соединение установлено', 'success');
+                    
+                    fetch('/api/calls/start', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            roomId: currentRoom,
+                            callerId: mySocketId,
+                            type: currentCallType
+                        })
+                    });
+                }
+            };
+            
+            pc.ontrack = (event) => {
+                console.log('Получен удаленный трек');
+                const remoteVideo = document.getElementById('remoteVideo');
+                remoteVideo.srcObject = event.streams[0];
+            };
+            
+            return pc;
+        }
+        
+        socket.on('connect', () => {
+            mySocketId = socket.id;
+            updateStatus('setupStatus', '✅ Подключено к серверу', 'success');
+            updateRoomList();
+            setInterval(updateRoomList, 5000);
+        });
+        
+        socket.on('join-success', (data) => {
+            console.log('Подключились к комнате:', data);
+            document.getElementById('setupSection').style.display = 'none';
+            document.getElementById('videoSection').style.display = 'block';
+            updateStatus('callStatus', '🟡 Ожидание собеседника...', 'info');
+            document.getElementById('joinBtn').disabled = false;
+            document.getElementById('joinBtnText').classList.remove('hidden');
+            document.getElementById('joinBtnLoader').classList.add('hidden');
+        });
+        
+        socket.on('peer-joined', async (peerId) => {
+            console.log('Собеседник подключился:', peerId);
+            updateStatus('callStatus', '🟡 Собеседник найден, соединение...', 'info');
+            
+            try {
+                await new Promise(resolve => setTimeout(resolve, 500));
+                peerConnection = createPeerConnection(peerId);
+                const offer = await peerConnection.createOffer({
+                    offerToReceiveAudio: true,
+                    offerToReceiveVideo: currentCallType === 'video'
+                });
+                await peerConnection.setLocalDescription(offer);
+                socket.emit('offer', {
+                    target: peerId,
+                    offer: offer
+                });
+            } catch (err) {
+                updateStatus('callStatus', 'Ошибка: ' + err.message, 'error');
+            }
+        });
+        
+        socket.on('offer', async ({ offer, sender }) => {
+            console.log('Получен оффер');
+            updateStatus('callStatus', '🟡 Получен запрос на соединение...', 'info');
+            
+            try {
+                if (!peerConnection) {
+                    peerConnection = createPeerConnection(sender);
+                }
+                await peerConnection.setRemoteDescription(new RTCSessionDescription(offer));
+                const answer = await peerConnection.createAnswer();
+                await peerConnection.setLocalDescription(answer);
+                socket.emit('answer', {
+                    target: sender,
+                    answer: answer
+                });
+            } catch (err) {
+                updateStatus('callStatus', 'Ошибка: ' + err.message, 'error');
+            }
+        });
+        
+        socket.on('answer', async ({ answer }) => {
+            console.log('Получен ответ');
+            try {
+                if (peerConnection && !peerConnection.currentRemoteDescription) {
+                    await peerConnection.setRemoteDescription(new RTCSessionDescription(answer));
+                }
+            } catch (err) {
+                console.error('Ошибка:', err);
+            }
+        });
+        
+        socket.on('ice-candidate', async ({ candidate }) => {
+            console.log('Получен ICE кандидат');
+            if (peerConnection) {
+                try {
+                    await peerConnection.addIceCandidate(new RTCIceCandidate(candidate));
+                } catch (err) {
+                    console.error('Ошибка:', err);
+                }
+            }
+        });
+        
+        socket.on('peer-disconnected', () => {
+            console.log('Собеседник отключился');
+            updateStatus('callStatus', '🔴 Собеседник отключился', 'error');
+            if (peerConnection) {
+                peerConnection.close();
+                peerConnection = null;
+            }
+            document.getElementById('remoteVideo').srcObject = null;
+            updateStatus('callStatus', '🟡 Ожидание нового собеседника...', 'info');
+        });
+        
+        socket.on('room-full', () => {
+            alert('Комната переполнена! Максимум 2 участника.');
+            hangUp();
+        });
+        
+        function toggleAudio() {
+            if (localStream) {
+                const audioTrack = localStream.getAudioTracks()[0];
+                if (audioTrack) {
+                    audioTrack.enabled = !audioTrack.enabled;
+                    isAudioEnabled = audioTrack.enabled;
+                    document.getElementById('audioBtn').innerHTML = isAudioEnabled ? 
+                        '🔊 Выключить микрофон' : '🔇 Включить микрофон';
+                }
+            }
+        }
+        
+        function toggleVideo() {
+            if (localStream && currentCallType === 'video') {
+                const videoTrack = localStream.getVideoTracks()[0];
+                if (videoTrack) {
+                    videoTrack.enabled = !videoTrack.enabled;
+                    isVideoEnabled = videoTrack.enabled;
+                    document.getElementById('videoBtn').innerHTML = isVideoEnabled ? 
+                        '📹 Выключить камеру' : '📹 Включить камеру';
+                }
+            }
+        }
+        
+        function hangUp() {
+            if (currentRoom && mySocketId) {
+                fetch('/api/calls/active')
+                    .then(res => res.json())
+                    .then(data => {
+                        const myCall = data.calls.find(call => 
+                            call.roomId === currentRoom && 
+                            call.participants && call.participants.includes(mySocketId)
+                        );
+                        if (myCall) {
+                            fetch('/api/calls/end/' + myCall.callId, {
+                                method: 'POST',
+                                headers: { 'Content-Type': 'application/json' },
+                                body: JSON.stringify({ endedBy: mySocketId })
+                            });
+                        }
+                    })
+                    .catch(err => console.error('Ошибка при завершении звонка:', err));
+            }
+            
+            if (peerConnection) {
+                peerConnection.close();
+                peerConnection = null;
+            }
+            
+            if (localStream) {
+                localStream.getTracks().forEach(track => track.stop());
+                localStream = null;
+            }
+            
+            document.getElementById('localVideo').srcObject = null;
+            document.getElementById('remoteVideo').srcObject = null;
+            
+            if (currentRoom) {
+                socket.emit('leave-room', currentRoom);
+                currentRoom = null;
+            }
+            
+            document.getElementById('setupSection').style.display = 'block';
+            document.getElementById('videoSection').style.display = 'none';
+            document.getElementById('joinBtn').disabled = false;
+            document.getElementById('joinBtnText').classList.remove('hidden');
+            document.getElementById('joinBtnLoader').classList.add('hidden');
+        }
+    </script>
+</body>
+</html>
+  `);
 });
 
-// Graceful shutdown
+// ===== ЗАПУСК СЕРВЕРА =====
+server.listen(PORT, '0.0.0.0', async () => {
+    console.log('\n' + '='.repeat(60));
+    console.log('🚀 ЗАПУСК ОБЪЕДИНЕННОГО СЕРВЕРА BERESTA');
+    console.log('='.repeat(60));
+    console.log(`📡 Порт: ${PORT}`);
+    console.log(`🆔 Server ID: ${SERVER_ID}`);
+    console.log(`🌐 Режим: ${process.env.NODE_ENV || 'development'}`);
+    console.log(`📡 Веб-интерфейс: http://localhost:${PORT}`);
+    console.log(`🔌 API Endpoint: http://localhost:${PORT}/api`);
+    console.log(`📡 Socket.IO (чат и звонки) активен на /socket.io`);
+    console.log(`💾 База данных: Supabase (${supabaseUrl})`);
+    console.log(`📁 Папка загрузок: ${uploadDir}`);
+    console.log('='.repeat(60) + '\n');
+});
+
+// ===== Graceful shutdown =====
 process.on('SIGINT', async () => {
     console.log('\n🛑 Остановка сервера...');
+    
+    // Очищаем присутствие всех пользователей на этом сервере
+    try {
+        await supabase
+            .from('user_presence')
+            .delete()
+            .eq('server_id', SERVER_ID);
+        console.log('✅ Присутствие пользователей очищено');
+    } catch (error) {
+        console.error('❌ Ошибка очистки присутствия:', error);
+    }
+    
+    process.exit(0);
+});
+
+process.on('SIGTERM', async () => {
+    console.log('\n🛑 Остановка сервера (SIGTERM)...');
+    
+    try {
+        await supabase
+            .from('user_presence')
+            .delete()
+            .eq('server_id', SERVER_ID);
+        console.log('✅ Присутствие пользователей очищено');
+    } catch (error) {
+        console.error('❌ Ошибка очистки присутствия:', error);
+    }
+    
     process.exit(0);
 });
