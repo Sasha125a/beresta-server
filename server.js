@@ -3157,6 +3157,67 @@ app.get('/', (req, res) => {
   `);
 });
 
+// Добавьте в server.js после других эндпоинтов
+
+// ==================== AGORA.IO ====================
+const Agora = require('agora-access-token');
+const AGORA_APP_ID = process.env.AGORA_APP_ID || 'your_app_id';
+const AGORA_APP_CERTIFICATE = process.env.AGORA_APP_CERTIFICATE || 'your_app_certificate';
+
+// Эндпоинт для получения токена Agora
+app.post('/api/agora/token', (req, res) => {
+    try {
+        const { channelName, uid = 0, role = 1 } = req.body;
+        
+        if (!channelName) {
+            return res.status(400).json({ 
+                success: false, 
+                error: 'channelName обязателен' 
+            });
+        }
+
+        // Срок действия токена - 1 час
+        const expirationTimeInSeconds = 3600;
+        const currentTimestamp = Math.floor(Date.now() / 1000);
+        const privilegeExpiredTs = currentTimestamp + expirationTimeInSeconds;
+
+        // Создаем токен
+        const token = Agora.RtcTokenBuilder.buildTokenWithUid(
+            AGORA_APP_ID,
+            AGORA_APP_CERTIFICATE,
+            channelName,
+            uid,
+            role,
+            privilegeExpiredTs
+        );
+
+        console.log(`🔑 Agora токен сгенерирован для канала ${channelName}`);
+        
+        res.json({
+            success: true,
+            token: token,
+            appId: AGORA_APP_ID,
+            channelName: channelName,
+            uid: uid,
+            expirationTime: privilegeExpiredTs
+        });
+    } catch (error) {
+        console.error('❌ Ошибка генерации токена Agora:', error);
+        res.status(500).json({
+            success: false,
+            error: error.message
+        });
+    }
+});
+
+// Эндпоинт для получения App ID
+app.get('/api/agora/app-id', (req, res) => {
+    res.json({
+        success: true,
+        appId: AGORA_APP_ID
+    });
+});
+
 // ===== ЗАПУСК СЕРВЕРА =====
 server.listen(PORT, '0.0.0.0', async () => {
     console.log('\n' + '='.repeat(60));
