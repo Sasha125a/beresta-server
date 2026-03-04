@@ -455,11 +455,27 @@ io.on('connection', (socket) => {
     });
 
     socket.on('answer', (data) => {
+        console.log('='.repeat(40));
         console.log('📤 Ответ от ' + socket.id + ' к ' + data.target);
-        socket.to(data.target).emit('answer', {
-            answer: data.answer,
-            sender: socket.id
+        console.log('📦 Данные ответа:', {
+            target: data.target,
+            hasAnswer: !!data.answer,
+            answerLength: data.answer?.length
         });
+        
+        // Проверяем, существует ли целевой сокет
+        const targetSocket = io.sockets.sockets.get(data.target);
+        if (targetSocket) {
+            console.log(`✅ Целевой сокет ${data.target} найден`);
+            socket.to(data.target).emit('answer', {
+                answer: data.answer,
+                sender: socket.id
+            });
+            console.log(`✅ Ответ отправлен`);
+        } else {
+            console.log(`❌ Целевой сокет ${data.target} не найден!`);
+        }
+        console.log('='.repeat(40));
     });
 
     socket.on('ice-candidate', (data) => {
