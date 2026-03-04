@@ -12,11 +12,13 @@ const ffmpegPath = require('ffmpeg-static');
 const ffprobePath = require('ffprobe-static').path;
 const http = require('http');
 const socketIo = require('socket.io');
+const axios = require('axios'); // Добавлен для HTTP запросов к сервису звонков
 const { createClient } = require('@supabase/supabase-js');
 
 // ==================== КОНФИГУРАЦИЯ ====================
 const isRender = process.env.NODE_ENV === 'production';
 const SERVER_ID = process.env.RENDER_SERVICE_ID || `server-${Math.random().toString(36).substring(2, 10)}`;
+const CALL_SERVICE_URL = 'https://beresta-zvonok.onrender.com'; // URL сервиса звонков
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -333,6 +335,198 @@ async function cleanupOldPresence() {
 // Запускаем очистку раз в минуту
 setInterval(cleanupOldPresence, 60000);
 
+// ==================== ФУНКЦИИ ДЛЯ РАБОТЫ С СЕРВИСОМ ЗВОНКОВ ====================
+
+/**
+ * Проверка статуса сервиса звонков
+ */
+async function checkCallServiceStatus() {
+    try {
+        const response = await axios.get(`${CALL_SERVICE_URL}/api/status`, { timeout: 5000 });
+        return {
+            online: true,
+            data: response.data
+        };
+    } catch (error) {
+        console.error('❌ Сервис звонков недоступен:', error.message);
+        return {
+            online: false,
+            error: error.message
+        };
+    }
+}
+
+/**
+ * Создание комнаты для звонка
+ */
+async function createCallRoom(roomData) {
+    try {
+        const response = await axios.post(`${CALL_SERVICE_URL}/api/rooms`, roomData);
+        return {
+            success: true,
+            data: response.data
+        };
+    } catch (error) {
+        console.error('❌ Ошибка создания комнаты звонка:', error.response?.data || error.message);
+        return {
+            success: false,
+            error: error.response?.data || error.message
+        };
+    }
+}
+
+/**
+ * Получение информации о комнате
+ */
+async function getCallRoom(roomId) {
+    try {
+        const response = await axios.get(`${CALL_SERVICE_URL}/api/rooms/${roomId}`);
+        return {
+            success: true,
+            data: response.data
+        };
+    } catch (error) {
+        console.error('❌ Ошибка получения комнаты звонка:', error.response?.data || error.message);
+        return {
+            success: false,
+            error: error.response?.data || error.message
+        };
+    }
+}
+
+/**
+ * Обновление комнаты
+ */
+async function updateCallRoom(roomId, updateData) {
+    try {
+        const response = await axios.put(`${CALL_SERVICE_URL}/api/rooms/${roomId}`, updateData);
+        return {
+            success: true,
+            data: response.data
+        };
+    } catch (error) {
+        console.error('❌ Ошибка обновления комнаты звонка:', error.response?.data || error.message);
+        return {
+            success: false,
+            error: error.response?.data || error.message
+        };
+    }
+}
+
+/**
+ * Удаление комнаты
+ */
+async function deleteCallRoom(roomId) {
+    try {
+        const response = await axios.delete(`${CALL_SERVICE_URL}/api/rooms/${roomId}`);
+        return {
+            success: true,
+            data: response.data
+        };
+    } catch (error) {
+        console.error('❌ Ошибка удаления комнаты звонка:', error.response?.data || error.message);
+        return {
+            success: false,
+            error: error.response?.data || error.message
+        };
+    }
+}
+
+/**
+ * Получение списка активных звонков
+ */
+async function getActiveCalls() {
+    try {
+        const response = await axios.get(`${CALL_SERVICE_URL}/api/calls/active`);
+        return {
+            success: true,
+            data: response.data
+        };
+    } catch (error) {
+        console.error('❌ Ошибка получения активных звонков:', error.response?.data || error.message);
+        return {
+            success: false,
+            error: error.response?.data || error.message
+        };
+    }
+}
+
+/**
+ * Инициирование звонка
+ */
+async function startCall(callData) {
+    try {
+        const response = await axios.post(`${CALL_SERVICE_URL}/api/calls/start`, callData);
+        return {
+            success: true,
+            data: response.data
+        };
+    } catch (error) {
+        console.error('❌ Ошибка инициации звонка:', error.response?.data || error.message);
+        return {
+            success: false,
+            error: error.response?.data || error.message
+        };
+    }
+}
+
+/**
+ * Завершение звонка
+ */
+async function endCall(callId) {
+    try {
+        const response = await axios.post(`${CALL_SERVICE_URL}/api/calls/end/${callId}`);
+        return {
+            success: true,
+            data: response.data
+        };
+    } catch (error) {
+        console.error('❌ Ошибка завершения звонка:', error.response?.data || error.message);
+        return {
+            success: false,
+            error: error.response?.data || error.message
+        };
+    }
+}
+
+/**
+ * Получение истории звонков
+ */
+async function getCallHistory() {
+    try {
+        const response = await axios.get(`${CALL_SERVICE_URL}/api/calls/history`);
+        return {
+            success: true,
+            data: response.data
+        };
+    } catch (error) {
+        console.error('❌ Ошибка получения истории звонков:', error.response?.data || error.message);
+        return {
+            success: false,
+            error: error.response?.data || error.message
+        };
+    }
+}
+
+/**
+ * Получение статистики сервиса звонков
+ */
+async function getCallServiceStats() {
+    try {
+        const response = await axios.get(`${CALL_SERVICE_URL}/api/stats`);
+        return {
+            success: true,
+            data: response.data
+        };
+    } catch (error) {
+        console.error('❌ Ошибка получения статистики сервиса звонков:', error.response?.data || error.message);
+        return {
+            success: false,
+            error: error.response?.data || error.message
+        };
+    }
+}
+
 // ==================== SOCKET.IO СОЕДИНЕНИЯ (для чата) ====================
 
 io.on('connection', (socket) => {
@@ -417,6 +611,9 @@ app.get('/health', async (req, res) => {
             .eq('status', 'online')
             .gte('last_seen', new Date(Date.now() - 30000).toISOString());
 
+        // Проверка доступности сервиса звонков
+        const callServiceStatus = await checkCallServiceStatus();
+
         // Проверка доступности директорий
         const dirs = [uploadDir, tempDir, permanentDir, thumbnailsDir];
         const dirStatus = {};
@@ -432,6 +629,10 @@ app.get('/health', async (req, res) => {
             uptime: process.uptime(),
             memory: process.memoryUsage(),
             directories: dirStatus,
+            callService: {
+                url: CALL_SERVICE_URL,
+                status: callServiceStatus
+            },
             timestamp: new Date().toISOString()
         });
     } catch (error) {
@@ -1563,6 +1764,189 @@ app.get('/online-users', async (req, res) => {
     }
 });
 
+// ==================== НОВЫЕ ЭНДПОИНТЫ ДЛЯ ИНТЕГРАЦИИ С СЕРВИСОМ ЗВОНКОВ ====================
+
+/**
+ * Проверка статуса сервиса звонков
+ */
+app.get('/call-service/status', async (req, res) => {
+    const status = await checkCallServiceStatus();
+    res.json({
+        success: status.online,
+        ...status
+    });
+});
+
+/**
+ * Создание комнаты для звонка
+ */
+app.post('/call-service/rooms', async (req, res) => {
+    const result = await createCallRoom(req.body);
+    res.status(result.success ? 200 : 500).json(result);
+});
+
+/**
+ * Получение информации о комнате
+ */
+app.get('/call-service/rooms/:roomId', async (req, res) => {
+    const result = await getCallRoom(req.params.roomId);
+    res.status(result.success ? 200 : 404).json(result);
+});
+
+/**
+ * Обновление комнаты
+ */
+app.put('/call-service/rooms/:roomId', async (req, res) => {
+    const result = await updateCallRoom(req.params.roomId, req.body);
+    res.status(result.success ? 200 : 500).json(result);
+});
+
+/**
+ * Удаление комнаты
+ */
+app.delete('/call-service/rooms/:roomId', async (req, res) => {
+    const result = await deleteCallRoom(req.params.roomId);
+    res.status(result.success ? 200 : 500).json(result);
+});
+
+/**
+ * Получение списка комнат
+ */
+app.get('/call-service/rooms', async (req, res) => {
+    try {
+        const response = await axios.get(`${CALL_SERVICE_URL}/api/rooms`);
+        res.json({
+            success: true,
+            data: response.data
+        });
+    } catch (error) {
+        res.status(500).json({
+            success: false,
+            error: error.response?.data || error.message
+        });
+    }
+});
+
+/**
+ * Инициирование звонка
+ */
+app.post('/call-service/calls/start', async (req, res) => {
+    const result = await startCall(req.body);
+    res.status(result.success ? 200 : 500).json(result);
+});
+
+/**
+ * Завершение звонка
+ */
+app.post('/call-service/calls/end/:callId', async (req, res) => {
+    const result = await endCall(req.params.callId);
+    res.status(result.success ? 200 : 500).json(result);
+});
+
+/**
+ * Получение активных звонков
+ */
+app.get('/call-service/calls/active', async (req, res) => {
+    const result = await getActiveCalls();
+    res.status(result.success ? 200 : 500).json(result);
+});
+
+/**
+ * Получение истории звонков
+ */
+app.get('/call-service/calls/history', async (req, res) => {
+    const result = await getCallHistory();
+    res.status(result.success ? 200 : 500).json(result);
+});
+
+/**
+ * Получение статистики сервиса звонков
+ */
+app.get('/call-service/stats', async (req, res) => {
+    const result = await getCallServiceStats();
+    res.status(result.success ? 200 : 500).json(result);
+});
+
+/**
+ * Webhook для событий звонков
+ */
+app.post('/call-service/webhook/:event', async (req, res) => {
+    try {
+        const { event } = req.params;
+        const webhookData = req.body;
+        
+        console.log(`📞 Получен webhook события звонка: ${event}`, webhookData);
+        
+        // Здесь можно обрабатывать webhook события от сервиса звонков
+        // Например, уведомлять пользователей через Socket.IO о статусе звонка
+        
+        // Пример: если звонок начался, уведомить участников
+        if (event === 'call-started') {
+            const { roomId, participants } = webhookData;
+            
+            // Уведомляем участников через Socket.IO
+            participants?.forEach(email => {
+                io.emit(`call:${email}`, {
+                    type: 'incoming-call',
+                    roomId,
+                    caller: webhookData.caller
+                });
+            });
+        }
+        
+        // Если звонок завершился
+        if (event === 'call-ended') {
+            const { roomId, participants } = webhookData;
+            
+            participants?.forEach(email => {
+                io.emit(`call:${email}`, {
+                    type: 'call-ended',
+                    roomId
+                });
+            });
+        }
+        
+        res.json({
+            success: true,
+            message: `Webhook ${event} обработан`
+        });
+    } catch (error) {
+        console.error('❌ Ошибка обработки webhook:', error);
+        res.status(500).json({
+            success: false,
+            error: error.message
+        });
+    }
+});
+
+// ===== Информация о сервисе звонков =====
+app.get('/call-service/info', async (req, res) => {
+    try {
+        // Получаем основную информацию о сервисе
+        const [status, stats] = await Promise.all([
+            checkCallServiceStatus(),
+            getCallServiceStats()
+        ]);
+        
+        res.json({
+            success: true,
+            serviceUrl: CALL_SERVICE_URL,
+            status: status,
+            stats: stats.success ? stats.data : null,
+            endpoints: {
+                rooms: `${CALL_SERVICE_URL}/api/rooms`,
+                calls: `${CALL_SERVICE_URL}/api/calls`,
+                stats: `${CALL_SERVICE_URL}/api/stats`
+            }
+        });
+    } catch (error) {
+        res.status(500).json({
+            success: false,
+            error: error.message
+        });
+    }
+});
+
 // ===== СТАТИЧЕСКИЕ ФАЙЛЫ =====
 app.use('/uploads', express.static(uploadDir));
 
@@ -1575,9 +1959,18 @@ server.listen(PORT, '0.0.0.0', async () => {
     console.log(`🆔 Server ID: ${SERVER_ID}`);
     console.log(`🌐 Режим: ${process.env.NODE_ENV || 'development'}`);
     console.log(`📡 Socket.IO (чат) активен на /socket.io`);
+    console.log(`📞 Сервис звонков: ${CALL_SERVICE_URL}`);
     console.log(`💾 База данных: Supabase (${supabaseUrl})`);
     console.log(`📁 Папка загрузок: ${uploadDir}`);
     console.log('='.repeat(50) + '\n');
+    
+    // Проверяем доступность сервиса звонков
+    const callServiceStatus = await checkCallServiceStatus();
+    if (callServiceStatus.online) {
+        console.log('✅ Сервис звонков доступен');
+    } else {
+        console.log('⚠️ Сервис звонков недоступен:', callServiceStatus.error);
+    }
 });
 
 // ===== Graceful shutdown =====
