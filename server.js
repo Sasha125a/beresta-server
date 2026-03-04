@@ -870,21 +870,15 @@ app.post('/api/webhook/:event', (req, res) => {
 
 // ===== НОВЫЕ ЭНДПОИНТЫ ДЛЯ ЗВОНКОВ (ПРОСТАЯ РЕАЛИЗАЦИЯ) =====
 
-/**
- * Инициирование звонка (простая версия)
- */
+// В server.js, в эндпоинте /api/calls/initiate добавьте:
+
 app.post('/api/calls/initiate', async (req, res) => {
     try {
         const { callerEmail, receiverEmail, callType } = req.body;
         
-        if (!callerEmail || !receiverEmail) {
-            return res.status(400).json({
-                success: false,
-                error: 'Email звонящего и получателя обязательны'
-            });
-        }
-        
+        console.log('='.repeat(60));
         console.log(`📞 Инициирование звонка: ${callerEmail} -> ${receiverEmail}`);
+        console.log(`📋 Данные запроса:`, req.body);
         
         // Генерируем уникальный ID комнаты
         const roomId = `call_${Date.now()}_${Math.random().toString(36).substring(2, 10)}`;
@@ -900,11 +894,21 @@ app.post('/api/calls/initiate', async (req, res) => {
             participants: [callerEmail]
         };
         
-        // Сохраняем в Map
         activeCalls.set(roomId, callData);
         
-        // Отправляем уведомление получателю через Socket.IO
-        io.emit(`call:${receiverEmail}`, {
+        // ПРОВЕРЯЕМ ПОДКЛЮЧЕННЫХ КЛИЕНТОВ
+        const clients = Array.from(io.sockets.sockets.keys());
+        console.log(`🟢 Подключенные клиенты (${clients.length}):`, clients);
+        
+        // Получаем все комнаты (для отладки)
+        const rooms = io.sockets.adapter.rooms;
+        console.log('📋 Активные комнаты:', Array.from(rooms.keys()));
+        
+        // ОТПРАВЛЯЕМ УВЕДОМЛЕНИЕ
+        const callEventName = `call:${receiverEmail}`;
+        console.log(`📤 Отправка события: ${callEventName}`);
+        
+        const emitResult = io.emit(callEventName, {
             type: 'incoming-call',
             roomId: roomId,
             caller: callerEmail,
@@ -912,7 +916,19 @@ app.post('/api/calls/initiate', async (req, res) => {
             timestamp: new Date().toISOString()
         });
         
-        console.log(`✅ Звонок инициирован, комната: ${roomId}`);
+        console.log(`📊 Результат отправки:`, emitResult);
+        
+        // Также отправляем общее событие
+        io.emit('incoming-call', {
+            roomId: roomId,
+            caller: callerEmail,
+            receiver: receiverEmail,
+            callType: callType || 'audio',
+            timestamp: new Date().toISOString()
+        });
+        
+        console.log('✅ Звонок инициирован, комната:', roomId);
+        console.log('='.repeat(60));
         
         res.json({
             success: true,
@@ -926,6 +942,36 @@ app.post('/api/calls/initiate', async (req, res) => {
             success: false,
             error: error.message
         });
+    }
+});
+
+// В server.js добавьте:
+
+app.get('/api/debug/socket/:email', (req, res) => {
+    try {
+        const { email } = req.params;
+        
+        // Получаем информацию о сокетах
+        const sockets = Array.from(io.sockets.sockets.values()).map(socket => ({
+            id: socket.id,
+            email: socket.userEmail,
+            connected: socket.connected,
+            rooms: Array.from(socket.rooms)
+        }));
+        
+        // Проверяем, есть ли пользователь онлайн
+        const userSockets = sockets.filter(s => s.email === email);
+        
+        res.json({
+            success: true,
+            email: email,
+            isOnline: userSockets.length > 0,
+            userSockets: userSockets,
+            allSockets: sockets,
+            totalConnections: sockets.length
+        });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
     }
 });
 
