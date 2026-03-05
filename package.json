@@ -1,7 +1,7 @@
 {
   "name": "beresta-server",
   "version": "1.0.0",
-  "description": "Backend server for Beresta messaging application with WebRTC, WebSocket, and file sharing support",
+  "description": "Backend server for Beresta messaging application with WebRTC, WebSocket, file sharing, and FCM push notifications",
   "main": "server.js",
   "type": "commonjs",
   "scripts": {
@@ -23,7 +23,10 @@
     "sqlite",
     "express",
     "agora",
-    "real-time"
+    "real-time",
+    "fcm",
+    "firebase",
+    "push-notifications"
   ],
   "author": "Beresta Team",
   "license": "MIT",
@@ -41,7 +44,8 @@
     "agora-access-token": "^2.0.4",
     "socket.io": "^4.7.4",
     "firebase-admin": "^11.11.1",
-    "@supabase/supabase-js": "^2.39.0"
+    "@supabase/supabase-js": "^2.39.0",
+    "dotenv": "^16.3.1"
   },
   "devDependencies": {
     "nodemon": "^3.0.1"
