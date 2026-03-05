@@ -392,35 +392,33 @@ async function sendFCMNotification(userEmail, title, body, data) {
             return false;
         }
 
+        // ВАЖНО: Отправляем DATA MESSAGE, а не Notification Message
+        // Убираем поле notification, оставляем только data
         const message = {
-            notification: {
-                title: title,
-                body: body,
-            },
             data: {
                 ...data,
+                title: title,           // Добавляем title в data
+                body: body,              // Добавляем body в data
+                type: 'call',
                 click_action: 'OPEN_CALL_ACTIVITY'
             },
             token: userData[0].fcm_token,
             android: {
                 priority: 'high',
-                notification: {
-                    channelId: 'calls',
-                    priority: 'high',
-                    visibility: 'public',
-                    clickAction: 'OPEN_CALL_ACTIVITY',
-                    sound: 'default'
-                },
+                data: {
+                    ...data,
+                    title: title,
+                    body: body
+                }
             },
         };
 
         const response = await admin.messaging().send(message);
-        console.log(`✅ FCM уведомление отправлено для ${userEmail}`);
+        console.log(`✅ FCM Data Message отправлено для ${userEmail}`);
         return true;
     } catch (error) {
         console.error('❌ Ошибка отправки FCM:', error);
         
-        // Если токен устарел, удаляем его из базы
         if (error.code === 'messaging/registration-token-not-registered') {
             await supabase
                 .from('user_fcm_tokens')
