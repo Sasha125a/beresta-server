@@ -42,16 +42,28 @@ let firebaseInitialized = false;
 try {
     // Пробуем загрузить из переменной окружения (для Render.com)
     if (process.env.FIREBASE_SERVICE_ACCOUNT_JSON) {
-        const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT_JSON);
+        console.log('📦 Найден FIREBASE_SERVICE_ACCOUNT_JSON, пытаемся распарсить...');
+        
+        // Убираем экранирование если нужно
+        let jsonString = process.env.FIREBASE_SERVICE_ACCOUNT_JSON;
+        if (jsonString.startsWith('"') && jsonString.endsWith('"')) {
+            jsonString = jsonString.slice(1, -1).replace(/\\n/g, '\n').replace(/\\"/g, '"');
+        }
+        
+        const serviceAccount = JSON.parse(jsonString);
+        console.log(`✅ JSON распарсен, project_id: ${serviceAccount.project_id}`);
+        
         admin.initializeApp({
             credential: admin.credential.cert(serviceAccount)
         });
         firebaseInitialized = true;
         console.log('✅ Firebase Admin инициализирован из переменной окружения');
         console.log(`🔥 Проект: ${serviceAccount.project_id}`);
+        console.log(`📧 Client email: ${serviceAccount.client_email}`);
     } 
     // Если нет, пробуем загрузить из файла (для локальной разработки)
     else {
+        console.log('📦 FIREBASE_SERVICE_ACCOUNT_JSON не найден, ищем файл...');
         // Ищем любой файл, содержащий firebase-adminsdk
         const files = fs.readdirSync('./').filter(f => f.includes('firebase-adminsdk') && f.endsWith('.json'));
         if (files.length > 0) {
@@ -68,6 +80,7 @@ try {
     }
 } catch (error) {
     console.error('❌ Ошибка инициализации Firebase Admin:', error.message);
+    console.error('❌ Стек ошибки:', error.stack);
 }
 
 // ==================== SUPABASE ====================
@@ -675,6 +688,61 @@ app.get('/health', async (req, res) => {
             success: false,
             error: 'Health check failed',
             details: error.message
+        });
+    }
+});
+
+/**
+ * Получение групп пользователя
+ */
+app.get('/groups/:userEmail', async (req, res) => {
+    try {
+        const userEmail = req.params.userEmail.toLowerCase();
+
+        const { data, error } = await supabase
+            .from('group_members')
+            .select(`
+                group_id,
+                role,
+                groups (
+                    id,
+                    name,
+                    description,
+                    created_by,
+                    created_at
+                )
+            `)
+            .eq('user_email', userEmail);
+
+        if (error) throw error;
+
+        // Получаем количество участников для каждой группы
+        const groups = await Promise.all((data || []).map(async (item) => {
+            const { count } = await supabase
+                .from('group_members')
+                .select('*', { count: 'exact', head: true })
+                .eq('group_id', item.group_id);
+
+            return {
+                id: item.groups.id,
+                name: item.groups.name,
+                description: item.groups.description,
+                created_by: item.groups.created_by,
+                created_at: item.groups.created_at,
+                role: item.role,
+                member_count: count || 0
+            };
+        }));
+
+        res.json({
+            success: true,
+            groups
+        });
+    } catch (error) {
+        console.error('❌ Ошибка получения групп:', error);
+        res.status(500).json({ 
+            success: false, 
+            error: 'Internal server error' 
         });
     }
 });
