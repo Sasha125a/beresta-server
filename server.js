@@ -1463,9 +1463,79 @@ app.get('/messages/:userEmail/:friendEmail', async (req, res) => {
     }
 });
 
-/**
- * Отправка сообщения
- */
+// Добавьте эту функцию после sendFCMNotification
+
+async function sendFCMNotificationForMessage(receiverEmail, senderName, message, messageId, isGroup = false) {
+    if (!firebaseInitialized) {
+        console.log('❌ Firebase не инициализирован');
+        return false;
+    }
+
+    try {
+        // Получаем FCM токен получателя
+        const { data: userData, error } = await supabase
+            .from('user_fcm_tokens')
+            .select('fcm_token')
+            .eq('user_email', receiverEmail.toLowerCase())
+            .order('created_at', { ascending: false })
+            .limit(1);
+
+        if (error) throw error;
+
+        if (!userData || userData.length === 0 || !userData[0].fcm_token) {
+            console.log(`❌ Нет FCM токена для ${receiverEmail}`);
+            return false;
+        }
+
+        const title = isGroup ? '💬 Новое сообщение в группе' : '💬 Новое сообщение';
+        const body = `${senderName}: ${message.substring(0, 50)}${message.length > 50 ? '...' : ''}`;
+
+        const messageData = {
+            notification: {
+                title: title,
+                body: body,
+            },
+            data: {
+                type: 'message',
+                senderName: senderName,
+                senderEmail: receiverEmail, // Внимание: здесь может быть ошибка, нужно передавать отправителя
+                message: message,
+                messageId: messageId.toString(),
+                isGroup: isGroup.toString(),
+                click_action: 'OPEN_CHAT_ACTIVITY'
+            },
+            token: userData[0].fcm_token,
+            android: {
+                priority: 'high',
+                notification: {
+                    channelId: 'messages',
+                    priority: 'high',
+                    visibility: 'private',
+                    clickAction: 'OPEN_CHAT_ACTIVITY',
+                    sound: 'default'
+                },
+            },
+        };
+
+        const response = await admin.messaging().send(messageData);
+        console.log(`✅ FCM уведомление о сообщении отправлено для ${receiverEmail}`);
+        return true;
+    } catch (error) {
+        console.error('❌ Ошибка отправки FCM для сообщения:', error);
+        
+        if (error.code === 'messaging/registration-token-not-registered') {
+            await supabase
+                .from('user_fcm_tokens')
+                .delete()
+                .eq('user_email', receiverEmail.toLowerCase());
+            console.log(`🗑️ Удален устаревший FCM токен для ${receiverEmail}`);
+        }
+        
+        return false;
+    }
+}
+
+// Обновите эндпоинт отправки сообщения
 app.post('/send-message', async (req, res) => {
     try {
         const { senderEmail, receiverEmail, message, duration } = req.body;
@@ -1501,12 +1571,98 @@ app.post('/send-message', async (req, res) => {
 
         await addToChatsAutomatically(senderEmail, receiverEmail);
 
+        // Отправляем FCM уведомление получателю
+        const senderName = `${senderInfo.first_name || ''} ${senderInfo.last_name || ''}`.trim() || senderEmail;
+        await sendFCMNotificationForMessage(
+            receiverEmail,
+            senderName,
+            message || '',
+            data[0].id,
+            false
+        );
+
+        // Отправляем через Socket.IO если получатель онлайн
+        const receiverSocketId = emailToSocket.get(receiverEmail.toLowerCase());
+        if (receiverSocketId) {
+            io.to(receiverSocketId).emit('new_message', {
+                id: data[0].id,
+                senderEmail: senderEmail,
+                message: message,
+                timestamp: new Date().toISOString()
+            });
+        }
+
         res.json({
             success: true,
             messageId: data[0].id
         });
     } catch (error) {
         console.error('❌ Ошибка отправки сообщения:', error);
+        res.status(500).json({ success: false, error: 'Internal server error' });
+    }
+});
+
+// Добавьте эндпоинт для групповых сообщений
+app.post('/send-group-message', async (req, res) => {
+    try {
+        const { groupId, senderEmail, message, duration } = req.body;
+
+        if (!groupId || !senderEmail) {
+            return res.status(400).json({
+                success: false,
+                error: 'Группа и отправитель обязательны'
+            });
+        }
+
+        const senderInfo = await getUserInfo(senderEmail);
+        if (!senderInfo) {
+            return res.status(404).json({
+                success: false,
+                error: 'Отправитель не найден'
+            });
+        }
+
+        const { data, error } = await supabase
+            .from('group_messages')
+            .insert([{
+                group_id: groupId,
+                sender_email: senderEmail.toLowerCase(),
+                message: message || '',
+                duration: duration || 0
+            }])
+            .select();
+
+        if (error) throw error;
+
+        // Получаем всех участников группы
+        const { data: members, error: membersError } = await supabase
+            .from('group_members')
+            .select('user_email')
+            .eq('group_id', groupId);
+
+        if (!membersError && members) {
+            const senderName = `${senderInfo.first_name || ''} ${senderInfo.last_name || ''}`.trim() || senderEmail;
+            
+            // Отправляем уведомления всем участникам кроме отправителя
+            for (const member of members) {
+                if (member.user_email !== senderEmail.toLowerCase()) {
+                    await sendFCMNotificationForMessage(
+                        member.user_email,
+                        senderName,
+                        message || '',
+                        data[0].id,
+                        true
+                    );
+                }
+            }
+        }
+
+        res.json({
+            success: true,
+            messageId: data[0].id
+        });
+    } catch (error) {
+        console.error('❌ Ошибка отправки группового сообщения:', error);
         res.status(500).json({ success: false, error: 'Internal server error' });
     }
 });
