@@ -1,4 +1,4 @@
-// server.js - Объединенный сервер чата и звонков с FCM поддержкой
+// server.js - Объединенный сервер чата и звонков с FCM поддержкой и Supabase Storage
 // ==================== ИМПОРТЫ ====================
 const express = require('express');
 const http = require('http');
@@ -8,13 +8,12 @@ const bodyParser = require('body-parser');
 const path = require('path');
 const fs = require('fs');
 const multer = require('multer');
-const mime = require('mime-types');
 const { v4: uuidv4 } = require('uuid');
-const ffmpeg = require('fluent-ffmpeg');
-const ffmpegPath = require('ffmpeg-static');
-const ffprobePath = require('ffprobe-static').path;
 const { createClient } = require('@supabase/supabase-js');
 const admin = require('firebase-admin');
+const axios = require('axios'); // Для скачивания файлов из Supabase
+const stream = require('stream');
+const util = require('util');
 
 // ==================== КОНФИГУРАЦИЯ ====================
 const isRender = process.env.NODE_ENV === 'production';
@@ -86,6 +85,7 @@ try {
 // ==================== SUPABASE ====================
 const supabaseUrl = process.env.SUPABASE_URL;
 const supabaseKey = process.env.SUPABASE_SERVICE_KEY;
+const supabaseBucketName = process.env.SUPABASE_BUCKET_NAME || 'chat-files';
 
 if (!supabaseUrl || !supabaseKey) {
     console.error('❌ ОШИБКА: SUPABASE_URL и SUPABASE_SERVICE_KEY должны быть указаны в .env');
@@ -94,28 +94,47 @@ if (!supabaseUrl || !supabaseKey) {
 
 const supabase = createClient(supabaseUrl, supabaseKey);
 
-// ==================== MIDDLEWARE ====================
-app.use(cors({
-    origin: process.env.CLIENT_URL || "*",
-    methods: ['GET', 'POST', 'DELETE', 'PUT', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With'],
-    credentials: true
-}));
+// Создаем bucket если его нет
+async function ensureBucketExists() {
+    try {
+        // Проверяем существует ли bucket
+        const { data: buckets, error: listError } = await supabase
+            .storage
+            .listBuckets();
 
-app.options('*', cors());
-app.use(bodyParser.json({ limit: '100mb' }));
-app.use(bodyParser.urlencoded({ extended: true, limit: '100mb' }));
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
+        if (listError) throw listError;
 
-// ==================== ФАЙЛОВОЕ ХРАНИЛИЩЕ ====================
+        const bucketExists = buckets.some(b => b.name === supabaseBucketName);
+        
+        if (!bucketExists) {
+            console.log(`📦 Создание bucket "${supabaseBucketName}"...`);
+            const { data, error } = await supabase
+                .storage
+                .createBucket(supabaseBucketName, {
+                    public: true,
+                    fileSizeLimit: 104857600, // 100MB
+                    allowedMimeTypes: ['*/*']
+                });
+
+            if (error) throw error;
+            console.log(`✅ Bucket "${supabaseBucketName}" создан`);
+        } else {
+            console.log(`✅ Bucket "${supabaseBucketName}" уже существует`);
+        }
+    } catch (error) {
+        console.error('❌ Ошибка при создании bucket:', error);
+    }
+}
+
+// Вызываем функцию создания bucket
+ensureBucketExists();
+
+// ==================== ЛОКАЛЬНОЕ ФАЙЛОВОЕ ХРАНИЛИЩЕ (ВРЕМЕННОЕ) ====================
 const uploadDir = process.env.UPLOAD_DIR || path.join(__dirname, 'uploads');
 const tempDir = path.join(uploadDir, 'temp');
-const permanentDir = path.join(uploadDir, 'permanent');
-const thumbnailsDir = path.join(uploadDir, 'thumbnails');
 
 // Создаем папки, если их нет
-[uploadDir, tempDir, permanentDir, thumbnailsDir].forEach(dir => {
+[uploadDir, tempDir].forEach(dir => {
     if (!fs.existsSync(dir)) {
         fs.mkdirSync(dir, { recursive: true });
         console.log(`📁 Создана папка: ${dir}`);
@@ -144,10 +163,6 @@ const upload = multer({
         cb(null, true);
     }
 });
-
-// ==================== FFMPEG ====================
-ffmpeg.setFfmpegPath(ffmpegPath);
-ffmpeg.setFfprobePath(ffprobePath);
 
 // ==================== ХРАНИЛИЩА ДАННЫХ ====================
 const rooms = new Map();           // Комнаты и их участники
@@ -187,67 +202,64 @@ function getFileType(mimetype, filename) {
     return 'file';
 }
 
-function moveFileToPermanent(filename) {
-    const tempPath = path.join(tempDir, filename);
-    const permanentPath = path.join(permanentDir, filename);
-    
-    if (fs.existsSync(tempPath)) {
-        try {
-            fs.renameSync(tempPath, permanentPath);
-            console.log(`✅ Файл перемещен: ${filename}`);
-            return true;
-        } catch (error) {
-            console.error(`❌ Ошибка перемещения файла ${filename}:`, error);
-            return false;
-        }
-    }
-    console.error(`❌ Временный файл не найден: ${tempPath}`);
-    return false;
-}
+// Функция для загрузки файла в Supabase Storage
+async function uploadFileToSupabase(filePath, fileName, bucket = supabaseBucketName) {
+    try {
+        const fileContent = fs.readFileSync(filePath);
+        const fileExt = path.extname(fileName);
+        const uniqueFileName = `${Date.now()}_${uuidv4()}${fileExt}`;
+        const filePathInBucket = `uploads/${uniqueFileName}`;
 
-function getVideoDuration(videoPath, callback) {
-    ffmpeg.ffprobe(videoPath, (err, metadata) => {
-        if (err) {
-            console.error('❌ Ошибка получения длительности видео:', err);
-            return callback(err);
-        }
-        const duration = Math.round(metadata.format.duration || 0);
-        callback(null, duration);
-    });
-}
-
-function createMediaPreview(filePath, outputPath, fileType, callback) {
-    if (fileType === 'video') {
-        ffmpeg(filePath)
-            .screenshots({
-                timestamps: ['00:00:01'],
-                filename: path.basename(outputPath),
-                folder: path.dirname(outputPath),
-                size: '320x240'
-            })
-            .on('end', () => {
-                console.log('✅ Превью видео создано:', outputPath);
-                callback(null, outputPath);
-            })
-            .on('error', (err) => {
-                console.error('❌ Ошибка создания превью видео:', err);
-                callback(err);
+        const { data, error } = await supabase
+            .storage
+            .from(bucket)
+            .upload(filePathInBucket, fileContent, {
+                contentType: mime.lookup(fileName) || 'application/octet-stream',
+                cacheControl: '3600',
+                upsert: false
             });
-    } else if (fileType === 'image') {
-        ffmpeg(filePath)
-            .size('320x240')
-            .output(outputPath)
-            .on('end', () => {
-                console.log('✅ Превью изображения создано:', outputPath);
-                callback(null, outputPath);
-            })
-            .on('error', (err) => {
-                console.error('❌ Ошибка создания превью изображения:', err);
-                callback(err);
-            })
-            .run();
-    } else {
-        callback(new Error('Unsupported file type for preview'));
+
+        if (error) throw error;
+
+        // Получаем публичный URL
+        const { data: urlData } = supabase
+            .storage
+            .from(bucket)
+            .getPublicUrl(filePathInBucket);
+
+        console.log(`✅ Файл загружен в Supabase: ${urlData.publicUrl}`);
+        
+        return {
+            success: true,
+            path: filePathInBucket,
+            url: urlData.publicUrl,
+            fileName: uniqueFileName,
+            originalName: fileName
+        };
+    } catch (error) {
+        console.error('❌ Ошибка загрузки в Supabase:', error);
+        return {
+            success: false,
+            error: error.message
+        };
+    }
+}
+
+// Функция для удаления файла из Supabase Storage
+async function deleteFileFromSupabase(filePath, bucket = supabaseBucketName) {
+    try {
+        const { error } = await supabase
+            .storage
+            .from(bucket)
+            .remove([filePath]);
+
+        if (error) throw error;
+
+        console.log(`✅ Файл удален из Supabase: ${filePath}`);
+        return { success: true };
+    } catch (error) {
+        console.error('❌ Ошибка удаления из Supabase:', error);
+        return { success: false, error: error.message };
     }
 }
 
@@ -446,14 +458,14 @@ async function sendFCMNotificationForMessage(receiverEmail, senderName, senderEm
         }
 
         const title = isGroup ? `💬 ${groupName || 'Групповой чат'}` : '💬 Новое сообщение';
-        const body = `${senderName}: ${message.substring(0, 50)}${message.length > 50 ? '...' : ''}`;
+        const body = `${senderName}: ${typeof message === 'string' ? message.substring(0, 50) : 'Файл'}${typeof message === 'string' && message.length > 50 ? '...' : ''}`;
 
         const messageData = {
             data: {
                 type: 'message',
                 senderName: senderName,
-                senderEmail: senderEmail, // ВАЖНО: Это email ОТПРАВИТЕЛЯ!
-                message: message,
+                senderEmail: senderEmail,
+                message: typeof message === 'string' ? message : '[Файл]',
                 messageId: messageId.toString(),
                 isGroup: isGroup.toString(),
                 groupId: groupId ? groupId.toString() : '',
@@ -485,6 +497,7 @@ async function sendFCMNotificationForMessage(receiverEmail, senderName, senderEm
         return false;
     }
 }
+
 // ==================== SOCKET.IO ОБРАБОТЧИКИ ====================
 io.on('connection', (socket) => {
     console.log('👤 Пользователь подключился:', socket.id);
@@ -712,11 +725,15 @@ app.get('/health', async (req, res) => {
             .eq('status', 'online')
             .gte('last_seen', new Date(Date.now() - 30000).toISOString());
 
-        const dirs = [uploadDir, tempDir, permanentDir, thumbnailsDir];
+        const dirs = [uploadDir, tempDir];
         const dirStatus = {};
         dirs.forEach(dir => {
             dirStatus[path.basename(dir)] = fs.existsSync(dir);
         });
+
+        // Проверка Supabase Storage
+        const { data: buckets } = await supabase.storage.listBuckets();
+        const storageAvailable = buckets && buckets.some(b => b.name === supabaseBucketName);
 
         res.json({
             success: true,
@@ -732,6 +749,10 @@ app.get('/health', async (req, res) => {
             uptime: process.uptime(),
             memory: process.memoryUsage(),
             directories: dirStatus,
+            supabaseStorage: {
+                bucket: supabaseBucketName,
+                available: storageAvailable
+            },
             timestamp: new Date().toISOString()
         });
     } catch (error) {
@@ -740,6 +761,401 @@ app.get('/health', async (req, res) => {
             success: false,
             error: 'Health check failed',
             details: error.message
+        });
+    }
+});
+
+// ===== Загрузка файла с сохранением в Supabase =====
+app.post('/upload', upload.single('file'), async (req, res) => {
+    try {
+        if (!req.file) {
+            return res.status(400).json({ 
+                success: false, 
+                error: 'Файл не предоставлен' 
+            });
+        }
+
+        const file = req.file;
+        const { senderEmail, receiverEmail, isGroup, groupId, messageType = 'file' } = req.body;
+
+        console.log('📤 Загрузка файла:', file.originalname);
+
+        // Загружаем файл в Supabase Storage
+        const uploadResult = await uploadFileToSupabase(file.path, file.originalname);
+
+        if (!uploadResult.success) {
+            return res.status(500).json({
+                success: false,
+                error: 'Ошибка загрузки в Supabase Storage'
+            });
+        }
+
+        // Определяем тип файла
+        const fileType = getFileType(file.mimetype, file.originalname);
+
+        // Создаем запись о файле в базе данных
+        const fileRecord = {
+            file_name: file.originalname,
+            file_path: uploadResult.path,
+            file_url: uploadResult.url,
+            file_size: file.size,
+            file_type: fileType,
+            mime_type: file.mimetype,
+            sender_email: senderEmail?.toLowerCase(),
+            receiver_email: receiverEmail?.toLowerCase(),
+            group_id: groupId,
+            uploaded_at: new Date().toISOString()
+        };
+
+        const { data: fileData, error: fileError } = await supabase
+            .from('files')
+            .insert([fileRecord])
+            .select();
+
+        if (fileError) {
+            console.error('❌ Ошибка сохранения записи о файле:', fileError);
+            // Пытаемся удалить файл из Supabase
+            await deleteFileFromSupabase(uploadResult.path);
+            throw fileError;
+        }
+
+        // Если это сообщение, создаем запись в messages или group_messages
+        if (senderEmail && (receiverEmail || groupId)) {
+            if (groupId) {
+                // Групповое сообщение с файлом
+                const { data: messageData, error: messageError } = await supabase
+                    .from('group_messages')
+                    .insert([{
+                        group_id: groupId,
+                        sender_email: senderEmail.toLowerCase(),
+                        message: `[${fileType}] ${file.originalname}`,
+                        file_id: fileData[0].id,
+                        duration: 0
+                    }])
+                    .select();
+
+                if (messageError) throw messageError;
+
+                // Получаем информацию о группе и отправителе для уведомлений
+                const { data: groupData } = await supabase
+                    .from('groups')
+                    .select('name')
+                    .eq('id', groupId)
+                    .single();
+
+                const { data: members } = await supabase
+                    .from('group_members')
+                    .select('user_email')
+                    .eq('group_id', groupId);
+
+                const senderInfo = await getUserInfo(senderEmail);
+                const senderName = senderInfo ? `${senderInfo.first_name || ''} ${senderInfo.last_name || ''}`.trim() : senderEmail;
+
+                // Отправляем уведомления
+                if (members) {
+                    for (const member of members) {
+                        if (member.user_email !== senderEmail.toLowerCase()) {
+                            await sendFCMNotificationForMessage(
+                                member.user_email,
+                                senderName,
+                                senderEmail,
+                                `[${fileType}] ${file.originalname}`,
+                                messageData[0].id,
+                                true,
+                                groupId,
+                                groupData?.name
+                            );
+                        }
+                    }
+                }
+
+                res.json({
+                    success: true,
+                    message: 'Файл загружен и сообщение отправлено',
+                    file: {
+                        id: fileData[0].id,
+                        name: file.originalname,
+                        url: uploadResult.url,
+                        type: fileType,
+                        size: file.size
+                    },
+                    messageId: messageData[0].id
+                });
+            } else if (receiverEmail) {
+                // Личное сообщение с файлом
+                const { data: messageData, error: messageError } = await supabase
+                    .from('messages')
+                    .insert([{
+                        sender_email: senderEmail.toLowerCase(),
+                        receiver_email: receiverEmail.toLowerCase(),
+                        message: `[${fileType}] ${file.originalname}`,
+                        file_id: fileData[0].id,
+                        duration: 0
+                    }])
+                    .select();
+
+                if (messageError) throw messageError;
+
+                // Добавляем в чаты автоматически
+                await addToChatsAutomatically(senderEmail, receiverEmail);
+
+                // Отправляем уведомление получателю
+                const senderInfo = await getUserInfo(senderEmail);
+                const senderName = senderInfo ? `${senderInfo.first_name || ''} ${senderInfo.last_name || ''}`.trim() : senderEmail;
+
+                await sendFCMNotificationForMessage(
+                    receiverEmail,
+                    senderName,
+                    senderEmail,
+                    `[${fileType}] ${file.originalname}`,
+                    messageData[0].id,
+                    false
+                );
+
+                // Отправляем через Socket.IO
+                const receiverSocketId = emailToSocket.get(receiverEmail.toLowerCase());
+                if (receiverSocketId) {
+                    io.to(receiverSocketId).emit('new_message', {
+                        id: messageData[0].id,
+                        senderEmail: senderEmail,
+                        message: `[${fileType}] ${file.originalname}`,
+                        file: {
+                            id: fileData[0].id,
+                            name: file.originalname,
+                            url: uploadResult.url,
+                            type: fileType,
+                            size: file.size
+                        },
+                        timestamp: new Date().toISOString()
+                    });
+                }
+
+                res.json({
+                    success: true,
+                    message: 'Файл загружен и сообщение отправлено',
+                    file: {
+                        id: fileData[0].id,
+                        name: file.originalname,
+                        url: uploadResult.url,
+                        type: fileType,
+                        size: file.size
+                    },
+                    messageId: messageData[0].id
+                });
+            } else {
+                res.json({
+                    success: true,
+                    file: {
+                        id: fileData[0].id,
+                        name: file.originalname,
+                        url: uploadResult.url,
+                        type: fileType,
+                        size: file.size
+                    }
+                });
+            }
+        } else {
+            res.json({
+                success: true,
+                file: {
+                    id: fileData[0].id,
+                    name: file.originalname,
+                    url: uploadResult.url,
+                    type: fileType,
+                    size: file.size
+                }
+            });
+        }
+
+        // Удаляем временный файл после загрузки в Supabase
+        fs.unlink(file.path, (err) => {
+            if (err) console.error('❌ Ошибка удаления временного файла:', err);
+            else console.log('🗑️ Временный файл удален:', file.path);
+        });
+
+    } catch (error) {
+        console.error('❌ Ошибка загрузки файла:', error);
+        res.status(500).json({ 
+            success: false, 
+            error: 'Ошибка загрузки файла',
+            details: error.message 
+        });
+    }
+});
+
+// ===== Получение информации о файле =====
+app.get('/files/:fileId', async (req, res) => {
+    try {
+        const { fileId } = req.params;
+
+        const { data, error } = await supabase
+            .from('files')
+            .select('*')
+            .eq('id', fileId)
+            .single();
+
+        if (error || !data) {
+            return res.status(404).json({
+                success: false,
+                error: 'Файл не найден'
+            });
+        }
+
+        res.json({
+            success: true,
+            file: data
+        });
+    } catch (error) {
+        console.error('❌ Ошибка получения информации о файле:', error);
+        res.status(500).json({ 
+            success: false, 
+            error: 'Internal server error' 
+        });
+    }
+});
+
+// ===== Получение файлов сообщения =====
+app.get('/messages/:messageId/files', async (req, res) => {
+    try {
+        const { messageId } = req.params;
+
+        // Проверяем в обычных сообщениях
+        const { data: messageData, error: messageError } = await supabase
+            .from('messages')
+            .select('file_id')
+            .eq('id', messageId)
+            .single();
+
+        if (messageData && messageData.file_id) {
+            const { data: fileData, error: fileError } = await supabase
+                .from('files')
+                .select('*')
+                .eq('id', messageData.file_id)
+                .single();
+
+            if (!fileError && fileData) {
+                return res.json({
+                    success: true,
+                    files: [fileData]
+                });
+            }
+        }
+
+        // Проверяем в групповых сообщениях
+        const { data: groupMessageData, error: groupMessageError } = await supabase
+            .from('group_messages')
+            .select('file_id')
+            .eq('id', messageId)
+            .single();
+
+        if (groupMessageData && groupMessageData.file_id) {
+            const { data: fileData, error: fileError } = await supabase
+                .from('files')
+                .select('*')
+                .eq('id', groupMessageData.file_id)
+                .single();
+
+            if (!fileError && fileData) {
+                return res.json({
+                    success: true,
+                    files: [fileData]
+                });
+            }
+        }
+
+        res.json({
+            success: true,
+            files: []
+        });
+    } catch (error) {
+        console.error('❌ Ошибка получения файлов сообщения:', error);
+        res.status(500).json({ 
+            success: false, 
+            error: 'Internal server error' 
+        });
+    }
+});
+
+// ===== Получение файлов пользователя =====
+app.get('/users/:email/files', async (req, res) => {
+    try {
+        const email = req.params.email.toLowerCase();
+
+        const { data, error } = await supabase
+            .from('files')
+            .select('*')
+            .eq('sender_email', email)
+            .order('uploaded_at', { ascending: false });
+
+        if (error) throw error;
+
+        res.json({
+            success: true,
+            files: data || []
+        });
+    } catch (error) {
+        console.error('❌ Ошибка получения файлов пользователя:', error);
+        res.status(500).json({ 
+            success: false, 
+            error: 'Internal server error' 
+        });
+    }
+});
+
+// ===== Удаление файла =====
+app.delete('/files/:fileId', async (req, res) => {
+    try {
+        const { fileId } = req.params;
+
+        // Получаем информацию о файле
+        const { data: fileData, error: fileError } = await supabase
+            .from('files')
+            .select('*')
+            .eq('id', fileId)
+            .single();
+
+        if (fileError || !fileData) {
+            return res.status(404).json({
+                success: false,
+                error: 'Файл не найден'
+            });
+        }
+
+        // Удаляем из Supabase Storage
+        const deleteResult = await deleteFileFromSupabase(fileData.file_path);
+
+        if (!deleteResult.success) {
+            console.warn('⚠️ Не удалось удалить файл из хранилища:', deleteResult.error);
+        }
+
+        // Удаляем запись из базы данных
+        const { error: deleteError } = await supabase
+            .from('files')
+            .delete()
+            .eq('id', fileId);
+
+        if (deleteError) throw deleteError;
+
+        // Удаляем ссылки на файл в сообщениях
+        await supabase
+            .from('messages')
+            .update({ file_id: null })
+            .eq('file_id', fileId);
+
+        await supabase
+            .from('group_messages')
+            .update({ file_id: null })
+            .eq('file_id', fileId);
+
+        res.json({
+            success: true,
+            message: 'Файл удален'
+        });
+    } catch (error) {
+        console.error('❌ Ошибка удаления файла:', error);
+        res.status(500).json({ 
+            success: false, 
+            error: 'Internal server error' 
         });
     }
 });
@@ -858,81 +1274,6 @@ app.get('/api/rooms/:roomId', (req, res) => {
             createdAt: new Date().toISOString()
         }
     });
-});
-
-// Отправка группового сообщения
-app.post('/send-group-message', async (req, res) => {
-    try {
-        const { groupId, senderEmail, message, duration } = req.body;
-
-        if (!groupId || !senderEmail) {
-            return res.status(400).json({
-                success: false,
-                error: 'Группа и отправитель обязательны'
-            });
-        }
-
-        const senderInfo = await getUserInfo(senderEmail);
-        if (!senderInfo) {
-            return res.status(404).json({
-                success: false,
-                error: 'Отправитель не найден'
-            });
-        }
-
-        const { data, error } = await supabase
-            .from('group_messages')
-            .insert([{
-                group_id: groupId,
-                sender_email: senderEmail.toLowerCase(),
-                message: message || '',
-                duration: duration || 0
-            }])
-            .select();
-
-        if (error) throw error;
-
-        // Получаем название группы
-        const { data: groupData } = await supabase
-            .from('groups')
-            .select('name')
-            .eq('id', groupId)
-            .single();
-
-        // Получаем всех участников группы
-        const { data: members, error: membersError } = await supabase
-            .from('group_members')
-            .select('user_email')
-            .eq('group_id', groupId);
-
-        if (!membersError && members) {
-            const senderName = `${senderInfo.first_name || ''} ${senderInfo.last_name || ''}`.trim() || senderEmail;
-            const groupName = groupData?.name || 'Группа';
-            
-            // Отправляем уведомления всем участникам кроме отправителя
-            for (const member of members) {
-                if (member.user_email !== senderEmail.toLowerCase()) {
-                    await sendFCMNotificationForMessage(
-                        member.user_email,
-                        senderName,
-                        message || '',
-                        data[0].id,
-                        true,
-                        groupId,
-                        groupName
-                    );
-                }
-            }
-        }
-
-        res.json({
-            success: true,
-            messageId: data[0].id
-        });
-    } catch (error) {
-        console.error('❌ Ошибка отправки группового сообщения:', error);
-        res.status(500).json({ success: false, error: 'Internal server error' });
-    }
 });
 
 // ===== Создать комнату (через API) =====
@@ -1099,15 +1440,14 @@ app.post('/api/calls/initiate', async (req, res) => {
         // Отправляем FCM уведомление получателю
         const fcmSent = await sendFCMNotification(
             receiverEmail,
-            '📞 Входящий звонок',  // title
-            `${callerEmail} (${callType === 'video' ? 'видео' : 'аудио'})`,  // body
+            '📞 Входящий звонок',
+            `${callerEmail} (${callType === 'video' ? 'видео' : 'аудио'})`,
             {
                 type: 'call',
                 roomId: roomId,
                 caller: callerEmail,
                 callType: callType || 'audio',
                 userEmail: receiverEmail,
-                // Добавляем action для кнопок
                 accept_action: 'ACCEPT_CALL',
                 reject_action: 'REJECT_CALL'
             }
@@ -1276,7 +1616,6 @@ app.get('/api/fcm/check/:email', async (req, res) => {
         
         console.log(`🔍 Проверка FCM токена для: ${normalizedEmail}`);
         
-        // Проверяем наличие токена
         const { data, error } = await supabase
             .from('user_fcm_tokens')
             .select('*')
@@ -1288,7 +1627,6 @@ app.get('/api/fcm/check/:email', async (req, res) => {
             throw error;
         }
         
-        // Проверяем, есть ли пользователь в системе
         const userInfo = await getUserInfo(normalizedEmail);
         
         const response = {
@@ -1625,610 +1963,6 @@ app.get('/users', async (req, res) => {
     }
 });
 
-// ==================== ЭНДПОИНТЫ ДЛЯ ФАЙЛОВ ====================
-
-/**
- * Загрузка файла в личный чат
- */
-app.post('/upload', upload.single('file'), async (req, res) => {
-    try {
-        if (!req.file) {
-            return res.status(400).json({ success: false, error: 'Файл не загружен' });
-        }
-
-        const { senderEmail, receiverEmail, message } = req.body;
-
-        if (!senderEmail || !receiverEmail) {
-            fs.unlinkSync(req.file.path);
-            return res.status(400).json({ success: false, error: 'Email обязательны' });
-        }
-
-        const senderInfo = await getUserInfo(senderEmail);
-        const receiverInfo = await getUserInfo(receiverEmail);
-
-        if (!senderInfo || !receiverInfo) {
-            fs.unlinkSync(req.file.path);
-            return res.status(404).json({ success: false, error: 'Пользователь не найден' });
-        }
-
-        const fileType = getFileType(req.file.mimetype, req.file.originalname);
-        let thumbnailFilename = '';
-        let videoDuration = 0;
-
-        // Функция завершения загрузки
-        const completeFileUpload = async (thumbnail = '') => {
-            try {
-                const { data, error } = await supabase
-                    .from('messages')
-                    .insert([{
-                        sender_email: senderEmail.toLowerCase(),
-                        receiver_email: receiverEmail.toLowerCase(),
-                        message: message || '',
-                        attachment_type: fileType,
-                        attachment_filename: req.file.filename,
-                        attachment_original_name: req.file.originalname,
-                        attachment_mime_type: req.file.mimetype,
-                        attachment_size: req.file.size,
-                        duration: videoDuration,
-                        thumbnail: thumbnail
-                    }])
-                    .select();
-
-                if (error) throw error;
-
-                if (moveFileToPermanent(req.file.filename)) {
-                    await addToChatsAutomatically(senderEmail, receiverEmail);
-                    
-                    // Отправляем уведомление получателю
-                    const senderName = `${senderInfo.first_name || ''} ${senderInfo.last_name || ''}`.trim() || senderEmail;
-                    await sendFCMNotificationForMessage(
-                        receiverEmail,
-                        senderName,
-                        message || '📎 Файл',
-                        data[0].id,
-                        false
-                    );
-                    
-                    res.json({
-                        success: true,
-                        messageId: data[0].id,
-                        filename: req.file.filename,
-                        thumbnail: thumbnail,
-                        fileType: fileType
-                    });
-                } else {
-                    throw new Error('Ошибка перемещения файла');
-                }
-            } catch (error) {
-                // Очистка при ошибке
-                fs.unlinkSync(req.file.path);
-                if (thumbnail) {
-                    const thumbPath = path.join(thumbnailsDir, thumbnail);
-                    if (fs.existsSync(thumbPath)) fs.unlinkSync(thumbPath);
-                }
-                throw error;
-            }
-        };
-
-        // Создаем превью для видео и изображений
-        if (fileType === 'image' || fileType === 'video') {
-            const previewName = `preview_${path.parse(req.file.filename).name}.jpg`;
-            const previewPath = path.join(thumbnailsDir, previewName);
-
-            if (fileType === 'video') {
-                getVideoDuration(req.file.path, (err, duration) => {
-                    if (!err && duration > 0) videoDuration = duration;
-                    
-                    createMediaPreview(req.file.path, previewPath, fileType, (err) => {
-                        if (!err) thumbnailFilename = previewName;
-                        completeFileUpload(thumbnailFilename);
-                    });
-                });
-            } else {
-                createMediaPreview(req.file.path, previewPath, fileType, (err) => {
-                    if (!err) thumbnailFilename = previewName;
-                    completeFileUpload(thumbnailFilename);
-                });
-            }
-        } else {
-            await completeFileUpload();
-        }
-    } catch (error) {
-        console.error('❌ Ошибка загрузки файла:', error);
-        if (req.file && fs.existsSync(req.file.path)) {
-            fs.unlinkSync(req.file.path);
-        }
-        res.status(500).json({ success: false, error: 'Internal server error' });
-    }
-});
-
-/**
- * Загрузка файла в групповой чат
- */
-app.post('/upload-group', upload.single('file'), async (req, res) => {
-    try {
-        if (!req.file) {
-            return res.status(400).json({ success: false, error: 'Файл не загружен' });
-        }
-
-        const { groupId, senderEmail, message } = req.body;
-
-        if (!groupId || !senderEmail) {
-            fs.unlinkSync(req.file.path);
-            return res.status(400).json({ success: false, error: 'Группа и отправитель обязательны' });
-        }
-
-        const senderInfo = await getUserInfo(senderEmail);
-        if (!senderInfo) {
-            fs.unlinkSync(req.file.path);
-            return res.status(404).json({ success: false, error: 'Отправитель не найден' });
-        }
-
-        // Проверяем, существует ли группа
-        const { data: groupData, error: groupError } = await supabase
-            .from('groups')
-            .select('name')
-            .eq('id', groupId)
-            .single();
-
-        if (groupError || !groupData) {
-            fs.unlinkSync(req.file.path);
-            return res.status(404).json({ success: false, error: 'Группа не найдена' });
-        }
-
-        const fileType = getFileType(req.file.mimetype, req.file.originalname);
-        let thumbnailFilename = '';
-        let videoDuration = 0;
-
-        const completeFileUpload = async (thumbnail = '') => {
-            try {
-                const { data, error } = await supabase
-                    .from('group_messages')
-                    .insert([{
-                        group_id: groupId,
-                        sender_email: senderEmail.toLowerCase(),
-                        message: message || '',
-                        attachment_type: fileType,
-                        attachment_filename: req.file.filename,
-                        attachment_original_name: req.file.originalname,
-                        attachment_mime_type: req.file.mimetype,
-                        attachment_size: req.file.size,
-                        duration: videoDuration,
-                        thumbnail: thumbnail
-                    }])
-                    .select();
-
-                if (error) throw error;
-
-                if (moveFileToPermanent(req.file.filename)) {
-                    // Получаем всех участников группы
-                    const { data: members, error: membersError } = await supabase
-                        .from('group_members')
-                        .select('user_email')
-                        .eq('group_id', groupId);
-
-                    if (!membersError && members) {
-                        const senderName = `${senderInfo.first_name || ''} ${senderInfo.last_name || ''}`.trim() || senderEmail;
-                        
-                        // Отправляем уведомления всем участникам кроме отправителя
-                        for (const member of members) {
-                            if (member.user_email !== senderEmail.toLowerCase()) {
-                                await sendFCMNotificationForMessage(
-                                    member.user_email,
-                                    senderName,
-                                    message || '📎 Файл',
-                                    data[0].id,
-                                    true,
-                                    groupId,
-                                    groupData.name
-                                );
-                            }
-                        }
-                    }
-                    
-                    res.json({
-                        success: true,
-                        messageId: data[0].id,
-                        filename: req.file.filename,
-                        thumbnail: thumbnail,
-                        fileType: fileType
-                    });
-                } else {
-                    throw new Error('Ошибка перемещения файла');
-                }
-            } catch (error) {
-                fs.unlinkSync(req.file.path);
-                if (thumbnail) {
-                    const thumbPath = path.join(thumbnailsDir, thumbnail);
-                    if (fs.existsSync(thumbPath)) fs.unlinkSync(thumbPath);
-                }
-                throw error;
-            }
-        };
-
-        if (fileType === 'image' || fileType === 'video') {
-            const previewName = `preview_${path.parse(req.file.filename).name}.jpg`;
-            const previewPath = path.join(thumbnailsDir, previewName);
-
-            if (fileType === 'video') {
-                getVideoDuration(req.file.path, (err, duration) => {
-                    if (!err && duration > 0) videoDuration = duration;
-                    
-                    createMediaPreview(req.file.path, previewPath, fileType, (err) => {
-                        if (!err) thumbnailFilename = previewName;
-                        completeFileUpload(thumbnailFilename);
-                    });
-                });
-            } else {
-                createMediaPreview(req.file.path, previewPath, fileType, (err) => {
-                    if (!err) thumbnailFilename = previewName;
-                    completeFileUpload(thumbnailFilename);
-                });
-            }
-        } else {
-            await completeFileUpload();
-        }
-    } catch (error) {
-        console.error('❌ Ошибка загрузки файла в группу:', error);
-        if (req.file && fs.existsSync(req.file.path)) {
-            fs.unlinkSync(req.file.path);
-        }
-        res.status(500).json({ success: false, error: 'Internal server error' });
-    }
-});
-
-/**
- * Загрузка файла (без привязки к сообщению)
- */
-app.post('/upload-file', upload.single('file'), async (req, res) => {
-    try {
-        if (!req.file) {
-            return res.status(400).json({ success: false, error: 'Файл не загружен' });
-        }
-
-        const fileType = getFileType(req.file.mimetype, req.file.originalname);
-
-        if (moveFileToPermanent(req.file.filename)) {
-            res.json({
-                success: true,
-                filename: req.file.filename,
-                originalName: req.file.originalname,
-                fileType: fileType,
-                size: req.file.size,
-                mimeType: req.file.mimetype
-            });
-        } else {
-            fs.unlinkSync(req.file.path);
-            res.status(500).json({ success: false, error: 'Ошибка сохранения файла' });
-        }
-    } catch (error) {
-        console.error('❌ Ошибка загрузки файла:', error);
-        if (req.file && fs.existsSync(req.file.path)) {
-            fs.unlinkSync(req.file.path);
-        }
-        res.status(500).json({ success: false, error: 'Internal server error' });
-    }
-});
-
-/**
- * Загрузка аватара профиля
- */
-app.post('/upload-avatar', upload.single('avatar'), async (req, res) => {
-    try {
-        if (!req.file) {
-            return res.status(400).json({ success: false, error: 'Файл не загружен' });
-        }
-
-        const { userEmail } = req.body;
-
-        if (!userEmail) {
-            fs.unlinkSync(req.file.path);
-            return res.status(400).json({ success: false, error: 'Email обязателен' });
-        }
-
-        const userInfo = await getUserInfo(userEmail);
-        if (!userInfo) {
-            fs.unlinkSync(req.file.path);
-            return res.status(404).json({ success: false, error: 'Пользователь не найден' });
-        }
-
-        // Удаляем старый аватар, если есть
-        if (userInfo.avatar_filename) {
-            const oldAvatarPath = path.join(permanentDir, userInfo.avatar_filename);
-            if (fs.existsSync(oldAvatarPath)) {
-                fs.unlinkSync(oldAvatarPath);
-            }
-        }
-
-        if (moveFileToPermanent(req.file.filename)) {
-            const table = userInfo.userType === 'regular' ? 'regular_users' : 'beresta_users';
-            
-            const { error } = await supabase
-                .from(table)
-                .update({ avatar_filename: req.file.filename })
-                .eq('email', userEmail.toLowerCase());
-
-            if (error) throw error;
-
-            res.json({
-                success: true,
-                filename: req.file.filename,
-                message: 'Аватар обновлен'
-            });
-        } else {
-            fs.unlinkSync(req.file.path);
-            res.status(500).json({ success: false, error: 'Ошибка сохранения файла' });
-        }
-    } catch (error) {
-        console.error('❌ Ошибка загрузки аватара:', error);
-        if (req.file && fs.existsSync(req.file.path)) {
-            fs.unlinkSync(req.file.path);
-        }
-        res.status(500).json({ success: false, error: 'Internal server error' });
-    }
-});
-
-/**
- * Скачивание файла
- */
-app.get('/download/:filename', async (req, res) => {
-    try {
-        const filename = req.params.filename;
-        const filePath = path.join(permanentDir, filename);
-
-        if (!fs.existsSync(filePath)) {
-            return res.status(404).json({ success: false, error: 'Файл не найден' });
-        }
-
-        const mimeType = mime.lookup(filename) || 'application/octet-stream';
-        const originalName = req.query.originalName || filename;
-
-        res.setHeader('Content-Type', mimeType);
-        res.setHeader('Content-Disposition', `attachment; filename="${encodeURIComponent(originalName)}"`);
-        res.setHeader('Content-Length', fs.statSync(filePath).size);
-        
-        const fileStream = fs.createReadStream(filePath);
-        fileStream.pipe(res);
-    } catch (error) {
-        console.error('❌ Ошибка скачивания файла:', error);
-        res.status(500).json({ success: false, error: 'Internal server error' });
-    }
-});
-
-/**
- * Получить информацию о файле из личного чата
- */
-app.get('/file-info/:messageId', async (req, res) => {
-    try {
-        const messageId = req.params.messageId;
-
-        const { data, error } = await supabase
-            .from('messages')
-            .select('attachment_filename, attachment_original_name, attachment_mime_type, attachment_size, attachment_type, sender_email, receiver_email')
-            .eq('id', messageId)
-            .single();
-
-        if (error || !data?.attachment_filename) {
-            return res.status(404).json({ success: false, error: 'Файл не найден' });
-        }
-
-        const filePath = path.join(permanentDir, data.attachment_filename);
-        const exists = fs.existsSync(filePath);
-
-        res.json({
-            success: true,
-            exists,
-            filename: data.attachment_filename,
-            originalName: data.attachment_original_name,
-            mimeType: data.attachment_mime_type,
-            size: data.attachment_size,
-            type: data.attachment_type,
-            senderEmail: data.sender_email,
-            receiverEmail: data.receiver_email
-        });
-    } catch (error) {
-        console.error('❌ Ошибка получения информации о файле:', error);
-        res.status(500).json({ success: false, error: 'Internal server error' });
-    }
-});
-
-/**
- * Получить информацию о файле из группы
- */
-app.get('/group-file-info/:filename', async (req, res) => {
-    try {
-        const filename = req.params.filename;
-
-        const { data, error } = await supabase
-            .from('group_messages')
-            .select('attachment_filename, attachment_original_name, attachment_mime_type, attachment_size, attachment_type, group_id, sender_email')
-            .eq('attachment_filename', filename)
-            .single();
-
-        if (error || !data) {
-            return res.status(404).json({ success: false, error: 'Файл не найден' });
-        }
-
-        const filePath = path.join(permanentDir, data.attachment_filename);
-        const exists = fs.existsSync(filePath);
-
-        res.json({
-            success: true,
-            exists,
-            filename: data.attachment_filename,
-            originalName: data.attachment_original_name,
-            mimeType: data.attachment_mime_type,
-            size: data.attachment_size,
-            type: data.attachment_type,
-            groupId: data.group_id,
-            senderEmail: data.sender_email
-        });
-    } catch (error) {
-        console.error('❌ Ошибка получения информации о групповом файле:', error);
-        res.status(500).json({ success: false, error: 'Internal server error' });
-    }
-});
-
-/**
- * Получить информацию о файле (универсальный)
- */
-app.get('/file/:filename', async (req, res) => {
-    try {
-        const filename = req.params.filename;
-        const filePath = path.join(permanentDir, filename);
-
-        if (!fs.existsSync(filePath)) {
-            return res.status(404).json({ success: false, error: 'Файл не найден' });
-        }
-
-        const stats = fs.statSync(filePath);
-        const mimeType = mime.lookup(filename) || 'application/octet-stream';
-
-        res.json({
-            success: true,
-            filename: filename,
-            mimeType: mimeType,
-            size: stats.size,
-            created: stats.birthtime,
-            modified: stats.mtime
-        });
-    } catch (error) {
-        console.error('❌ Ошибка получения информации о файле:', error);
-        res.status(500).json({ success: false, error: 'Internal server error' });
-    }
-});
-
-/**
- * Получить список файлов пользователя
- */
-app.get('/user-files/:email', async (req, res) => {
-    try {
-        const email = req.params.email.toLowerCase();
-
-        // Получаем файлы из личных сообщений
-        const { data: personalFiles, error: personalError } = await supabase
-            .from('messages')
-            .select('attachment_filename, attachment_original_name, attachment_type, attachment_size, timestamp')
-            .or(`sender_email.eq.${email},receiver_email.eq.${email}`)
-            .not('attachment_filename', 'is', null)
-            .order('timestamp', { ascending: false });
-
-        if (personalError) throw personalError;
-
-        // Получаем файлы из групповых чатов
-        const { data: groupFiles, error: groupError } = await supabase
-            .from('group_messages')
-            .select('attachment_filename, attachment_original_name, attachment_type, attachment_size, timestamp, group_id')
-            .eq('sender_email', email)
-            .not('attachment_filename', 'is', null)
-            .order('timestamp', { ascending: false });
-
-        if (groupError) throw groupError;
-
-        const files = [
-            ...(personalFiles || []).map(f => ({
-                ...f,
-                type: 'personal',
-                url: `/download/${f.attachment_filename}`
-            })),
-            ...(groupFiles || []).map(f => ({
-                ...f,
-                type: 'group',
-                url: `/download/${f.attachment_filename}`
-            }))
-        ];
-
-        res.json({
-            success: true,
-            files: files
-        });
-    } catch (error) {
-        console.error('❌ Ошибка получения файлов пользователя:', error);
-        res.status(500).json({ success: false, error: 'Internal server error' });
-    }
-});
-
-/**
- * Удалить файл
- */
-app.delete('/file/:filename', async (req, res) => {
-    try {
-        const filename = req.params.filename;
-        const { userEmail } = req.body;
-
-        if (!userEmail) {
-            return res.status(400).json({ success: false, error: 'Email обязателен' });
-        }
-
-        // Проверяем, является ли пользователь владельцем файла
-        const { data: personalFile, error: personalError } = await supabase
-            .from('messages')
-            .select('id, sender_email')
-            .eq('attachment_filename', filename)
-            .single();
-
-        if (!personalError && personalFile) {
-            if (personalFile.sender_email !== userEmail.toLowerCase()) {
-                return res.status(403).json({ success: false, error: 'Нет прав на удаление файла' });
-            }
-
-            // Удаляем запись из БД
-            await supabase
-                .from('messages')
-                .update({ 
-                    attachment_filename: null,
-                    attachment_original_name: null,
-                    attachment_type: null,
-                    attachment_size: null
-                })
-                .eq('id', personalFile.id);
-        } else {
-            // Проверяем групповые файлы
-            const { data: groupFile, error: groupError } = await supabase
-                .from('group_messages')
-                .select('id, sender_email')
-                .eq('attachment_filename', filename)
-                .single();
-
-            if (!groupError && groupFile) {
-                if (groupFile.sender_email !== userEmail.toLowerCase()) {
-                    return res.status(403).json({ success: false, error: 'Нет прав на удаление файла' });
-                }
-
-                await supabase
-                    .from('group_messages')
-                    .update({ 
-                        attachment_filename: null,
-                        attachment_original_name: null,
-                        attachment_type: null,
-                        attachment_size: null
-                    })
-                    .eq('id', groupFile.id);
-            }
-        }
-
-        // Удаляем физический файл
-        const filePath = path.join(permanentDir, filename);
-        if (fs.existsSync(filePath)) {
-            fs.unlinkSync(filePath);
-        }
-
-        // Удаляем превью если есть
-        const previewPath = path.join(thumbnailsDir, `preview_${path.parse(filename).name}.jpg`);
-        if (fs.existsSync(previewPath)) {
-            fs.unlinkSync(previewPath);
-        }
-
-        res.json({
-            success: true,
-            message: 'Файл удален'
-        });
-    } catch (error) {
-        console.error('❌ Ошибка удаления файла:', error);
-        res.status(500).json({ success: false, error: 'Internal server error' });
-    }
-});
-
 /**
  * Получение чатов пользователя
  */
@@ -2300,9 +2034,13 @@ app.get('/messages/:userEmail/:friendEmail', async (req, res) => {
         const userEmail = req.params.userEmail.toLowerCase();
         const friendEmail = req.params.friendEmail.toLowerCase();
 
+        // Получаем сообщения с информацией о файлах
         const { data, error } = await supabase
             .from('messages')
-            .select('*')
+            .select(`
+                *,
+                files:file_id (*)
+            `)
             .or(`and(sender_email.eq.${userEmail},receiver_email.eq.${friendEmail}),and(sender_email.eq.${friendEmail},receiver_email.eq.${userEmail})`)
             .order('timestamp', { ascending: true });
 
@@ -2318,6 +2056,9 @@ app.get('/messages/:userEmail/:friendEmail', async (req, res) => {
     }
 });
 
+/**
+ * Отправка текстового сообщения
+ */
 app.post('/send-message', async (req, res) => {
     try {
         const { senderEmail, receiverEmail, message, duration } = req.body;
@@ -2356,9 +2097,9 @@ app.post('/send-message', async (req, res) => {
         // Отправляем FCM уведомление получателю
         const senderName = `${senderInfo.first_name || ''} ${senderInfo.last_name || ''}`.trim() || senderEmail;
         await sendFCMNotificationForMessage(
-            receiverEmail,  // КОМУ отправляем (получатель)
-            senderName,     // Имя отправителя
-            senderEmail,    // Email отправителя (ВАЖНО!)
+            receiverEmail,
+            senderName,
+            senderEmail,
             message || '',
             data[0].id,
             false
@@ -2385,7 +2126,9 @@ app.post('/send-message', async (req, res) => {
     }
 });
 
-// Добавьте эндпоинт для групповых сообщений
+/**
+ * Отправка группового сообщения
+ */
 app.post('/send-group-message', async (req, res) => {
     try {
         const { groupId, senderEmail, message, duration } = req.body;
@@ -2417,6 +2160,13 @@ app.post('/send-group-message', async (req, res) => {
 
         if (error) throw error;
 
+        // Получаем название группы
+        const { data: groupData } = await supabase
+            .from('groups')
+            .select('name')
+            .eq('id', groupId)
+            .single();
+
         // Получаем всех участников группы
         const { data: members, error: membersError } = await supabase
             .from('group_members')
@@ -2425,6 +2175,7 @@ app.post('/send-group-message', async (req, res) => {
 
         if (!membersError && members) {
             const senderName = `${senderInfo.first_name || ''} ${senderInfo.last_name || ''}`.trim() || senderEmail;
+            const groupName = groupData?.name || 'Группа';
             
             // Отправляем уведомления всем участникам кроме отправителя
             for (const member of members) {
@@ -2432,9 +2183,12 @@ app.post('/send-group-message', async (req, res) => {
                     await sendFCMNotificationForMessage(
                         member.user_email,
                         senderName,
+                        senderEmail,
                         message || '',
                         data[0].id,
-                        true
+                        true,
+                        groupId,
+                        groupName
                     );
                 }
             }
@@ -2537,7 +2291,27 @@ app.get('/api/debug/firebase', (req, res) => {
     });
 });
 
-// ===== СТАТИЧЕСКИЕ ФАЙЛЫ =====
+app.get('/api/debug/storage', async (req, res) => {
+    try {
+        const { data: buckets } = await supabase.storage.listBuckets();
+        const bucketInfo = buckets?.find(b => b.name === supabaseBucketName);
+
+        res.json({
+            success: true,
+            bucketName: supabaseBucketName,
+            bucketExists: !!bucketInfo,
+            bucketInfo: bucketInfo,
+            allBuckets: buckets?.map(b => b.name)
+        });
+    } catch (error) {
+        res.json({
+            success: false,
+            error: error.message
+        });
+    }
+});
+
+// ===== СТАТИЧЕСКИЕ ФАЙЛЫ (для обратной совместимости) =====
 app.use('/uploads', express.static(uploadDir));
 
 // ===== ВЕБ-ИНТЕРФЕЙС =====
@@ -2552,6 +2326,8 @@ app.get('/', (req, res) => {
             h1 { color: #333; }
             .status { padding: 20px; background: #f0f0f0; border-radius: 5px; }
             .online { color: green; }
+            .storage { color: blue; }
+            .feature { margin-left: 20px; }
         </style>
     </head>
     <body>
@@ -2560,9 +2336,24 @@ app.get('/', (req, res) => {
             <p><strong>Status:</strong> <span class="online">🟢 Online</span></p>
             <p><strong>Server ID:</strong> ${SERVER_ID}</p>
             <p><strong>Firebase:</strong> ${firebaseInitialized ? '✅ Активен' : '❌ Не настроен'}</p>
+            <p><strong>Supabase Storage:</strong> <span class="storage">✅ Активен (bucket: ${supabaseBucketName})</span></p>
             <p><strong>Active Rooms:</strong> ${rooms.size}</p>
             <p><strong>Active Calls:</strong> ${activeCalls.size}</p>
             <p><strong>Total Users:</strong> ${users.size}</p>
+        </div>
+        <div class="features">
+            <h2>📋 Доступные эндпоинты:</h2>
+            <ul>
+                <li><strong>POST /upload</strong> - Загрузка файла (multipart/form-data)</li>
+                <li><strong>GET /files/:fileId</strong> - Информация о файле</li>
+                <li><strong>GET /messages/:messageId/files</strong> - Файлы сообщения</li>
+                <li><strong>GET /users/:email/files</strong> - Файлы пользователя</li>
+                <li><strong>DELETE /files/:fileId</strong> - Удаление файла</li>
+                <li><strong>POST /send-message</strong> - Отправка сообщения</li>
+                <li><strong>POST /send-group-message</strong> - Отправка группового сообщения</li>
+                <li><strong>GET /chats/:userEmail</strong> - Чаты пользователя</li>
+                <li><strong>GET /messages/:userEmail/:friendEmail</strong> - История переписки</li>
+            </ul>
         </div>
     </body>
     </html>
@@ -2580,7 +2371,8 @@ server.listen(PORT, '0.0.0.0', async () => {
     console.log(`📡 Веб-интерфейс: http://localhost:${PORT}`);
     console.log(`🔌 API Endpoint: http://localhost:${PORT}/api`);
     console.log(`💾 База данных: Supabase (${supabaseUrl})`);
-    console.log(`📁 Папка загрузок: ${uploadDir}`);
+    console.log(`📦 Supabase Storage: ${supabaseBucketName}`);
+    console.log(`📁 Локальная папка загрузок (временная): ${tempDir}`);
     console.log(`📧 Маппинг email->socketId активен`);
     console.log(`🔥 Firebase: ${firebaseInitialized ? 'активен' : 'не настроен'}`);
     console.log('='.repeat(60) + '\n');
@@ -2598,6 +2390,17 @@ process.on('SIGINT', async () => {
         console.log('✅ Присутствие пользователей очищено');
     } catch (error) {
         console.error('❌ Ошибка очистки присутствия:', error);
+    }
+    
+    // Очистка временной папки при остановке
+    try {
+        const files = fs.readdirSync(tempDir);
+        for (const file of files) {
+            fs.unlinkSync(path.join(tempDir, file));
+        }
+        console.log('✅ Временные файлы удалены');
+    } catch (error) {
+        console.error('❌ Ошибка очистки временных файлов:', error);
     }
     
     process.exit(0);
