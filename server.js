@@ -37,18 +37,26 @@ const io = socketIo(server, {
 });
 
 // ==================== FIREBASE ADMIN ====================
-// Загрузите ваш сервисный аккаунт из Firebase Console
-// Сохраните его как firebase-adminsdk.json в корне проекта
+// Загружаем сервисный аккаунт из файла
+// Имя файла может быть разным, поэтому используем переменную окружения
+const FIREBASE_SERVICE_ACCOUNT_PATH = process.env.FIREBASE_SERVICE_ACCOUNT_PATH || './beresta-9ed83-firebase-adminsdk-fbsvc-a14e896462.json';
+
 let serviceAccount;
 try {
-    serviceAccount = require('./firebase-adminsdk.json');
-    admin.initializeApp({
-        credential: admin.credential.cert(serviceAccount)
-    });
-    console.log('✅ Firebase Admin инициализирован');
+  // Пытаемся загрузить файл сервисного аккаунта
+  serviceAccount = require(FIREBASE_SERVICE_ACCOUNT_PATH);
+  
+  admin.initializeApp({
+    credential: admin.credential.cert(serviceAccount)
+  });
+  console.log('✅ Firebase Admin инициализирован успешно');
+  console.log(`📁 Используется файл: ${FIREBASE_SERVICE_ACCOUNT_PATH}`);
+  console.log(`🔥 Проект: ${serviceAccount.project_id}`);
 } catch (error) {
-    console.error('❌ Ошибка инициализации Firebase Admin:', error.message);
-    console.log('⚠️ FMC уведомления не будут работать без файла firebase-adminsdk.json');
+  console.error('❌ Ошибка инициализации Firebase Admin:', error.message);
+  console.log('⚠️ FCM уведомления не будут работать без файла сервисного аккаунта');
+  console.log('📁 Ожидается файл: beresta-9ed83-firebase-adminsdk-fbsvc-a14e896462.json');
+  console.log('💡 Вы можете указать другой файл через переменную окружения FIREBASE_SERVICE_ACCOUNT_PATH');
 }
 
 // ==================== SUPABASE ====================
