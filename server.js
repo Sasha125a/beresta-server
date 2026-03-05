@@ -424,15 +424,13 @@ async function sendFCMNotification(userEmail, title, body, data) {
     }
 }
 
-// Функция для отправки FCM уведомлений о сообщениях
-async function sendFCMNotificationForMessage(receiverEmail, senderName, message, messageId, isGroup = false, groupId = null, groupName = null) {
+async function sendFCMNotificationForMessage(receiverEmail, senderName, senderEmail, message, messageId, isGroup = false, groupId = null, groupName = null) {
     if (!firebaseInitialized) {
         console.log('❌ Firebase не инициализирован');
         return false;
     }
 
     try {
-        // Получаем FCM токен получателя
         const { data: userData, error } = await supabase
             .from('user_fcm_tokens')
             .select('fcm_token')
@@ -454,7 +452,7 @@ async function sendFCMNotificationForMessage(receiverEmail, senderName, message,
             data: {
                 type: 'message',
                 senderName: senderName,
-                senderEmail: receiverEmail,
+                senderEmail: senderEmail, // ВАЖНО: Это email ОТПРАВИТЕЛЯ!
                 message: message,
                 messageId: messageId.toString(),
                 isGroup: isGroup.toString(),
@@ -1716,79 +1714,6 @@ app.get('/messages/:userEmail/:friendEmail', async (req, res) => {
     }
 });
 
-// Добавьте эту функцию после sendFCMNotification
-
-async function sendFCMNotificationForMessage(receiverEmail, senderName, message, messageId, isGroup = false) {
-    if (!firebaseInitialized) {
-        console.log('❌ Firebase не инициализирован');
-        return false;
-    }
-
-    try {
-        // Получаем FCM токен получателя
-        const { data: userData, error } = await supabase
-            .from('user_fcm_tokens')
-            .select('fcm_token')
-            .eq('user_email', receiverEmail.toLowerCase())
-            .order('created_at', { ascending: false })
-            .limit(1);
-
-        if (error) throw error;
-
-        if (!userData || userData.length === 0 || !userData[0].fcm_token) {
-            console.log(`❌ Нет FCM токена для ${receiverEmail}`);
-            return false;
-        }
-
-        const title = isGroup ? '💬 Новое сообщение в группе' : '💬 Новое сообщение';
-        const body = `${senderName}: ${message.substring(0, 50)}${message.length > 50 ? '...' : ''}`;
-
-        const messageData = {
-            notification: {
-                title: title,
-                body: body,
-            },
-            data: {
-                type: 'message',
-                senderName: senderName,
-                senderEmail: receiverEmail, // Внимание: здесь может быть ошибка, нужно передавать отправителя
-                message: message,
-                messageId: messageId.toString(),
-                isGroup: isGroup.toString(),
-                click_action: 'OPEN_CHAT_ACTIVITY'
-            },
-            token: userData[0].fcm_token,
-            android: {
-                priority: 'high',
-                notification: {
-                    channelId: 'messages',
-                    priority: 'high',
-                    visibility: 'private',
-                    clickAction: 'OPEN_CHAT_ACTIVITY',
-                    sound: 'default'
-                },
-            },
-        };
-
-        const response = await admin.messaging().send(messageData);
-        console.log(`✅ FCM уведомление о сообщении отправлено для ${receiverEmail}`);
-        return true;
-    } catch (error) {
-        console.error('❌ Ошибка отправки FCM для сообщения:', error);
-        
-        if (error.code === 'messaging/registration-token-not-registered') {
-            await supabase
-                .from('user_fcm_tokens')
-                .delete()
-                .eq('user_email', receiverEmail.toLowerCase());
-            console.log(`🗑️ Удален устаревший FCM токен для ${receiverEmail}`);
-        }
-        
-        return false;
-    }
-}
-
-// Обновите эндпоинт отправки сообщения
 app.post('/send-message', async (req, res) => {
     try {
         const { senderEmail, receiverEmail, message, duration } = req.body;
@@ -1827,8 +1752,9 @@ app.post('/send-message', async (req, res) => {
         // Отправляем FCM уведомление получателю
         const senderName = `${senderInfo.first_name || ''} ${senderInfo.last_name || ''}`.trim() || senderEmail;
         await sendFCMNotificationForMessage(
-            receiverEmail,
-            senderName,
+            receiverEmail,  // КОМУ отправляем (получатель)
+            senderName,     // Имя отправителя
+            senderEmail,    // Email отправителя (ВАЖНО!)
             message || '',
             data[0].id,
             false
