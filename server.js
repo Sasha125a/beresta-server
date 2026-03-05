@@ -37,26 +37,37 @@ const io = socketIo(server, {
 });
 
 // ==================== FIREBASE ADMIN ====================
-// Загружаем сервисный аккаунт из файла
-// Имя файла может быть разным, поэтому используем переменную окружения
-const FIREBASE_SERVICE_ACCOUNT_PATH = process.env.FIREBASE_SERVICE_ACCOUNT_PATH || './beresta-9ed83-firebase-adminsdk-fbsvc-a14e896462.json';
+let firebaseInitialized = false;
 
-let serviceAccount;
 try {
-  // Пытаемся загрузить файл сервисного аккаунта
-  serviceAccount = require(FIREBASE_SERVICE_ACCOUNT_PATH);
-  
-  admin.initializeApp({
-    credential: admin.credential.cert(serviceAccount)
-  });
-  console.log('✅ Firebase Admin инициализирован успешно');
-  console.log(`📁 Используется файл: ${FIREBASE_SERVICE_ACCOUNT_PATH}`);
-  console.log(`🔥 Проект: ${serviceAccount.project_id}`);
+    // Пробуем загрузить из переменной окружения (для Render.com)
+    if (process.env.FIREBASE_SERVICE_ACCOUNT_JSON) {
+        const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT_JSON);
+        admin.initializeApp({
+            credential: admin.credential.cert(serviceAccount)
+        });
+        firebaseInitialized = true;
+        console.log('✅ Firebase Admin инициализирован из переменной окружения');
+        console.log(`🔥 Проект: ${serviceAccount.project_id}`);
+    } 
+    // Если нет, пробуем загрузить из файла (для локальной разработки)
+    else {
+        // Ищем любой файл, содержащий firebase-adminsdk
+        const files = fs.readdirSync('./').filter(f => f.includes('firebase-adminsdk') && f.endsWith('.json'));
+        if (files.length > 0) {
+            const serviceAccount = require('./' + files[0]);
+            admin.initializeApp({
+                credential: admin.credential.cert(serviceAccount)
+            });
+            firebaseInitialized = true;
+            console.log(`✅ Firebase Admin инициализирован из файла: ${files[0]}`);
+            console.log(`🔥 Проект: ${serviceAccount.project_id}`);
+        } else {
+            console.log('⚠️ Firebase credentials not found, FCM notifications disabled');
+        }
+    }
 } catch (error) {
-  console.error('❌ Ошибка инициализации Firebase Admin:', error.message);
-  console.log('⚠️ FCM уведомления не будут работать без файла сервисного аккаунта');
-  console.log('📁 Ожидается файл: beresta-9ed83-firebase-adminsdk-fbsvc-a14e896462.json');
-  console.log('💡 Вы можете указать другой файл через переменную окружения FIREBASE_SERVICE_ACCOUNT_PATH');
+    console.error('❌ Ошибка инициализации Firebase Admin:', error.message);
 }
 
 // ==================== SUPABASE ====================
@@ -133,6 +144,18 @@ const callHistory = new Map();     // История звонков
 const activeCalls = new Map();     // Активные звонки
 const emailToSocket = new Map();   // Маппинг email -> socket.id
 const socketToEmail = new Map();   // Обратный маппинг
+
+// Периодическая очистка старых звонков (раз в 5 минут)
+setInterval(() => {
+    const now = Date.now();
+    for (const [roomId, callData] of activeCalls.entries()) {
+        const startedAt = new Date(callData.startedAt || callData.startTime).getTime();
+        if (now - startedAt > 60 * 60 * 1000) {
+            activeCalls.delete(roomId);
+            console.log(`🧹 Очищен старый звонок: ${roomId}`);
+        }
+    }
+}, 5 * 60 * 1000);
 
 // ==================== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ====================
 
@@ -335,7 +358,7 @@ function getTodayCallsCount() {
 // ==================== ФУНКЦИИ ДЛЯ FCM ====================
 
 async function sendFCMNotification(userEmail, title, body, data) {
-    if (!admin.apps.length) {
+    if (!firebaseInitialized) {
         console.log('❌ Firebase не инициализирован');
         return false;
     }
@@ -372,16 +395,27 @@ async function sendFCMNotification(userEmail, title, body, data) {
                     channelId: 'calls',
                     priority: 'high',
                     visibility: 'public',
-                    clickAction: 'OPEN_CALL_ACTIVITY'
+                    clickAction: 'OPEN_CALL_ACTIVITY',
+                    sound: 'default'
                 },
             },
         };
 
         const response = await admin.messaging().send(message);
-        console.log(`✅ FCM уведомление отправлено: ${response}`);
+        console.log(`✅ FCM уведомление отправлено для ${userEmail}`);
         return true;
     } catch (error) {
         console.error('❌ Ошибка отправки FCM:', error);
+        
+        // Если токен устарел, удаляем его из базы
+        if (error.code === 'messaging/registration-token-not-registered') {
+            await supabase
+                .from('user_fcm_tokens')
+                .delete()
+                .eq('user_email', userEmail.toLowerCase());
+            console.log(`🗑️ Удален устаревший FCM токен для ${userEmail}`);
+        }
+        
         return false;
     }
 }
@@ -600,6 +634,7 @@ function handleDisconnect(socket, specificRoom = null) {
 
 // ==================== API ЭНДПОИНТЫ ====================
 
+// ===== Health check =====
 app.get('/health', async (req, res) => {
     try {
         const { error } = await supabase.from('regular_users').select('count', { count: 'exact', head: true });
@@ -644,6 +679,189 @@ app.get('/health', async (req, res) => {
     }
 });
 
+// ===== Статус сервера =====
+app.get('/api/status', (req, res) => {
+    res.json({
+        status: 'online',
+        timestamp: new Date().toISOString(),
+        serverId: SERVER_ID,
+        stats: {
+            activeRooms: rooms.size,
+            totalUsers: users.size,
+            activeCalls: activeCalls.size,
+            totalCallsToday: getTodayCallsCount()
+        }
+    });
+});
+
+// ===== Список всех комнат =====
+app.get('/api/rooms', (req, res) => {
+    const roomsList = [];
+    for (const [roomId, participants] of rooms.entries()) {
+        roomsList.push({
+            roomId: roomId,
+            participants: participants.size,
+            participantsList: Array.from(participants).map(socketId => ({
+                socketId,
+                userInfo: users.get(socketId) || { name: 'Аноним', type: 'unknown' }
+            })),
+            roomInfo: roomsInfo.get(roomId) || {
+                name: roomId,
+                createdAt: new Date().toISOString()
+            }
+        });
+    }
+    res.json({
+        total: roomsList.length,
+        rooms: roomsList
+    });
+});
+
+// ===== Информация о конкретной комнате =====
+app.get('/api/rooms/:roomId', (req, res) => {
+    const { roomId } = req.params;
+    const participants = rooms.get(roomId);
+    
+    if (!participants) {
+        return res.status(404).json({ error: 'Комната не найдена' });
+    }
+    
+    res.json({
+        roomId,
+        participants: participants.size,
+        participantsList: Array.from(participants).map(socketId => ({
+            socketId,
+            userInfo: users.get(socketId) || { name: 'Аноним', type: 'unknown' }
+        })),
+        roomInfo: roomsInfo.get(roomId) || {
+            name: roomId,
+            createdAt: new Date().toISOString()
+        }
+    });
+});
+
+// ===== Создать комнату (через API) =====
+app.post('/api/rooms', (req, res) => {
+    const { roomId, roomName, createdBy, type = 'video' } = req.body;
+    
+    if (!roomId) {
+        return res.status(400).json({ error: 'roomId обязателен' });
+    }
+    
+    if (rooms.has(roomId)) {
+        return res.status(409).json({ error: 'Комната уже существует' });
+    }
+    
+    rooms.set(roomId, new Set());
+    roomsInfo.set(roomId, {
+        name: roomName || roomId,
+        createdBy: createdBy || 'system',
+        createdAt: new Date().toISOString(),
+        type: type,
+        settings: req.body.settings || {}
+    });
+    
+    res.status(201).json({
+        success: true,
+        roomId,
+        message: 'Комната создана',
+        roomInfo: roomsInfo.get(roomId)
+    });
+});
+
+// ===== Обновить информацию о комнате =====
+app.put('/api/rooms/:roomId', (req, res) => {
+    const { roomId } = req.params;
+    const updates = req.body;
+    
+    if (!rooms.has(roomId)) {
+        return res.status(404).json({ error: 'Комната не найдена' });
+    }
+    
+    const currentInfo = roomsInfo.get(roomId) || {};
+    roomsInfo.set(roomId, { ...currentInfo, ...updates, updatedAt: new Date().toISOString() });
+    
+    io.to(roomId).emit('room-updated', roomsInfo.get(roomId));
+    
+    res.json({
+        success: true,
+        roomId,
+        roomInfo: roomsInfo.get(roomId)
+    });
+});
+
+// ===== Удалить комнату =====
+app.delete('/api/rooms/:roomId', (req, res) => {
+    const { roomId } = req.params;
+    
+    if (!rooms.has(roomId)) {
+        return res.status(404).json({ error: 'Комната не найдена' });
+    }
+    
+    io.to(roomId).emit('room-closed', { roomId, reason: 'Комната закрыта администратором' });
+    
+    rooms.delete(roomId);
+    roomsInfo.delete(roomId);
+    
+    res.json({
+        success: true,
+        message: 'Комната удалена'
+    });
+});
+
+// ===== Информация о пользователе по socketId =====
+app.get('/api/users/:socketId', (req, res) => {
+    const { socketId } = req.params;
+    const userInfo = users.get(socketId);
+    
+    if (!userInfo) {
+        return res.status(404).json({ error: 'Пользователь не найден' });
+    }
+    
+    res.json(userInfo);
+});
+
+// ===== Обновить информацию о пользователе =====
+app.put('/api/users/:socketId', (req, res) => {
+    const { socketId } = req.params;
+    const updates = req.body;
+    
+    const currentInfo = users.get(socketId) || {};
+    users.set(socketId, { ...currentInfo, ...updates, updatedAt: new Date().toISOString() });
+    
+    res.json({
+        success: true,
+        userInfo: users.get(socketId)
+    });
+});
+
+// ===== История звонков =====
+app.get('/api/calls/history', (req, res) => {
+    const { limit = 50, roomId } = req.query;
+    let history = Array.from(callHistory.values());
+    
+    if (roomId) {
+        history = history.filter(call => call.roomId === roomId);
+    }
+    
+    history.sort((a, b) => new Date(b.startTime || b.startedAt) - new Date(a.startTime || a.startedAt));
+    history = history.slice(0, parseInt(limit));
+    
+    res.json({
+        total: history.length,
+        calls: history
+    });
+});
+
+// ===== Активные звонки =====
+app.get('/api/calls/active', (req, res) => {
+    const active = Array.from(activeCalls.values());
+    res.json({
+        total: active.length,
+        calls: active
+    });
+});
+
 // ===== ЭНДПОИНТЫ ДЛЯ ЗВОНКОВ =====
 
 /**
@@ -662,7 +880,6 @@ app.post('/api/calls/initiate', async (req, res) => {
         
         console.log(`📞 Инициирование звонка: ${callerEmail} -> ${receiverEmail}`);
         
-        // Проверяем, что получатель не равен отправителю
         if (callerEmail.toLowerCase() === receiverEmail.toLowerCase()) {
             return res.status(400).json({
                 success: false,
@@ -670,10 +887,8 @@ app.post('/api/calls/initiate', async (req, res) => {
             });
         }
         
-        // Генерируем уникальный ID комнаты
         const roomId = `call_${Date.now()}_${Math.random().toString(36).substring(2, 10)}`;
         
-        // Создаем запись о звонке
         const callData = {
             roomId,
             caller: callerEmail,
@@ -1055,7 +1270,311 @@ app.post('/api/fcm/test', async (req, res) => {
 });
 
 // ===== РЕГИСТРАЦИЯ И ПОЛЬЗОВАТЕЛИ =====
-// ... (все остальные эндпоинты остаются без изменений)
+
+/**
+ * Регистрация обычного пользователя
+ */
+app.post('/register', async (req, res) => {
+    try {
+        const { email, firstName, lastName } = req.body;
+
+        if (!email || !firstName || !lastName) {
+            return res.status(400).json({
+                success: false,
+                error: 'Все поля обязательны'
+            });
+        }
+
+        const exists = await userExists(email);
+        if (exists) {
+            return res.status(409).json({
+                success: false,
+                error: 'Пользователь уже существует'
+            });
+        }
+
+        const { data, error } = await supabase
+            .from('regular_users')
+            .insert([{
+                email: email.toLowerCase(),
+                first_name: firstName,
+                last_name: lastName
+            }])
+            .select();
+
+        if (error) throw error;
+
+        res.json({
+            success: true,
+            message: 'Пользователь успешно зарегистрирован',
+            userId: data[0].id
+        });
+    } catch (error) {
+        console.error('❌ Ошибка регистрации:', error);
+        res.status(500).json({ success: false, error: 'Internal server error' });
+    }
+});
+
+/**
+ * Получение информации о пользователе
+ */
+app.get('/user/:email', async (req, res) => {
+    try {
+        const email = decodeURIComponent(req.params.email).toLowerCase();
+        console.log('🔍 Поиск пользователя по email:', email);
+
+        const user = await getUserInfo(email);
+
+        if (!user) {
+            return res.status(404).json({
+                success: false,
+                error: 'Пользователь не найден'
+            });
+        }
+
+        res.json({
+            success: true,
+            user
+        });
+    } catch (error) {
+        console.error('❌ Ошибка получения пользователя:', error);
+        res.status(500).json({
+            success: false,
+            error: 'Internal server error',
+            details: error.message
+        });
+    }
+});
+
+/**
+ * Получение всех пользователей
+ */
+app.get('/users', async (req, res) => {
+    try {
+        const [regularResult, berestaResult] = await Promise.all([
+            supabase.from('regular_users').select('email, first_name, last_name').order('first_name'),
+            supabase.from('beresta_users').select('email, first_name, last_name, beresta_id').order('first_name')
+        ]);
+
+        const regularUsers = regularResult.data || [];
+        const berestaUsers = berestaResult.data || [];
+
+        const allUsers = [
+            ...regularUsers.map(u => ({ ...u, userType: 'regular' })),
+            ...berestaUsers.map(u => ({ ...u, userType: 'beresta' }))
+        ];
+
+        res.json({
+            success: true,
+            users: allUsers
+        });
+    } catch (error) {
+        console.error('❌ Ошибка получения пользователей:', error);
+        res.status(500).json({ success: false, error: 'Internal server error' });
+    }
+});
+
+/**
+ * Получение чатов пользователя
+ */
+app.get('/chats/:userEmail', async (req, res) => {
+    try {
+        const userEmail = req.params.userEmail.toLowerCase();
+
+        console.log('🔄 Получение чатов для:', userEmail);
+
+        const { data: friends, error: friendsError } = await supabase
+            .from('friends')
+            .select('friend_email, created_at')
+            .eq('user_email', userEmail);
+
+        if (friendsError) throw friendsError;
+
+        if (!friends || friends.length === 0) {
+            return res.json({
+                success: true,
+                chats: []
+            });
+        }
+
+        const chats = await Promise.all(friends.map(async (friend) => {
+            const friendEmail = friend.friend_email;
+            const friendInfo = await getUserInfo(friendEmail);
+
+            const { data: messages, error: msgError } = await supabase
+                .from('messages')
+                .select('timestamp')
+                .or(`and(sender_email.eq.${userEmail},receiver_email.eq.${friendEmail}),and(sender_email.eq.${friendEmail},receiver_email.eq.${userEmail})`)
+                .order('timestamp', { ascending: false })
+                .limit(1);
+
+            if (msgError) console.error(`❌ Ошибка получения сообщений для ${friendEmail}:`, msgError);
+
+            return {
+                contactEmail: friendEmail,
+                firstName: friendInfo?.first_name || '',
+                lastName: friendInfo?.last_name || '',
+                type: 'friend',
+                lastMessageTime: messages?.[0]?.timestamp || friend.created_at || new Date().toISOString()
+            };
+        }));
+
+        chats.sort((a, b) => new Date(b.lastMessageTime) - new Date(a.lastMessageTime));
+
+        console.log('✅ Найдено чатов:', chats.length);
+
+        res.json({
+            success: true,
+            chats
+        });
+    } catch (error) {
+        console.error('❌ Ошибка получения чатов:', error);
+        res.status(500).json({
+            success: false,
+            error: 'Internal server error',
+            details: error.message
+        });
+    }
+});
+
+/**
+ * Получение сообщений между пользователями
+ */
+app.get('/messages/:userEmail/:friendEmail', async (req, res) => {
+    try {
+        const userEmail = req.params.userEmail.toLowerCase();
+        const friendEmail = req.params.friendEmail.toLowerCase();
+
+        const { data, error } = await supabase
+            .from('messages')
+            .select('*')
+            .or(`and(sender_email.eq.${userEmail},receiver_email.eq.${friendEmail}),and(sender_email.eq.${friendEmail},receiver_email.eq.${userEmail})`)
+            .order('timestamp', { ascending: true });
+
+        if (error) throw error;
+
+        res.json({
+            success: true,
+            messages: data || []
+        });
+    } catch (error) {
+        console.error('❌ Ошибка получения сообщений:', error);
+        res.status(500).json({ success: false, error: 'Internal server error' });
+    }
+});
+
+/**
+ * Отправка сообщения
+ */
+app.post('/send-message', async (req, res) => {
+    try {
+        const { senderEmail, receiverEmail, message, duration } = req.body;
+
+        if (!senderEmail || !receiverEmail) {
+            return res.status(400).json({
+                success: false,
+                error: 'Email обязательны'
+            });
+        }
+
+        const senderInfo = await getUserInfo(senderEmail);
+        const receiverInfo = await getUserInfo(receiverEmail);
+
+        if (!senderInfo || !receiverInfo) {
+            return res.status(404).json({
+                success: false,
+                error: 'Пользователь не найден'
+            });
+        }
+
+        const { data, error } = await supabase
+            .from('messages')
+            .insert([{
+                sender_email: senderEmail.toLowerCase(),
+                receiver_email: receiverEmail.toLowerCase(),
+                message: message || '',
+                duration: duration || 0
+            }])
+            .select();
+
+        if (error) throw error;
+
+        await addToChatsAutomatically(senderEmail, receiverEmail);
+
+        res.json({
+            success: true,
+            messageId: data[0].id
+        });
+    } catch (error) {
+        console.error('❌ Ошибка отправки сообщения:', error);
+        res.status(500).json({ success: false, error: 'Internal server error' });
+    }
+});
+
+/**
+ * Добавление друга
+ */
+app.post('/add-friend', async (req, res) => {
+    try {
+        const { userEmail, friendEmail } = req.body;
+
+        if (!userEmail || !friendEmail) {
+            return res.status(400).json({ success: false, error: 'Email обязательны' });
+        }
+
+        const normalizedUserEmail = userEmail.toLowerCase().trim();
+        const normalizedFriendEmail = friendEmail.toLowerCase().trim();
+
+        if (normalizedUserEmail === normalizedFriendEmail) {
+            return res.status(400).json({
+                success: false,
+                error: 'Нельзя добавить самого себя'
+            });
+        }
+
+        const userExistsCheck = await userExists(normalizedUserEmail);
+        const friendExistsCheck = await userExists(normalizedFriendEmail);
+
+        if (!userExistsCheck || !friendExistsCheck) {
+            return res.status(404).json({
+                success: false,
+                error: 'Пользователи не найдены'
+            });
+        }
+
+        await supabase
+            .from('friends')
+            .upsert({
+                user_email: normalizedUserEmail,
+                friend_email: normalizedFriendEmail
+            }, {
+                onConflict: 'user_email,friend_email',
+                ignoreDuplicates: true
+            });
+
+        await supabase
+            .from('friends')
+            .upsert({
+                user_email: normalizedFriendEmail,
+                friend_email: normalizedUserEmail
+            }, {
+                onConflict: 'user_email,friend_email',
+                ignoreDuplicates: true
+            });
+
+        res.json({
+            success: true,
+            message: 'Друг добавлен'
+        });
+    } catch (error) {
+        console.error('❌ Ошибка добавления друга:', error);
+        res.status(500).json({
+            success: false,
+            error: 'Internal server error',
+            details: error.message
+        });
+    }
+});
 
 // ===== ДЕБАГ ЭНДПОИНТЫ =====
 app.get('/api/debug/mappings', (req, res) => {
@@ -1072,6 +1591,45 @@ app.get('/api/debug/mappings', (req, res) => {
     });
 });
 
+app.get('/api/debug/firebase', (req, res) => {
+    res.json({
+        success: true,
+        firebaseInitialized: firebaseInitialized
+    });
+});
+
+// ===== СТАТИЧЕСКИЕ ФАЙЛЫ =====
+app.use('/uploads', express.static(uploadDir));
+
+// ===== ВЕБ-ИНТЕРФЕЙС =====
+app.get('/', (req, res) => {
+    res.send(`
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Beresta Server</title>
+        <style>
+            body { font-family: Arial, sans-serif; margin: 40px; line-height: 1.6; }
+            h1 { color: #333; }
+            .status { padding: 20px; background: #f0f0f0; border-radius: 5px; }
+            .online { color: green; }
+        </style>
+    </head>
+    <body>
+        <h1>🚀 Beresta Server</h1>
+        <div class="status">
+            <p><strong>Status:</strong> <span class="online">🟢 Online</span></p>
+            <p><strong>Server ID:</strong> ${SERVER_ID}</p>
+            <p><strong>Firebase:</strong> ${firebaseInitialized ? '✅ Активен' : '❌ Не настроен'}</p>
+            <p><strong>Active Rooms:</strong> ${rooms.size}</p>
+            <p><strong>Active Calls:</strong> ${activeCalls.size}</p>
+            <p><strong>Total Users:</strong> ${users.size}</p>
+        </div>
+    </body>
+    </html>
+    `);
+});
+
 // ===== ЗАПУСК СЕРВЕРА =====
 server.listen(PORT, '0.0.0.0', async () => {
     console.log('\n' + '='.repeat(60));
@@ -1082,11 +1640,10 @@ server.listen(PORT, '0.0.0.0', async () => {
     console.log(`🌐 Режим: ${process.env.NODE_ENV || 'development'}`);
     console.log(`📡 Веб-интерфейс: http://localhost:${PORT}`);
     console.log(`🔌 API Endpoint: http://localhost:${PORT}/api`);
-    console.log(`📡 Socket.IO активен на /socket.io`);
     console.log(`💾 База данных: Supabase (${supabaseUrl})`);
     console.log(`📁 Папка загрузок: ${uploadDir}`);
     console.log(`📧 Маппинг email->socketId активен`);
-    console.log(`🔥 FCM уведомления: ${admin.apps.length ? 'активны' : 'не настроены'}`);
+    console.log(`🔥 Firebase: ${firebaseInitialized ? 'активен' : 'не настроен'}`);
     console.log('='.repeat(60) + '\n');
 });
 
