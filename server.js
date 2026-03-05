@@ -1069,6 +1069,59 @@ app.post('/api/calls/reject', async (req, res) => {
 });
 
 /**
+ * Проверить FCM токен пользователя
+ */
+app.get('/api/fcm/check/:email', async (req, res) => {
+    try {
+        const { email } = req.params;
+        const normalizedEmail = email.toLowerCase();
+        
+        console.log(`🔍 Проверка FCM токена для: ${normalizedEmail}`);
+        
+        // Проверяем наличие токена
+        const { data, error } = await supabase
+            .from('user_fcm_tokens')
+            .select('*')
+            .eq('user_email', normalizedEmail)
+            .order('created_at', { ascending: false });
+            
+        if (error) {
+            console.error('❌ Ошибка запроса к Supabase:', error);
+            throw error;
+        }
+        
+        // Проверяем, есть ли пользователь в системе
+        const userInfo = await getUserInfo(normalizedEmail);
+        
+        const response = {
+            success: true,
+            email: normalizedEmail,
+            exists: userInfo !== null,
+            hasToken: data && data.length > 0,
+            tokenCount: data ? data.length : 0,
+            tokens: data ? data.map(t => ({
+                token_preview: t.fcm_token.substring(0, 20) + '...',
+                created_at: t.created_at,
+                updated_at: t.updated_at
+            })) : [],
+            message: data && data.length > 0 
+                ? `✅ Токен найден: ${data[0].fcm_token.substring(0, 20)}...` 
+                : '❌ Токен не найден'
+        };
+        
+        console.log(response.message);
+        
+        res.json(response);
+    } catch (error) {
+        console.error('❌ Ошибка проверки FCM токена:', error);
+        res.status(500).json({ 
+            success: false, 
+            error: error.message 
+        });
+    }
+});
+
+/**
  * Завершить звонок
  */
 app.post('/api/calls/end', async (req, res) => {
