@@ -369,6 +369,61 @@ function getTodayCallsCount() {
 }
 
 // ==================== ФУНКЦИИ ДЛЯ FCM ====================
+
+// Функция для отправки FCM уведомлений о звонках
+async function sendFCMNotification(userEmail, title, body, data) {
+    if (!firebaseInitialized) {
+        console.log('❌ Firebase не инициализирован');
+        return false;
+    }
+
+    try {
+        const { data: userData, error } = await supabase
+            .from('user_fcm_tokens')
+            .select('fcm_token')
+            .eq('user_email', userEmail.toLowerCase())
+            .order('created_at', { ascending: false })
+            .limit(1);
+
+        if (error) throw error;
+
+        if (!userData || userData.length === 0 || !userData[0].fcm_token) {
+            console.log(`❌ Нет FCM токена для ${userEmail}`);
+            return false;
+        }
+
+        const message = {
+            data: {
+                ...data,
+                title: title,
+                body: body,
+                type: 'call',
+                click_action: 'OPEN_CALL_ACTIVITY'
+            },
+            token: userData[0].fcm_token,
+            android: {
+                priority: 'high',
+            },
+        };
+
+        const response = await admin.messaging().send(message);
+        console.log(`✅ FCM уведомление о звонке отправлено для ${userEmail}`);
+        return true;
+    } catch (error) {
+        console.error('❌ Ошибка отправки FCM:', error);
+        
+        if (error.code === 'messaging/registration-token-not-registered') {
+            await supabase
+                .from('user_fcm_tokens')
+                .delete()
+                .eq('user_email', userEmail.toLowerCase());
+            console.log(`🗑️ Удален устаревший FCM токен для ${userEmail}`);
+        }
+        
+        return false;
+    }
+}
+
 // Функция для отправки FCM уведомлений о сообщениях
 async function sendFCMNotificationForMessage(receiverEmail, senderName, message, messageId, isGroup = false, groupId = null, groupName = null) {
     if (!firebaseInitialized) {
