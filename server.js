@@ -14,7 +14,6 @@ const ffmpeg = require('fluent-ffmpeg');
 const ffmpegPath = require('ffmpeg-static');
 const ffprobePath = require('ffprobe-static').path;
 const { createClient } = require('@supabase/supabase-js');
-const Agora = require('agora-access-token');
 
 // ==================== КОНФИГУРАЦИЯ ====================
 const isRender = process.env.NODE_ENV === 'production';
@@ -3156,78 +3155,6 @@ app.get('/', (req, res) => {
 </body>
 </html>
   `);
-});
-
-// Добавьте после других переменных окружения:
-const AGORA_APP_ID = process.env.AGORA_APP_ID;
-const AGORA_APP_CERTIFICATE = process.env.AGORA_APP_CERTIFICATE;
-
-// Эндпоинт для получения App ID
-app.get('/api/agora/app-id', (req, res) => {
-    if (!AGORA_APP_ID) {
-        return res.status(500).json({
-            success: false,
-            error: 'AGORA_APP_ID not configured'
-        });
-    }
-    
-    res.json({
-        success: true,
-        appId: AGORA_APP_ID
-    });
-});
-
-// Эндпоинт для получения токена
-app.post('/api/agora/token', (req, res) => {
-    try {
-        const { channelName, uid = 0 } = req.body;
-        
-        if (!channelName) {
-            return res.status(400).json({ 
-                success: false, 
-                error: 'channelName is required' 
-            });
-        }
-
-        if (!AGORA_APP_ID || !AGORA_APP_CERTIFICATE) {
-            return res.status(500).json({
-                success: false,
-                error: 'Agora credentials not configured'
-            });
-        }
-
-        // Срок действия токена - 1 час
-        const expirationTimeInSeconds = 3600;
-        const currentTimestamp = Math.floor(Date.now() / 1000);
-        const privilegeExpiredTs = currentTimestamp + expirationTimeInSeconds;
-
-        // Создаем токен
-        const token = Agora.RtcTokenBuilder.buildTokenWithUid(
-            AGORA_APP_ID,
-            AGORA_APP_CERTIFICATE,
-            channelName,
-            uid,
-            Agora.RtcRole.PUBLISHER,
-            privilegeExpiredTs
-        );
-
-        console.log(`✅ Токен сгенерирован для канала ${channelName}, uid ${uid}`);
-        
-        res.json({
-            success: true,
-            token: token,
-            appId: AGORA_APP_ID,
-            channelName: channelName,
-            uid: uid,
-            expirationTime: privilegeExpiredTs
-        });
-    } catch (error) {
-        console.error('❌ Ошибка генерации токена:', error);
-        res.status(500).json({
-            success: false,
-            error: error.message
-        });
-    }
 });
 
 // ===== ЗАПУСК СЕРВЕРА =====
