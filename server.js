@@ -369,83 +369,7 @@ function getTodayCallsCount() {
 }
 
 // ==================== ФУНКЦИИ ДЛЯ FCM ====================
-
-// Отправка группового сообщения
-app.post('/send-group-message', async (req, res) => {
-    try {
-        const { groupId, senderEmail, message, duration } = req.body;
-
-        if (!groupId || !senderEmail) {
-            return res.status(400).json({
-                success: false,
-                error: 'Группа и отправитель обязательны'
-            });
-        }
-
-        const senderInfo = await getUserInfo(senderEmail);
-        if (!senderInfo) {
-            return res.status(404).json({
-                success: false,
-                error: 'Отправитель не найден'
-            });
-        }
-
-        const { data, error } = await supabase
-            .from('group_messages')
-            .insert([{
-                group_id: groupId,
-                sender_email: senderEmail.toLowerCase(),
-                message: message || '',
-                duration: duration || 0
-            }])
-            .select();
-
-        if (error) throw error;
-
-        // Получаем название группы
-        const { data: groupData } = await supabase
-            .from('groups')
-            .select('name')
-            .eq('id', groupId)
-            .single();
-
-        // Получаем всех участников группы
-        const { data: members, error: membersError } = await supabase
-            .from('group_members')
-            .select('user_email')
-            .eq('group_id', groupId);
-
-        if (!membersError && members) {
-            const senderName = `${senderInfo.first_name || ''} ${senderInfo.last_name || ''}`.trim() || senderEmail;
-            const groupName = groupData?.name || 'Группа';
-            
-            // Отправляем уведомления всем участникам кроме отправителя
-            for (const member of members) {
-                if (member.user_email !== senderEmail.toLowerCase()) {
-                    await sendFCMNotificationForMessage(
-                        member.user_email,
-                        senderName,
-                        message || '',
-                        data[0].id,
-                        true,
-                        groupId,
-                        groupName
-                    );
-                }
-            }
-        }
-
-        res.json({
-            success: true,
-            messageId: data[0].id
-        });
-    } catch (error) {
-        console.error('❌ Ошибка отправки группового сообщения:', error);
-        res.status(500).json({ success: false, error: 'Internal server error' });
-    }
-});
-
-// Обновите функцию sendFCMNotificationForMessage
+// Функция для отправки FCM уведомлений о сообщениях
 async function sendFCMNotificationForMessage(receiverEmail, senderName, message, messageId, isGroup = false, groupId = null, groupName = null) {
     if (!firebaseInitialized) {
         console.log('❌ Firebase не инициализирован');
@@ -453,6 +377,7 @@ async function sendFCMNotificationForMessage(receiverEmail, senderName, message,
     }
 
     try {
+        // Получаем FCM токен получателя
         const { data: userData, error } = await supabase
             .from('user_fcm_tokens')
             .select('fcm_token')
@@ -467,7 +392,7 @@ async function sendFCMNotificationForMessage(receiverEmail, senderName, message,
             return false;
         }
 
-        const title = isGroup ? `💬 ${groupName || 'Группа'}` : '💬 Новое сообщение';
+        const title = isGroup ? `💬 ${groupName || 'Групповой чат'}` : '💬 Новое сообщение';
         const body = `${senderName}: ${message.substring(0, 50)}${message.length > 50 ? '...' : ''}`;
 
         const messageData = {
@@ -480,7 +405,9 @@ async function sendFCMNotificationForMessage(receiverEmail, senderName, message,
                 isGroup: isGroup.toString(),
                 groupId: groupId ? groupId.toString() : '',
                 groupName: groupName || '',
-                click_action: 'OPEN_CHAT_ACTIVITY'
+                click_action: 'OPEN_CHAT_ACTIVITY',
+                title: title,
+                body: body
             },
             token: userData[0].fcm_token,
             android: {
@@ -878,6 +805,81 @@ app.get('/api/rooms/:roomId', (req, res) => {
             createdAt: new Date().toISOString()
         }
     });
+});
+
+// Отправка группового сообщения
+app.post('/send-group-message', async (req, res) => {
+    try {
+        const { groupId, senderEmail, message, duration } = req.body;
+
+        if (!groupId || !senderEmail) {
+            return res.status(400).json({
+                success: false,
+                error: 'Группа и отправитель обязательны'
+            });
+        }
+
+        const senderInfo = await getUserInfo(senderEmail);
+        if (!senderInfo) {
+            return res.status(404).json({
+                success: false,
+                error: 'Отправитель не найден'
+            });
+        }
+
+        const { data, error } = await supabase
+            .from('group_messages')
+            .insert([{
+                group_id: groupId,
+                sender_email: senderEmail.toLowerCase(),
+                message: message || '',
+                duration: duration || 0
+            }])
+            .select();
+
+        if (error) throw error;
+
+        // Получаем название группы
+        const { data: groupData } = await supabase
+            .from('groups')
+            .select('name')
+            .eq('id', groupId)
+            .single();
+
+        // Получаем всех участников группы
+        const { data: members, error: membersError } = await supabase
+            .from('group_members')
+            .select('user_email')
+            .eq('group_id', groupId);
+
+        if (!membersError && members) {
+            const senderName = `${senderInfo.first_name || ''} ${senderInfo.last_name || ''}`.trim() || senderEmail;
+            const groupName = groupData?.name || 'Группа';
+            
+            // Отправляем уведомления всем участникам кроме отправителя
+            for (const member of members) {
+                if (member.user_email !== senderEmail.toLowerCase()) {
+                    await sendFCMNotificationForMessage(
+                        member.user_email,
+                        senderName,
+                        message || '',
+                        data[0].id,
+                        true,
+                        groupId,
+                        groupName
+                    );
+                }
+            }
+        }
+
+        res.json({
+            success: true,
+            messageId: data[0].id
+        });
+    } catch (error) {
+        console.error('❌ Ошибка отправки группового сообщения:', error);
+        res.status(500).json({ success: false, error: 'Internal server error' });
+    }
 });
 
 // ===== Создать комнату (через API) =====
