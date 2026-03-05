@@ -970,14 +970,17 @@ app.post('/api/calls/initiate', async (req, res) => {
         // Отправляем FCM уведомление получателю
         const fcmSent = await sendFCMNotification(
             receiverEmail,
-            '📞 Входящий звонок',
-            `${callerEmail} (${callType === 'video' ? 'видео' : 'аудио'})`,
+            '📞 Входящий звонок',  // title
+            `${callerEmail} (${callType === 'video' ? 'видео' : 'аудио'})`,  // body
             {
                 type: 'call',
                 roomId: roomId,
                 caller: callerEmail,
                 callType: callType || 'audio',
-                userEmail: receiverEmail
+                userEmail: receiverEmail,
+                // Добавляем action для кнопок
+                accept_action: 'ACCEPT_CALL',
+                reject_action: 'REJECT_CALL'
             }
         );
         
