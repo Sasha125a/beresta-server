@@ -1625,6 +1625,610 @@ app.get('/users', async (req, res) => {
     }
 });
 
+// ==================== ЭНДПОИНТЫ ДЛЯ ФАЙЛОВ ====================
+
+/**
+ * Загрузка файла в личный чат
+ */
+app.post('/upload', upload.single('file'), async (req, res) => {
+    try {
+        if (!req.file) {
+            return res.status(400).json({ success: false, error: 'Файл не загружен' });
+        }
+
+        const { senderEmail, receiverEmail, message } = req.body;
+
+        if (!senderEmail || !receiverEmail) {
+            fs.unlinkSync(req.file.path);
+            return res.status(400).json({ success: false, error: 'Email обязательны' });
+        }
+
+        const senderInfo = await getUserInfo(senderEmail);
+        const receiverInfo = await getUserInfo(receiverEmail);
+
+        if (!senderInfo || !receiverInfo) {
+            fs.unlinkSync(req.file.path);
+            return res.status(404).json({ success: false, error: 'Пользователь не найден' });
+        }
+
+        const fileType = getFileType(req.file.mimetype, req.file.originalname);
+        let thumbnailFilename = '';
+        let videoDuration = 0;
+
+        // Функция завершения загрузки
+        const completeFileUpload = async (thumbnail = '') => {
+            try {
+                const { data, error } = await supabase
+                    .from('messages')
+                    .insert([{
+                        sender_email: senderEmail.toLowerCase(),
+                        receiver_email: receiverEmail.toLowerCase(),
+                        message: message || '',
+                        attachment_type: fileType,
+                        attachment_filename: req.file.filename,
+                        attachment_original_name: req.file.originalname,
+                        attachment_mime_type: req.file.mimetype,
+                        attachment_size: req.file.size,
+                        duration: videoDuration,
+                        thumbnail: thumbnail
+                    }])
+                    .select();
+
+                if (error) throw error;
+
+                if (moveFileToPermanent(req.file.filename)) {
+                    await addToChatsAutomatically(senderEmail, receiverEmail);
+                    
+                    // Отправляем уведомление получателю
+                    const senderName = `${senderInfo.first_name || ''} ${senderInfo.last_name || ''}`.trim() || senderEmail;
+                    await sendFCMNotificationForMessage(
+                        receiverEmail,
+                        senderName,
+                        message || '📎 Файл',
+                        data[0].id,
+                        false
+                    );
+                    
+                    res.json({
+                        success: true,
+                        messageId: data[0].id,
+                        filename: req.file.filename,
+                        thumbnail: thumbnail,
+                        fileType: fileType
+                    });
+                } else {
+                    throw new Error('Ошибка перемещения файла');
+                }
+            } catch (error) {
+                // Очистка при ошибке
+                fs.unlinkSync(req.file.path);
+                if (thumbnail) {
+                    const thumbPath = path.join(thumbnailsDir, thumbnail);
+                    if (fs.existsSync(thumbPath)) fs.unlinkSync(thumbPath);
+                }
+                throw error;
+            }
+        };
+
+        // Создаем превью для видео и изображений
+        if (fileType === 'image' || fileType === 'video') {
+            const previewName = `preview_${path.parse(req.file.filename).name}.jpg`;
+            const previewPath = path.join(thumbnailsDir, previewName);
+
+            if (fileType === 'video') {
+                getVideoDuration(req.file.path, (err, duration) => {
+                    if (!err && duration > 0) videoDuration = duration;
+                    
+                    createMediaPreview(req.file.path, previewPath, fileType, (err) => {
+                        if (!err) thumbnailFilename = previewName;
+                        completeFileUpload(thumbnailFilename);
+                    });
+                });
+            } else {
+                createMediaPreview(req.file.path, previewPath, fileType, (err) => {
+                    if (!err) thumbnailFilename = previewName;
+                    completeFileUpload(thumbnailFilename);
+                });
+            }
+        } else {
+            await completeFileUpload();
+        }
+    } catch (error) {
+        console.error('❌ Ошибка загрузки файла:', error);
+        if (req.file && fs.existsSync(req.file.path)) {
+            fs.unlinkSync(req.file.path);
+        }
+        res.status(500).json({ success: false, error: 'Internal server error' });
+    }
+});
+
+/**
+ * Загрузка файла в групповой чат
+ */
+app.post('/upload-group', upload.single('file'), async (req, res) => {
+    try {
+        if (!req.file) {
+            return res.status(400).json({ success: false, error: 'Файл не загружен' });
+        }
+
+        const { groupId, senderEmail, message } = req.body;
+
+        if (!groupId || !senderEmail) {
+            fs.unlinkSync(req.file.path);
+            return res.status(400).json({ success: false, error: 'Группа и отправитель обязательны' });
+        }
+
+        const senderInfo = await getUserInfo(senderEmail);
+        if (!senderInfo) {
+            fs.unlinkSync(req.file.path);
+            return res.status(404).json({ success: false, error: 'Отправитель не найден' });
+        }
+
+        // Проверяем, существует ли группа
+        const { data: groupData, error: groupError } = await supabase
+            .from('groups')
+            .select('name')
+            .eq('id', groupId)
+            .single();
+
+        if (groupError || !groupData) {
+            fs.unlinkSync(req.file.path);
+            return res.status(404).json({ success: false, error: 'Группа не найдена' });
+        }
+
+        const fileType = getFileType(req.file.mimetype, req.file.originalname);
+        let thumbnailFilename = '';
+        let videoDuration = 0;
+
+        const completeFileUpload = async (thumbnail = '') => {
+            try {
+                const { data, error } = await supabase
+                    .from('group_messages')
+                    .insert([{
+                        group_id: groupId,
+                        sender_email: senderEmail.toLowerCase(),
+                        message: message || '',
+                        attachment_type: fileType,
+                        attachment_filename: req.file.filename,
+                        attachment_original_name: req.file.originalname,
+                        attachment_mime_type: req.file.mimetype,
+                        attachment_size: req.file.size,
+                        duration: videoDuration,
+                        thumbnail: thumbnail
+                    }])
+                    .select();
+
+                if (error) throw error;
+
+                if (moveFileToPermanent(req.file.filename)) {
+                    // Получаем всех участников группы
+                    const { data: members, error: membersError } = await supabase
+                        .from('group_members')
+                        .select('user_email')
+                        .eq('group_id', groupId);
+
+                    if (!membersError && members) {
+                        const senderName = `${senderInfo.first_name || ''} ${senderInfo.last_name || ''}`.trim() || senderEmail;
+                        
+                        // Отправляем уведомления всем участникам кроме отправителя
+                        for (const member of members) {
+                            if (member.user_email !== senderEmail.toLowerCase()) {
+                                await sendFCMNotificationForMessage(
+                                    member.user_email,
+                                    senderName,
+                                    message || '📎 Файл',
+                                    data[0].id,
+                                    true,
+                                    groupId,
+                                    groupData.name
+                                );
+                            }
+                        }
+                    }
+                    
+                    res.json({
+                        success: true,
+                        messageId: data[0].id,
+                        filename: req.file.filename,
+                        thumbnail: thumbnail,
+                        fileType: fileType
+                    });
+                } else {
+                    throw new Error('Ошибка перемещения файла');
+                }
+            } catch (error) {
+                fs.unlinkSync(req.file.path);
+                if (thumbnail) {
+                    const thumbPath = path.join(thumbnailsDir, thumbnail);
+                    if (fs.existsSync(thumbPath)) fs.unlinkSync(thumbPath);
+                }
+                throw error;
+            }
+        };
+
+        if (fileType === 'image' || fileType === 'video') {
+            const previewName = `preview_${path.parse(req.file.filename).name}.jpg`;
+            const previewPath = path.join(thumbnailsDir, previewName);
+
+            if (fileType === 'video') {
+                getVideoDuration(req.file.path, (err, duration) => {
+                    if (!err && duration > 0) videoDuration = duration;
+                    
+                    createMediaPreview(req.file.path, previewPath, fileType, (err) => {
+                        if (!err) thumbnailFilename = previewName;
+                        completeFileUpload(thumbnailFilename);
+                    });
+                });
+            } else {
+                createMediaPreview(req.file.path, previewPath, fileType, (err) => {
+                    if (!err) thumbnailFilename = previewName;
+                    completeFileUpload(thumbnailFilename);
+                });
+            }
+        } else {
+            await completeFileUpload();
+        }
+    } catch (error) {
+        console.error('❌ Ошибка загрузки файла в группу:', error);
+        if (req.file && fs.existsSync(req.file.path)) {
+            fs.unlinkSync(req.file.path);
+        }
+        res.status(500).json({ success: false, error: 'Internal server error' });
+    }
+});
+
+/**
+ * Загрузка файла (без привязки к сообщению)
+ */
+app.post('/upload-file', upload.single('file'), async (req, res) => {
+    try {
+        if (!req.file) {
+            return res.status(400).json({ success: false, error: 'Файл не загружен' });
+        }
+
+        const fileType = getFileType(req.file.mimetype, req.file.originalname);
+
+        if (moveFileToPermanent(req.file.filename)) {
+            res.json({
+                success: true,
+                filename: req.file.filename,
+                originalName: req.file.originalname,
+                fileType: fileType,
+                size: req.file.size,
+                mimeType: req.file.mimetype
+            });
+        } else {
+            fs.unlinkSync(req.file.path);
+            res.status(500).json({ success: false, error: 'Ошибка сохранения файла' });
+        }
+    } catch (error) {
+        console.error('❌ Ошибка загрузки файла:', error);
+        if (req.file && fs.existsSync(req.file.path)) {
+            fs.unlinkSync(req.file.path);
+        }
+        res.status(500).json({ success: false, error: 'Internal server error' });
+    }
+});
+
+/**
+ * Загрузка аватара профиля
+ */
+app.post('/upload-avatar', upload.single('avatar'), async (req, res) => {
+    try {
+        if (!req.file) {
+            return res.status(400).json({ success: false, error: 'Файл не загружен' });
+        }
+
+        const { userEmail } = req.body;
+
+        if (!userEmail) {
+            fs.unlinkSync(req.file.path);
+            return res.status(400).json({ success: false, error: 'Email обязателен' });
+        }
+
+        const userInfo = await getUserInfo(userEmail);
+        if (!userInfo) {
+            fs.unlinkSync(req.file.path);
+            return res.status(404).json({ success: false, error: 'Пользователь не найден' });
+        }
+
+        // Удаляем старый аватар, если есть
+        if (userInfo.avatar_filename) {
+            const oldAvatarPath = path.join(permanentDir, userInfo.avatar_filename);
+            if (fs.existsSync(oldAvatarPath)) {
+                fs.unlinkSync(oldAvatarPath);
+            }
+        }
+
+        if (moveFileToPermanent(req.file.filename)) {
+            const table = userInfo.userType === 'regular' ? 'regular_users' : 'beresta_users';
+            
+            const { error } = await supabase
+                .from(table)
+                .update({ avatar_filename: req.file.filename })
+                .eq('email', userEmail.toLowerCase());
+
+            if (error) throw error;
+
+            res.json({
+                success: true,
+                filename: req.file.filename,
+                message: 'Аватар обновлен'
+            });
+        } else {
+            fs.unlinkSync(req.file.path);
+            res.status(500).json({ success: false, error: 'Ошибка сохранения файла' });
+        }
+    } catch (error) {
+        console.error('❌ Ошибка загрузки аватара:', error);
+        if (req.file && fs.existsSync(req.file.path)) {
+            fs.unlinkSync(req.file.path);
+        }
+        res.status(500).json({ success: false, error: 'Internal server error' });
+    }
+});
+
+/**
+ * Скачивание файла
+ */
+app.get('/download/:filename', async (req, res) => {
+    try {
+        const filename = req.params.filename;
+        const filePath = path.join(permanentDir, filename);
+
+        if (!fs.existsSync(filePath)) {
+            return res.status(404).json({ success: false, error: 'Файл не найден' });
+        }
+
+        const mimeType = mime.lookup(filename) || 'application/octet-stream';
+        const originalName = req.query.originalName || filename;
+
+        res.setHeader('Content-Type', mimeType);
+        res.setHeader('Content-Disposition', `attachment; filename="${encodeURIComponent(originalName)}"`);
+        res.setHeader('Content-Length', fs.statSync(filePath).size);
+        
+        const fileStream = fs.createReadStream(filePath);
+        fileStream.pipe(res);
+    } catch (error) {
+        console.error('❌ Ошибка скачивания файла:', error);
+        res.status(500).json({ success: false, error: 'Internal server error' });
+    }
+});
+
+/**
+ * Получить информацию о файле из личного чата
+ */
+app.get('/file-info/:messageId', async (req, res) => {
+    try {
+        const messageId = req.params.messageId;
+
+        const { data, error } = await supabase
+            .from('messages')
+            .select('attachment_filename, attachment_original_name, attachment_mime_type, attachment_size, attachment_type, sender_email, receiver_email')
+            .eq('id', messageId)
+            .single();
+
+        if (error || !data?.attachment_filename) {
+            return res.status(404).json({ success: false, error: 'Файл не найден' });
+        }
+
+        const filePath = path.join(permanentDir, data.attachment_filename);
+        const exists = fs.existsSync(filePath);
+
+        res.json({
+            success: true,
+            exists,
+            filename: data.attachment_filename,
+            originalName: data.attachment_original_name,
+            mimeType: data.attachment_mime_type,
+            size: data.attachment_size,
+            type: data.attachment_type,
+            senderEmail: data.sender_email,
+            receiverEmail: data.receiver_email
+        });
+    } catch (error) {
+        console.error('❌ Ошибка получения информации о файле:', error);
+        res.status(500).json({ success: false, error: 'Internal server error' });
+    }
+});
+
+/**
+ * Получить информацию о файле из группы
+ */
+app.get('/group-file-info/:filename', async (req, res) => {
+    try {
+        const filename = req.params.filename;
+
+        const { data, error } = await supabase
+            .from('group_messages')
+            .select('attachment_filename, attachment_original_name, attachment_mime_type, attachment_size, attachment_type, group_id, sender_email')
+            .eq('attachment_filename', filename)
+            .single();
+
+        if (error || !data) {
+            return res.status(404).json({ success: false, error: 'Файл не найден' });
+        }
+
+        const filePath = path.join(permanentDir, data.attachment_filename);
+        const exists = fs.existsSync(filePath);
+
+        res.json({
+            success: true,
+            exists,
+            filename: data.attachment_filename,
+            originalName: data.attachment_original_name,
+            mimeType: data.attachment_mime_type,
+            size: data.attachment_size,
+            type: data.attachment_type,
+            groupId: data.group_id,
+            senderEmail: data.sender_email
+        });
+    } catch (error) {
+        console.error('❌ Ошибка получения информации о групповом файле:', error);
+        res.status(500).json({ success: false, error: 'Internal server error' });
+    }
+});
+
+/**
+ * Получить информацию о файле (универсальный)
+ */
+app.get('/file/:filename', async (req, res) => {
+    try {
+        const filename = req.params.filename;
+        const filePath = path.join(permanentDir, filename);
+
+        if (!fs.existsSync(filePath)) {
+            return res.status(404).json({ success: false, error: 'Файл не найден' });
+        }
+
+        const stats = fs.statSync(filePath);
+        const mimeType = mime.lookup(filename) || 'application/octet-stream';
+
+        res.json({
+            success: true,
+            filename: filename,
+            mimeType: mimeType,
+            size: stats.size,
+            created: stats.birthtime,
+            modified: stats.mtime
+        });
+    } catch (error) {
+        console.error('❌ Ошибка получения информации о файле:', error);
+        res.status(500).json({ success: false, error: 'Internal server error' });
+    }
+});
+
+/**
+ * Получить список файлов пользователя
+ */
+app.get('/user-files/:email', async (req, res) => {
+    try {
+        const email = req.params.email.toLowerCase();
+
+        // Получаем файлы из личных сообщений
+        const { data: personalFiles, error: personalError } = await supabase
+            .from('messages')
+            .select('attachment_filename, attachment_original_name, attachment_type, attachment_size, timestamp')
+            .or(`sender_email.eq.${email},receiver_email.eq.${email}`)
+            .not('attachment_filename', 'is', null)
+            .order('timestamp', { ascending: false });
+
+        if (personalError) throw personalError;
+
+        // Получаем файлы из групповых чатов
+        const { data: groupFiles, error: groupError } = await supabase
+            .from('group_messages')
+            .select('attachment_filename, attachment_original_name, attachment_type, attachment_size, timestamp, group_id')
+            .eq('sender_email', email)
+            .not('attachment_filename', 'is', null)
+            .order('timestamp', { ascending: false });
+
+        if (groupError) throw groupError;
+
+        const files = [
+            ...(personalFiles || []).map(f => ({
+                ...f,
+                type: 'personal',
+                url: `/download/${f.attachment_filename}`
+            })),
+            ...(groupFiles || []).map(f => ({
+                ...f,
+                type: 'group',
+                url: `/download/${f.attachment_filename}`
+            }))
+        ];
+
+        res.json({
+            success: true,
+            files: files
+        });
+    } catch (error) {
+        console.error('❌ Ошибка получения файлов пользователя:', error);
+        res.status(500).json({ success: false, error: 'Internal server error' });
+    }
+});
+
+/**
+ * Удалить файл
+ */
+app.delete('/file/:filename', async (req, res) => {
+    try {
+        const filename = req.params.filename;
+        const { userEmail } = req.body;
+
+        if (!userEmail) {
+            return res.status(400).json({ success: false, error: 'Email обязателен' });
+        }
+
+        // Проверяем, является ли пользователь владельцем файла
+        const { data: personalFile, error: personalError } = await supabase
+            .from('messages')
+            .select('id, sender_email')
+            .eq('attachment_filename', filename)
+            .single();
+
+        if (!personalError && personalFile) {
+            if (personalFile.sender_email !== userEmail.toLowerCase()) {
+                return res.status(403).json({ success: false, error: 'Нет прав на удаление файла' });
+            }
+
+            // Удаляем запись из БД
+            await supabase
+                .from('messages')
+                .update({ 
+                    attachment_filename: null,
+                    attachment_original_name: null,
+                    attachment_type: null,
+                    attachment_size: null
+                })
+                .eq('id', personalFile.id);
+        } else {
+            // Проверяем групповые файлы
+            const { data: groupFile, error: groupError } = await supabase
+                .from('group_messages')
+                .select('id, sender_email')
+                .eq('attachment_filename', filename)
+                .single();
+
+            if (!groupError && groupFile) {
+                if (groupFile.sender_email !== userEmail.toLowerCase()) {
+                    return res.status(403).json({ success: false, error: 'Нет прав на удаление файла' });
+                }
+
+                await supabase
+                    .from('group_messages')
+                    .update({ 
+                        attachment_filename: null,
+                        attachment_original_name: null,
+                        attachment_type: null,
+                        attachment_size: null
+                    })
+                    .eq('id', groupFile.id);
+            }
+        }
+
+        // Удаляем физический файл
+        const filePath = path.join(permanentDir, filename);
+        if (fs.existsSync(filePath)) {
+            fs.unlinkSync(filePath);
+        }
+
+        // Удаляем превью если есть
+        const previewPath = path.join(thumbnailsDir, `preview_${path.parse(filename).name}.jpg`);
+        if (fs.existsSync(previewPath)) {
+            fs.unlinkSync(previewPath);
+        }
+
+        res.json({
+            success: true,
+            message: 'Файл удален'
+        });
+    } catch (error) {
+        console.error('❌ Ошибка удаления файла:', error);
+        res.status(500).json({ success: false, error: 'Internal server error' });
+    }
+});
+
 /**
  * Получение чатов пользователя
  */
