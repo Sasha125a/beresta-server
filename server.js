@@ -507,16 +507,39 @@ io.on('connection', (socket) => {
 
     socket.on('ice-candidate', (data) => {
         console.log('📤 ICE кандидат от ' + socket.id + ' к ' + data.target);
-        
+    
+        // Проверяем наличие всех необходимых полей
+        if (!data.candidate) {
+            console.log('❌ ICE кандидат не содержит candidate');
+            return;
+        }
+    
+        // Определяем тип кандидата для отладки
+        let candidateType = 'unknown';
+        if (data.candidate) {
+            if (data.candidate.includes('typ host')) candidateType = 'HOST';
+            else if (data.candidate.includes('typ srflx')) candidateType = 'SRFLX';
+            else if (data.candidate.includes('typ relay')) candidateType = 'RELAY';
+        }
+    
+        console.log(`   Тип: ${candidateType}`);
+        console.log(`   sdpMid: ${data.sdpMid || 'не указан'}`);
+        console.log(`   sdpMLineIndex: ${data.sdpMLineIndex || 'не указан'}`);
+    
         let targetSocketId = data.target;
-        
+    
+        // Если target - email, конвертируем в socket.id
         if (typeof data.target === 'string' && data.target.includes('@')) {
             targetSocketId = emailToSocket.get(data.target);
+            console.log(`   Email -> socket: ${targetSocketId}`);
         }
-        
+    
         if (targetSocketId) {
+            // Отправляем все поля ICE кандидата
             socket.to(targetSocketId).emit('ice-candidate', {
                 candidate: data.candidate,
+                sdpMid: data.sdpMid || '',  // Если нет sdpMid, отправляем пустую строку
+                sdpMLineIndex: data.sdpMLineIndex !== undefined ? data.sdpMLineIndex : 0,
                 sender: socket.id
             });
             console.log(`✅ ICE кандидат отправлен на ${targetSocketId}`);
