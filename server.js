@@ -765,7 +765,7 @@ app.get('/health', async (req, res) => {
     }
 });
 
-// ===== Загрузка файла с сохранением в Supabase =====
+// Загрузка файла с сохранением в Supabase
 app.post('/upload', upload.single('file'), async (req, res) => {
     try {
         if (!req.file) {
@@ -779,6 +779,7 @@ app.post('/upload', upload.single('file'), async (req, res) => {
         const { senderEmail, receiverEmail, isGroup, groupId, messageType = 'file' } = req.body;
 
         console.log('📤 Загрузка файла:', file.originalname);
+        console.log('📤 Данные:', { senderEmail, receiverEmail, isGroup, groupId });
 
         // Загружаем файл в Supabase Storage
         const uploadResult = await uploadFileToSupabase(file.path, file.originalname);
@@ -819,6 +820,8 @@ app.post('/upload', upload.single('file'), async (req, res) => {
             throw fileError;
         }
 
+        console.log('✅ Файл сохранен в БД с ID:', fileData[0].id);
+
         // Если это сообщение, создаем запись в messages или group_messages
         if (senderEmail && (receiverEmail || groupId)) {
             if (groupId) {
@@ -828,13 +831,15 @@ app.post('/upload', upload.single('file'), async (req, res) => {
                     .insert([{
                         group_id: groupId,
                         sender_email: senderEmail.toLowerCase(),
-                        message: `[${fileType}] ${file.originalname}`,
+                        message: req.body.message || '', // Используем переданное сообщение
                         file_id: fileData[0].id,
                         duration: 0
                     }])
                     .select();
 
                 if (messageError) throw messageError;
+
+                console.log('✅ Групповое сообщение создано с ID:', messageData[0].id);
 
                 // Получаем информацию о группе и отправителе для уведомлений
                 const { data: groupData } = await supabase
@@ -859,7 +864,7 @@ app.post('/upload', upload.single('file'), async (req, res) => {
                                 member.user_email,
                                 senderName,
                                 senderEmail,
-                                `[${fileType}] ${file.originalname}`,
+                                req.body.message || `[${fileType}] ${file.originalname}`,
                                 messageData[0].id,
                                 true,
                                 groupId,
@@ -888,13 +893,16 @@ app.post('/upload', upload.single('file'), async (req, res) => {
                     .insert([{
                         sender_email: senderEmail.toLowerCase(),
                         receiver_email: receiverEmail.toLowerCase(),
-                        message: `[${fileType}] ${file.originalname}`,
+                        message: req.body.message || '', // Используем переданное сообщение
                         file_id: fileData[0].id,
                         duration: 0
                     }])
                     .select();
 
                 if (messageError) throw messageError;
+
+                console.log('✅ Личное сообщение создано с ID:', messageData[0].id);
+                console.log('✅ Привязан файл ID:', fileData[0].id);
 
                 // Добавляем в чаты автоматически
                 await addToChatsAutomatically(senderEmail, receiverEmail);
@@ -907,7 +915,7 @@ app.post('/upload', upload.single('file'), async (req, res) => {
                     receiverEmail,
                     senderName,
                     senderEmail,
-                    `[${fileType}] ${file.originalname}`,
+                    req.body.message || `[${fileType}] ${file.originalname}`,
                     messageData[0].id,
                     false
                 );
@@ -918,7 +926,7 @@ app.post('/upload', upload.single('file'), async (req, res) => {
                     io.to(receiverSocketId).emit('new_message', {
                         id: messageData[0].id,
                         senderEmail: senderEmail,
-                        message: `[${fileType}] ${file.originalname}`,
+                        message: req.body.message || '',
                         file: {
                             id: fileData[0].id,
                             name: file.originalname,
