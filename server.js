@@ -110,7 +110,7 @@ if (!supabaseUrl || !supabaseKey) {
 
 const supabase = createClient(supabaseUrl, supabaseKey);
 
-// Проверяем наличие bucket, но не обновляем его
+// Проверяем наличие bucket
 async function ensureBucketExists() {
     try {
         console.log('🔍 Проверка наличия bucket...');
@@ -131,11 +131,10 @@ async function ensureBucketExists() {
         if (bucketExists) {
             console.log(`✅ Bucket "${supabaseBucketName}" уже существует`);
             
-            // Просто выводим информацию о bucket без попытки обновления
             const bucket = buckets.find(b => b.name === supabaseBucketName);
             console.log('📊 Текущие настройки bucket:', {
                 public: bucket.public,
-                fileSizeLimit: bucket.file_size_limit,
+                fileSizeLimit: bucket.file_size_limit ? `${bucket.file_size_limit / (1024 * 1024)} MB` : 'не ограничен',
                 allowedMimeTypes: bucket.allowed_mime_types
             });
             
@@ -150,9 +149,6 @@ async function ensureBucketExists() {
         return false;
     }
 }
-
-// Вызываем функцию создания bucket
-ensureBucketExists();
 
 // ==================== ЛОКАЛЬНОЕ ФАЙЛОВОЕ ХРАНИЛИЩЕ (ВРЕМЕННОЕ) ====================
 const uploadDir = process.env.UPLOAD_DIR || path.join(__dirname, 'uploads');
@@ -178,13 +174,20 @@ const multerStorage = multer.diskStorage({
     }
 });
 
+// Настройка multer для загрузки файлов с учетом лимита Supabase
+const MAX_FILE_SIZE = 50 * 1024 * 1024; // 50 МБ (лимит бесплатного плана Supabase)
+
 const upload = multer({
     storage: multerStorage,
     limits: {
-        fileSize: 100 * 1024 * 1024, // 100MB
-        fieldSize: 50 * 1024 * 1024
+        fileSize: MAX_FILE_SIZE, // 50MB
+        fieldSize: MAX_FILE_SIZE
     },
     fileFilter: (req, file, cb) => {
+        // Проверяем размер файла
+        if (file.size > MAX_FILE_SIZE) {
+            return cb(new Error(`Файл слишком большой. Максимальный размер: 50 МБ`));
+        }
         cb(null, true);
     }
 });
