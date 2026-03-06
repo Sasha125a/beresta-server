@@ -258,10 +258,27 @@ function getFileType(mimetype, filename) {
 // Функция для загрузки файла в Supabase Storage
 async function uploadFileToSupabase(filePath, fileName, bucket = supabaseBucketName) {
     try {
+        console.log(`📤 Загрузка файла в Supabase: ${fileName}`);
+        
         const fileContent = fs.readFileSync(filePath);
         const fileExt = path.extname(fileName);
         const uniqueFileName = `${Date.now()}_${uuidv4()}${fileExt}`;
         const filePathInBucket = `uploads/${uniqueFileName}`;
+
+        console.log(`📁 Путь в bucket: ${filePathInBucket}`);
+        console.log(`📊 Размер файла: ${fileContent.length} байт`);
+
+        // Проверяем существование bucket
+        const { data: buckets } = await supabase.storage.listBuckets();
+        const bucketExists = buckets.some(b => b.name === bucket);
+        
+        if (!bucketExists) {
+            console.log(`⚠️ Bucket "${bucket}" не найден, создаем...`);
+            await supabase.storage.createBucket(bucket, {
+                public: true,
+                fileSizeLimit: 104857600 // 100MB
+            });
+        }
 
         const { data, error } = await supabase
             .storage
@@ -272,7 +289,10 @@ async function uploadFileToSupabase(filePath, fileName, bucket = supabaseBucketN
                 upsert: false
             });
 
-        if (error) throw error;
+        if (error) {
+            console.error('❌ Ошибка загрузки в Supabase:', error);
+            throw error;
+        }
 
         // Получаем публичный URL
         const { data: urlData } = supabase
@@ -287,7 +307,8 @@ async function uploadFileToSupabase(filePath, fileName, bucket = supabaseBucketN
             path: filePathInBucket,
             url: urlData.publicUrl,
             fileName: uniqueFileName,
-            originalName: fileName
+            originalName: fileName,
+            size: fileContent.length
         };
     } catch (error) {
         console.error('❌ Ошибка загрузки в Supabase:', error);
