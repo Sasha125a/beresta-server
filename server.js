@@ -110,73 +110,44 @@ if (!supabaseUrl || !supabaseKey) {
 
 const supabase = createClient(supabaseUrl, supabaseKey);
 
-// Создаем bucket если его нет
+// Проверяем наличие bucket, но не обновляем его
 async function ensureBucketExists() {
     try {
         console.log('🔍 Проверка наличия bucket...');
         
-        // Проверяем существует ли bucket
         const { data: buckets, error: listError } = await supabase
             .storage
             .listBuckets();
 
         if (listError) {
             console.error('❌ Ошибка при получении списка bucket-ов:', listError);
-            throw listError;
+            return false;
         }
 
         console.log('📦 Найденные bucket-ы:', buckets.map(b => b.name));
 
         const bucketExists = buckets.some(b => b.name === supabaseBucketName);
         
-        if (!bucketExists) {
-            console.log(`📦 Создание bucket "${supabaseBucketName}"...`);
-            
-            // Исправленные параметры для создания bucket
-            const { data, error } = await supabase
-                .storage
-                .createBucket(supabaseBucketName, {
-                    public: true,
-                    fileSizeLimit: 104857600, // 100MB в байтах
-                    allowedMimeTypes: null // разрешаем все типы файлов
-                });
-
-            if (error) {
-                console.error('❌ Ошибка при создании bucket:', error);
-                throw error;
-            }
-
-            console.log(`✅ Bucket "${supabaseBucketName}" успешно создан`);
-            console.log('📊 Параметры bucket:', {
-                public: true,
-                fileSizeLimit: '100MB',
-                allowedMimeTypes: 'все'
-            });
-        } else {
+        if (bucketExists) {
             console.log(`✅ Bucket "${supabaseBucketName}" уже существует`);
             
-            // Обновляем настройки существующего bucket
-            try {
-                const { error: updateError } = await supabase
-                    .storage
-                    .updateBucket(supabaseBucketName, {
-                        public: true,
-                        fileSizeLimit: 104857600, // 100MB
-                        allowedMimeTypes: null
-                    });
-                
-                if (updateError) {
-                    console.warn('⚠️ Не удалось обновить настройки bucket:', updateError.message);
-                } else {
-                    console.log('✅ Настройки bucket обновлены');
-                }
-            } catch (updateError) {
-                console.warn('⚠️ Ошибка при обновлении bucket:', updateError.message);
-            }
+            // Просто выводим информацию о bucket без попытки обновления
+            const bucket = buckets.find(b => b.name === supabaseBucketName);
+            console.log('📊 Текущие настройки bucket:', {
+                public: bucket.public,
+                fileSizeLimit: bucket.file_size_limit,
+                allowedMimeTypes: bucket.allowed_mime_types
+            });
+            
+            return true;
+        } else {
+            console.error(`❌ Bucket "${supabaseBucketName}" не найден!`);
+            console.log('⚠️ Пожалуйста, создайте bucket вручную в панели Supabase');
+            return false;
         }
     } catch (error) {
-        console.error('❌ Ошибка при работе с bucket:', error);
-        console.log('⚠️ Продолжаем работу без создания bucket...');
+        console.error('❌ Ошибка при проверке bucket:', error);
+        return false;
     }
 }
 
