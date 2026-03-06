@@ -11,7 +11,7 @@ const multer = require('multer');
 const { v4: uuidv4 } = require('uuid');
 const { createClient } = require('@supabase/supabase-js');
 const admin = require('firebase-admin');
-const axios = require('axios');
+const axios = require('axios'); // Для скачивания файлов из Supabase
 const stream = require('stream');
 const util = require('util');
 const mime = require('mime-types');
@@ -33,17 +33,18 @@ const io = socketIo(server, {
     },
     transports: ['websocket', 'polling'],
     pingTimeout: 60000,
-    pingInterval: 25000,
-    allowEIO3: true
+    pingInterval: 25000
 });
 
 // ==================== FIREBASE ADMIN ====================
 let firebaseInitialized = false;
 
 try {
+    // Пробуем загрузить из переменной окружения (для Render.com)
     if (process.env.FIREBASE_SERVICE_ACCOUNT_JSON) {
         console.log('📦 Найден FIREBASE_SERVICE_ACCOUNT_JSON, пытаемся распарсить...');
         
+        // Убираем экранирование если нужно
         let jsonString = process.env.FIREBASE_SERVICE_ACCOUNT_JSON;
         if (jsonString.startsWith('"') && jsonString.endsWith('"')) {
             jsonString = jsonString.slice(1, -1).replace(/\\n/g, '\n').replace(/\\"/g, '"');
@@ -57,8 +58,13 @@ try {
         });
         firebaseInitialized = true;
         console.log('✅ Firebase Admin инициализирован из переменной окружения');
-    } else {
+        console.log(`🔥 Проект: ${serviceAccount.project_id}`);
+        console.log(`📧 Client email: ${serviceAccount.client_email}`);
+    } 
+    // Если нет, пробуем загрузить из файла (для локальной разработки)
+    else {
         console.log('📦 FIREBASE_SERVICE_ACCOUNT_JSON не найден, ищем файл...');
+        // Ищем любой файл, содержащий firebase-adminsdk
         const files = fs.readdirSync('./').filter(f => f.includes('firebase-adminsdk') && f.endsWith('.json'));
         if (files.length > 0) {
             const serviceAccount = require('./' + files[0]);
@@ -67,12 +73,14 @@ try {
             });
             firebaseInitialized = true;
             console.log(`✅ Firebase Admin инициализирован из файла: ${files[0]}`);
+            console.log(`🔥 Проект: ${serviceAccount.project_id}`);
         } else {
             console.log('⚠️ Firebase credentials not found, FCM notifications disabled');
         }
     }
 } catch (error) {
     console.error('❌ Ошибка инициализации Firebase Admin:', error.message);
+    console.error('❌ Стек ошибки:', error.stack);
 }
 
 // ==================== MIDDLEWARE ====================
@@ -82,8 +90,13 @@ app.use(cors({
     credentials: true
 }));
 
+// ВАЖНО: Добавляем middleware для парсинга JSON и URL-encoded данных
 app.use(bodyParser.json({ limit: '50mb' }));
 app.use(bodyParser.urlencoded({ extended: true, limit: '50mb' }));
+
+// Альтернативно можно использовать встроенный express.json()
+// app.use(express.json({ limit: '50mb' }));
+// app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 
 // ==================== SUPABASE ====================
 const supabaseUrl = process.env.SUPABASE_URL;
@@ -97,10 +110,51 @@ if (!supabaseUrl || !supabaseKey) {
 
 const supabase = createClient(supabaseUrl, supabaseKey);
 
-// ==================== ЛОКАЛЬНОЕ ФАЙЛОВОЕ ХРАНИЛИЩЕ ====================
+// Проверяем наличие bucket
+async function ensureBucketExists() {
+    try {
+        console.log('🔍 Проверка наличия bucket...');
+        
+        const { data: buckets, error: listError } = await supabase
+            .storage
+            .listBuckets();
+
+        if (listError) {
+            console.error('❌ Ошибка при получении списка bucket-ов:', listError);
+            return false;
+        }
+
+        console.log('📦 Найденные bucket-ы:', buckets.map(b => b.name));
+
+        const bucketExists = buckets.some(b => b.name === supabaseBucketName);
+        
+        if (bucketExists) {
+            console.log(`✅ Bucket "${supabaseBucketName}" уже существует`);
+            
+            const bucket = buckets.find(b => b.name === supabaseBucketName);
+            console.log('📊 Текущие настройки bucket:', {
+                public: bucket.public,
+                fileSizeLimit: bucket.file_size_limit ? `${bucket.file_size_limit / (1024 * 1024)} MB` : 'не ограничен',
+                allowedMimeTypes: bucket.allowed_mime_types
+            });
+            
+            return true;
+        } else {
+            console.error(`❌ Bucket "${supabaseBucketName}" не найден!`);
+            console.log('⚠️ Пожалуйста, создайте bucket вручную в панели Supabase');
+            return false;
+        }
+    } catch (error) {
+        console.error('❌ Ошибка при проверке bucket:', error);
+        return false;
+    }
+}
+
+// ==================== ЛОКАЛЬНОЕ ФАЙЛОВОЕ ХРАНИЛИЩЕ (ВРЕМЕННОЕ) ====================
 const uploadDir = process.env.UPLOAD_DIR || path.join(__dirname, 'uploads');
 const tempDir = path.join(uploadDir, 'temp');
 
+// Создаем папки, если их нет
 [uploadDir, tempDir].forEach(dir => {
     if (!fs.existsSync(dir)) {
         fs.mkdirSync(dir, { recursive: true });
@@ -108,6 +162,7 @@ const tempDir = path.join(uploadDir, 'temp');
     }
 });
 
+// Настройка multer для загрузки файлов
 const multerStorage = multer.diskStorage({
     destination: (req, file, cb) => {
         cb(null, tempDir);
@@ -119,15 +174,17 @@ const multerStorage = multer.diskStorage({
     }
 });
 
-const MAX_FILE_SIZE = 50 * 1024 * 1024;
+// Настройка multer для загрузки файлов с учетом лимита Supabase
+const MAX_FILE_SIZE = 50 * 1024 * 1024; // 50 МБ (лимит бесплатного плана Supabase)
 
 const upload = multer({
     storage: multerStorage,
     limits: {
-        fileSize: MAX_FILE_SIZE,
+        fileSize: MAX_FILE_SIZE, // 50MB
         fieldSize: MAX_FILE_SIZE
     },
     fileFilter: (req, file, cb) => {
+        // Проверяем размер файла
         if (file.size > MAX_FILE_SIZE) {
             return cb(new Error(`Файл слишком большой. Максимальный размер: 50 МБ`));
         }
@@ -143,9 +200,8 @@ const callHistory = new Map();     // История звонков
 const activeCalls = new Map();     // Активные звонки
 const emailToSocket = new Map();   // Маппинг email -> socket.id
 const socketToEmail = new Map();   // Обратный маппинг
-const pendingCalls = new Map();    // Ожидающие звонки
 
-// Периодическая очистка старых звонков
+// Периодическая очистка старых звонков (раз в 5 минут)
 setInterval(() => {
     const now = Date.now();
     for (const [roomId, callData] of activeCalls.entries()) {
@@ -174,6 +230,7 @@ function getFileType(mimetype, filename) {
     return 'file';
 }
 
+// Функция для загрузки файла в Supabase Storage
 async function uploadFileToSupabase(filePath, fileName, bucket = supabaseBucketName) {
     try {
         console.log(`📤 Загрузка файла в Supabase: ${fileName}`);
@@ -183,6 +240,10 @@ async function uploadFileToSupabase(filePath, fileName, bucket = supabaseBucketN
         const uniqueFileName = `${Date.now()}_${uuidv4()}${fileExt}`;
         const filePathInBucket = `uploads/${uniqueFileName}`;
 
+        console.log(`📁 Путь в bucket: ${filePathInBucket}`);
+        console.log(`📊 Размер файла: ${fileContent.length} байт`);
+
+        // Проверяем существование bucket
         const { data: buckets } = await supabase.storage.listBuckets();
         const bucketExists = buckets.some(b => b.name === bucket);
         
@@ -190,7 +251,7 @@ async function uploadFileToSupabase(filePath, fileName, bucket = supabaseBucketN
             console.log(`⚠️ Bucket "${bucket}" не найден, создаем...`);
             await supabase.storage.createBucket(bucket, {
                 public: true,
-                fileSizeLimit: 104857600
+                fileSizeLimit: 104857600 // 100MB
             });
         }
 
@@ -203,8 +264,12 @@ async function uploadFileToSupabase(filePath, fileName, bucket = supabaseBucketN
                 upsert: false
             });
 
-        if (error) throw error;
+        if (error) {
+            console.error('❌ Ошибка загрузки в Supabase:', error);
+            throw error;
+        }
 
+        // Получаем публичный URL
         const { data: urlData } = supabase
             .storage
             .from(bucket)
@@ -229,6 +294,7 @@ async function uploadFileToSupabase(filePath, fileName, bucket = supabaseBucketN
     }
 }
 
+// Функция для удаления файла из Supabase Storage
 async function deleteFileFromSupabase(filePath, bucket = supabaseBucketName) {
     try {
         const { error } = await supabase
@@ -365,6 +431,7 @@ function getTodayCallsCount() {
 
 // ==================== ФУНКЦИИ ДЛЯ FCM ====================
 
+// Функция для отправки FCM уведомлений о звонках
 async function sendFCMNotification(userEmail, title, body, data) {
     if (!firebaseInitialized) {
         console.log('❌ Firebase не инициализирован');
@@ -482,14 +549,21 @@ async function sendFCMNotificationForMessage(receiverEmail, senderName, senderEm
 
 // ===== ФУНКЦИИ ДЛЯ АВТОМАТИЧЕСКОЙ ОЧИСТКИ ФАЙЛОВ =====
 
+/**
+ * Удаление старых файлов (старше 10 дней)
+ */
 async function cleanupOldFiles() {
     try {
         console.log('🧹 Запуск очистки старых файлов...');
         
+        // Вычисляем дату 10 дней назад
         const tenDaysAgo = new Date();
         tenDaysAgo.setDate(tenDaysAgo.getDate() - 10);
         const cutoffDate = tenDaysAgo.toISOString();
+        
+        console.log(`📅 Удаляем файлы старше: ${cutoffDate}`);
 
+        // Находим все файлы старше 10 дней
         const { data: oldFiles, error: selectError } = await supabase
             .from('files')
             .select('*')
@@ -512,6 +586,7 @@ async function cleanupOldFiles() {
 
         for (const file of oldFiles) {
             try {
+                // Удаляем файл из Supabase Storage
                 if (file.file_path) {
                     const { error: storageError } = await supabase
                         .storage
@@ -525,6 +600,7 @@ async function cleanupOldFiles() {
                     }
                 }
 
+                // Удаляем запись из базы данных
                 const { error: dbError } = await supabase
                     .from('files')
                     .delete()
@@ -536,6 +612,7 @@ async function cleanupOldFiles() {
                     continue;
                 }
 
+                // Обнуляем file_id в связанных сообщениях
                 await supabase
                     .from('messages')
                     .update({ file_id: null })
@@ -547,7 +624,7 @@ async function cleanupOldFiles() {
                     .eq('file_id', file.id);
 
                 deletedCount++;
-                console.log(`✅ Удален файл ID ${file.id}: ${file.file_name}`);
+                console.log(`✅ Удален файл ID ${file.id}: ${file.file_name} (загружен ${file.uploaded_at})`);
 
             } catch (error) {
                 console.error(`❌ Ошибка при удалении файла ID ${file.id}:`, error);
@@ -562,16 +639,21 @@ async function cleanupOldFiles() {
     }
 }
 
+/**
+ * Запуск периодической очистки старых файлов
+ */
 function startFileCleanupScheduler() {
     console.log('⏰ Запуск планировщика очистки файлов (каждые 24 часа)');
     
+    // Запускаем сразу при старте сервера
     setTimeout(() => {
         cleanupOldFiles();
-    }, 60000);
+    }, 60000); // Через 1 минуту после запуска
     
+    // Затем запускаем каждые 24 часа
     setInterval(() => {
         cleanupOldFiles();
-    }, 24 * 60 * 60 * 1000);
+    }, 24 * 60 * 60 * 1000); // 24 часа
 }
 
 // ==================== SOCKET.IO ОБРАБОТЧИКИ ====================
@@ -631,10 +713,8 @@ io.on('connection', (socket) => {
         console.log('📢 ' + socket.id + ' подключается к комнате звонка: ' + roomId);
         
         if (userInfo.email) {
-            const email = userInfo.email.toLowerCase();
-            emailToSocket.set(email, socket.id);
-            socketToEmail.set(socket.id, email);
-            socket.userEmail = email;
+            emailToSocket.set(userInfo.email, socket.id);
+            socketToEmail.set(socket.id, userInfo.email);
         }
         
         if (!rooms.has(roomId)) {
@@ -666,95 +746,62 @@ io.on('connection', (socket) => {
         
         console.log('✅ ' + socket.id + ' подключился к ' + roomId + '. Участников: ' + room.size);
         
-        socket.emit('join-success', { 
-            roomId: roomId, 
-            participants: Array.from(room),
-            isFirstParticipant: room.size === 1
-        });
+        socket.emit('join-success', { roomId: roomId, participants: Array.from(room) });
         
-        // Уведомляем всех в комнате о новом участнике
         if (room.size > 1) {
-            socket.to(roomId).emit('peer-joined', {
-                peerId: socket.id,
-                peerEmail: socket.userEmail,
-                peerInfo: userInfo
-            });
-            
-            // Отправляем сигнал готовности новому участнику
-            setTimeout(() => {
-                socket.emit('peer-ready', {
-                    message: 'Собеседник готов к соединению',
-                    participants: Array.from(room).filter(id => id !== socket.id)
-                });
-            }, 1000);
+            io.to(roomId).emit('peer-joined', socket.id);
         }
         
         io.emit('rooms-updated');
     });
 
     socket.on('offer', (data) => {
-        console.log('📤 Получен offer от ' + socket.id + ' к ' + data.target);
+        console.log('📤 Оффер от ' + socket.id + ' к ' + data.target);
         
         let targetSocketId = data.target;
         
         if (typeof data.target === 'string' && data.target.includes('@')) {
-            targetSocketId = emailToSocket.get(data.target.toLowerCase());
-            console.log(`📧 Поиск socketId для email ${data.target}: ${targetSocketId || 'не найден'}`);
+            targetSocketId = emailToSocket.get(data.target);
         }
         
         if (targetSocketId) {
-            console.log(`📤 Пересылка offer от ${socket.id} к ${targetSocketId}`);
             socket.to(targetSocketId).emit('offer', {
                 offer: data.offer,
-                sender: socket.userEmail || socket.id,
-                senderId: socket.id,
-                type: data.type || 'video'
-            });
-        } else {
-            console.log(`❌ Не найден target socket для ${data.target}`);
-            socket.emit('offer-error', {
-                message: 'Собеседник не в сети',
-                target: data.target
+                sender: socket.id
             });
         }
     });
 
     socket.on('answer', (data) => {
-        console.log('📤 Получен answer от ' + socket.id + ' к ' + data.target);
+        console.log('📤 Ответ от ' + socket.id + ' к ' + data.target);
         
         let targetSocketId = data.target;
         
         if (typeof data.target === 'string' && data.target.includes('@')) {
-            targetSocketId = emailToSocket.get(data.target.toLowerCase());
-            console.log(`📧 Поиск socketId для email ${data.target}: ${targetSocketId || 'не найден'}`);
+            targetSocketId = emailToSocket.get(data.target);
         }
         
         if (targetSocketId) {
-            console.log(`📤 Пересылка answer от ${socket.id} к ${targetSocketId}`);
             socket.to(targetSocketId).emit('answer', {
                 answer: data.answer,
-                sender: socket.userEmail || socket.id,
-                senderId: socket.id
+                sender: socket.id
             });
         }
     });
 
     socket.on('ice-candidate', (data) => {
-        console.log('📤 Получен ICE кандидат от ' + socket.id + ' к ' + data.target);
+        console.log('📤 ICE кандидат от ' + socket.id + ' к ' + data.target);
         
         let targetSocketId = data.target;
         
         if (typeof data.target === 'string' && data.target.includes('@')) {
-            targetSocketId = emailToSocket.get(data.target.toLowerCase());
+            targetSocketId = emailToSocket.get(data.target);
         }
         
         if (targetSocketId) {
-            console.log(`📤 Пересылка ICE кандидата от ${socket.id} к ${targetSocketId}`);
             socket.to(targetSocketId).emit('ice-candidate', {
                 candidate: data.candidate,
-                sdpMid: data.sdpMid,
-                sdpMLineIndex: data.sdpMLineIndex,
-                sender: socket.userEmail || socket.id
+                sender: socket.id
             });
         }
     });
@@ -807,10 +854,7 @@ function handleDisconnect(socket, specificRoom = null) {
         const room = rooms.get(roomId);
         room.delete(socket.id);
         
-        socket.to(roomId).emit('peer-disconnected', {
-            peerId: socket.id,
-            peerEmail: socket.userEmail
-        });
+        io.to(roomId).emit('peer-disconnected');
         
         if (room.size === 0) {
             rooms.delete(roomId);
@@ -845,6 +889,7 @@ app.get('/health', async (req, res) => {
             dirStatus[path.basename(dir)] = fs.existsSync(dir);
         });
 
+        // Проверка Supabase Storage
         const { data: buckets } = await supabase.storage.listBuckets();
         const storageAvailable = buckets && buckets.some(b => b.name === supabaseBucketName);
 
@@ -878,7 +923,7 @@ app.get('/health', async (req, res) => {
     }
 });
 
-// ===== Загрузка файла =====
+// Загрузка файла с сохранением в Supabase
 app.post('/upload', upload.single('file'), async (req, res) => {
     try {
         if (!req.file) {
@@ -892,7 +937,9 @@ app.post('/upload', upload.single('file'), async (req, res) => {
         const { senderEmail, receiverEmail, isGroup, groupId, messageType = 'file' } = req.body;
 
         console.log('📤 Загрузка файла:', file.originalname);
+        console.log('📤 Данные:', { senderEmail, receiverEmail, isGroup, groupId });
 
+        // Загружаем файл в Supabase Storage
         const uploadResult = await uploadFileToSupabase(file.path, file.originalname);
 
         if (!uploadResult.success) {
@@ -902,8 +949,10 @@ app.post('/upload', upload.single('file'), async (req, res) => {
             });
         }
 
+        // Определяем тип файла
         const fileType = getFileType(file.mimetype, file.originalname);
 
+        // Создаем запись о файле в базе данных
         const fileRecord = {
             file_name: file.originalname,
             file_path: uploadResult.path,
@@ -924,20 +973,23 @@ app.post('/upload', upload.single('file'), async (req, res) => {
 
         if (fileError) {
             console.error('❌ Ошибка сохранения записи о файле:', fileError);
+            // Пытаемся удалить файл из Supabase
             await deleteFileFromSupabase(uploadResult.path);
             throw fileError;
         }
 
         console.log('✅ Файл сохранен в БД с ID:', fileData[0].id);
 
+        // Если это сообщение, создаем запись в messages или group_messages
         if (senderEmail && (receiverEmail || groupId)) {
             if (groupId) {
+                // Групповое сообщение с файлом
                 const { data: messageData, error: messageError } = await supabase
                     .from('group_messages')
                     .insert([{
                         group_id: groupId,
                         sender_email: senderEmail.toLowerCase(),
-                        message: req.body.message || '',
+                        message: req.body.message || '', // Используем переданное сообщение
                         file_id: fileData[0].id,
                         duration: 0
                     }])
@@ -947,6 +999,7 @@ app.post('/upload', upload.single('file'), async (req, res) => {
 
                 console.log('✅ Групповое сообщение создано с ID:', messageData[0].id);
 
+                // Получаем информацию о группе и отправителе для уведомлений
                 const { data: groupData } = await supabase
                     .from('groups')
                     .select('name')
@@ -961,6 +1014,7 @@ app.post('/upload', upload.single('file'), async (req, res) => {
                 const senderInfo = await getUserInfo(senderEmail);
                 const senderName = senderInfo ? `${senderInfo.first_name || ''} ${senderInfo.last_name || ''}`.trim() : senderEmail;
 
+                // Отправляем уведомления
                 if (members) {
                     for (const member of members) {
                         if (member.user_email !== senderEmail.toLowerCase()) {
@@ -991,12 +1045,13 @@ app.post('/upload', upload.single('file'), async (req, res) => {
                     messageId: messageData[0].id
                 });
             } else if (receiverEmail) {
+                // Личное сообщение с файлом
                 const { data: messageData, error: messageError } = await supabase
                     .from('messages')
                     .insert([{
                         sender_email: senderEmail.toLowerCase(),
                         receiver_email: receiverEmail.toLowerCase(),
-                        message: req.body.message || '',
+                        message: req.body.message || '', // Используем переданное сообщение
                         file_id: fileData[0].id,
                         duration: 0
                     }])
@@ -1005,9 +1060,12 @@ app.post('/upload', upload.single('file'), async (req, res) => {
                 if (messageError) throw messageError;
 
                 console.log('✅ Личное сообщение создано с ID:', messageData[0].id);
+                console.log('✅ Привязан файл ID:', fileData[0].id);
 
+                // Добавляем в чаты автоматически
                 await addToChatsAutomatically(senderEmail, receiverEmail);
 
+                // Отправляем уведомление получателю
                 const senderInfo = await getUserInfo(senderEmail);
                 const senderName = senderInfo ? `${senderInfo.first_name || ''} ${senderInfo.last_name || ''}`.trim() : senderEmail;
 
@@ -1020,6 +1078,7 @@ app.post('/upload', upload.single('file'), async (req, res) => {
                     false
                 );
 
+                // Отправляем через Socket.IO
                 const receiverSocketId = emailToSocket.get(receiverEmail.toLowerCase());
                 if (receiverSocketId) {
                     io.to(receiverSocketId).emit('new_message', {
@@ -1074,6 +1133,7 @@ app.post('/upload', upload.single('file'), async (req, res) => {
             });
         }
 
+        // Удаляем временный файл после загрузки в Supabase
         fs.unlink(file.path, (err) => {
             if (err) console.error('❌ Ошибка удаления временного файла:', err);
             else console.log('🗑️ Временный файл удален:', file.path);
@@ -1094,6 +1154,7 @@ app.get('/messages/:messageId/files', async (req, res) => {
     try {
         const { messageId } = req.params;
 
+        // Проверяем в обычных сообщениях
         const { data: messageData, error: messageError } = await supabase
             .from('messages')
             .select('file_id')
@@ -1115,6 +1176,7 @@ app.get('/messages/:messageId/files', async (req, res) => {
             }
         }
 
+        // Проверяем в групповых сообщениях
         const { data: groupMessageData, error: groupMessageError } = await supabase
             .from('group_messages')
             .select('file_id')
@@ -1175,7 +1237,9 @@ app.get('/users/:email/files', async (req, res) => {
     }
 });
 
-// ===== Обновление профиля =====
+/**
+ * Обновление профиля пользователя
+ */
 app.post('/update-profile', upload.single('avatar'), async (req, res) => {
     try {
         const { email, firstName, lastName, removeAvatar } = req.body;
@@ -1189,9 +1253,11 @@ app.post('/update-profile', upload.single('avatar'), async (req, res) => {
         }
 
         console.log(`📝 Обновление профиля для: ${email}`);
+        console.log(`📝 Данные: firstName=${firstName}, lastName=${lastName}, removeAvatar=${removeAvatar}`);
 
         const normalizedEmail = email.toLowerCase();
 
+        // Проверяем существование пользователя
         const { data: existingUser, error: checkError } = await supabase
             .from('regular_users')
             .select('*')
@@ -1206,13 +1272,16 @@ app.post('/update-profile', upload.single('avatar'), async (req, res) => {
             });
         }
 
+        // Подготавливаем данные для обновления
         const updateData = {
             first_name: firstName || existingUser.first_name,
             last_name: lastName || existingUser.last_name,
             updated_at: new Date().toISOString()
         };
 
+        // Обработка аватара
         if (removeAvatar === 'true') {
+            // Удаляем старый аватар, если он был
             if (existingUser.avatar_filename) {
                 try {
                     await supabase
@@ -1226,6 +1295,7 @@ app.post('/update-profile', upload.single('avatar'), async (req, res) => {
             updateData.avatar_filename = null;
         } 
         else if (file) {
+            // Загружаем новый аватар
             try {
                 console.log('📤 Загрузка нового аватара:', file.originalname);
                 
@@ -1234,6 +1304,7 @@ app.post('/update-profile', upload.single('avatar'), async (req, res) => {
                 const fileName = `avatar_${Date.now()}${fileExt}`;
                 const filePath = `avatars/${fileName}`;
 
+                // Загружаем в Supabase Storage
                 const { error: uploadError } = await supabase
                     .storage
                     .from(supabaseBucketName)
@@ -1247,6 +1318,7 @@ app.post('/update-profile', upload.single('avatar'), async (req, res) => {
                     throw uploadError;
                 }
 
+                // Удаляем старый аватар, если был
                 if (existingUser.avatar_filename) {
                     try {
                         await supabase
@@ -1261,6 +1333,7 @@ app.post('/update-profile', upload.single('avatar'), async (req, res) => {
                 updateData.avatar_filename = fileName;
                 console.log('✅ Аватар загружен:', fileName);
 
+                // Удаляем временный файл
                 fs.unlink(file.path, (err) => {
                     if (err) console.error('❌ Ошибка удаления временного файла:', err);
                 });
@@ -1274,6 +1347,7 @@ app.post('/update-profile', upload.single('avatar'), async (req, res) => {
             }
         }
 
+        // Обновляем данные пользователя в базе
         const { data, error: updateError } = await supabase
             .from('regular_users')
             .update(updateData)
@@ -1287,6 +1361,7 @@ app.post('/update-profile', upload.single('avatar'), async (req, res) => {
 
         console.log('✅ Профиль успешно обновлен для:', normalizedEmail);
 
+        // Получаем публичный URL аватара, если он есть
         let avatarUrl = null;
         if (updateData.avatar_filename) {
             const { data: urlData } = supabase
@@ -1311,6 +1386,7 @@ app.post('/update-profile', upload.single('avatar'), async (req, res) => {
     } catch (error) {
         console.error('❌ Ошибка обновления профиля:', error);
         
+        // Очищаем временный файл в случае ошибки
         if (req.file && req.file.path) {
             fs.unlink(req.file.path, () => {});
         }
@@ -1323,13 +1399,16 @@ app.post('/update-profile', upload.single('avatar'), async (req, res) => {
     }
 });
 
-// ===== Получение сообщений группы =====
+/**
+ * Получение сообщений группы
+ */
 app.get('/group-messages/:groupId', async (req, res) => {
     try {
         const groupId = req.params.groupId;
         
         console.log(`📥 Запрос сообщений для группы ID: ${groupId}`);
 
+        // Получаем сообщения группы с информацией об отправителях
         const { data: messages, error } = await supabase
             .from('group_messages')
             .select(`
@@ -1356,6 +1435,7 @@ app.get('/group-messages/:groupId', async (req, res) => {
 
         console.log(`✅ Найдено сообщений: ${messages?.length || 0}`);
 
+        // Форматируем сообщения для отправки клиенту
         const formattedMessages = (messages || []).map(msg => ({
             id: msg.id,
             group_id: msg.group_id,
@@ -1365,6 +1445,7 @@ app.get('/group-messages/:groupId', async (req, res) => {
             message: msg.message || '',
             timestamp: msg.timestamp,
             duration: msg.duration || 0,
+            // Информация о файле, если есть
             files: msg.files ? {
                 id: msg.files.id,
                 file_name: msg.files.file_name,
@@ -1394,6 +1475,7 @@ app.delete('/files/:fileId', async (req, res) => {
     try {
         const { fileId } = req.params;
 
+        // Получаем информацию о файле
         const { data: fileData, error: fileError } = await supabase
             .from('files')
             .select('*')
@@ -1407,12 +1489,14 @@ app.delete('/files/:fileId', async (req, res) => {
             });
         }
 
+        // Удаляем из Supabase Storage
         const deleteResult = await deleteFileFromSupabase(fileData.file_path);
 
         if (!deleteResult.success) {
             console.warn('⚠️ Не удалось удалить файл из хранилища:', deleteResult.error);
         }
 
+        // Удаляем запись из базы данных
         const { error: deleteError } = await supabase
             .from('files')
             .delete()
@@ -1420,6 +1504,7 @@ app.delete('/files/:fileId', async (req, res) => {
 
         if (deleteError) throw deleteError;
 
+        // Удаляем ссылки на файл в сообщениях
         await supabase
             .from('messages')
             .update({ file_id: null })
@@ -1443,7 +1528,9 @@ app.delete('/files/:fileId', async (req, res) => {
     }
 });
 
-// ===== Получение групп пользователя =====
+/**
+ * Получение групп пользователя
+ */
 app.get('/groups/:userEmail', async (req, res) => {
     try {
         const userEmail = req.params.userEmail.toLowerCase();
@@ -1465,6 +1552,7 @@ app.get('/groups/:userEmail', async (req, res) => {
 
         if (error) throw error;
 
+        // Получаем количество участников для каждой группы
         const groups = await Promise.all((data || []).map(async (item) => {
             const { count } = await supabase
                 .from('group_members')
@@ -1495,7 +1583,9 @@ app.get('/groups/:userEmail', async (req, res) => {
     }
 });
 
-// ===== Очистка истории чата =====
+/**
+ * Очистка истории чата между пользователями
+ */
 app.post('/clear-chat', async (req, res) => {
     try {
         const { userEmail, friendEmail } = req.body;
@@ -1512,6 +1602,7 @@ app.post('/clear-chat', async (req, res) => {
         
         console.log(`🧹 Очистка чата между ${normalizedUserEmail} и ${normalizedFriendEmail}`);
         
+        // Находим все сообщения между пользователями
         const { data: messages, error: selectError } = await supabase
             .from('messages')
             .select('id, file_id')
@@ -1525,12 +1616,14 @@ app.post('/clear-chat', async (req, res) => {
         console.log(`📊 Найдено сообщений: ${messages?.length || 0}`);
         
         if (messages && messages.length > 0) {
+            // Собираем все file_id из сообщений
             const fileIds = messages
                 .filter(msg => msg.file_id !== null)
                 .map(msg => msg.file_id);
             
             console.log(`📎 Найдено файлов: ${fileIds.length}`);
             
+            // Удаляем сами сообщения
             const { error: deleteMessagesError } = await supabase
                 .from('messages')
                 .delete()
@@ -1541,9 +1634,11 @@ app.post('/clear-chat', async (req, res) => {
                 throw deleteMessagesError;
             }
             
+            // Удаляем файлы, если они есть
             if (fileIds.length > 0) {
                 for (const fileId of fileIds) {
                     try {
+                        // Получаем информацию о файле
                         const { data: fileData } = await supabase
                             .from('files')
                             .select('file_path')
@@ -1551,12 +1646,14 @@ app.post('/clear-chat', async (req, res) => {
                             .single();
                         
                         if (fileData && fileData.file_path) {
+                            // Удаляем из Supabase Storage
                             await supabase
                                 .storage
                                 .from(supabaseBucketName)
                                 .remove([fileData.file_path]);
                         }
                         
+                        // Удаляем запись из БД
                         await supabase
                             .from('files')
                             .delete()
@@ -1587,7 +1684,9 @@ app.post('/clear-chat', async (req, res) => {
     }
 });
 
-// ===== Получение информации о файле =====
+/**
+ * Получение информации о файле с проверкой возраста
+ */
 app.get('/files/:fileId', async (req, res) => {
     try {
         const { fileId } = req.params;
@@ -1605,9 +1704,12 @@ app.get('/files/:fileId', async (req, res) => {
             });
         }
 
+        // Проверяем возраст файла (опционально)
         const uploadedAt = new Date(data.uploaded_at);
         const now = new Date();
         const daysOld = Math.floor((now - uploadedAt) / (1000 * 60 * 60 * 24));
+        
+        console.log(`📎 Информация о файле ID ${fileId}: ${data.file_name}, возраст: ${daysOld} дней`);
 
         res.json({
             success: true,
@@ -1687,7 +1789,7 @@ app.get('/api/rooms/:roomId', (req, res) => {
     });
 });
 
-// ===== Создать комнату =====
+// ===== Создать комнату (через API) =====
 app.post('/api/rooms', (req, res) => {
     const { roomId, roomName, createdBy, type = 'video' } = req.body;
     
@@ -1809,7 +1911,11 @@ app.get('/api/calls/active', (req, res) => {
     });
 });
 
-// ===== Инициирование звонка =====
+// ===== ЭНДПОИНТЫ ДЛЯ ЗВОНКОВ =====
+
+/**
+ * Инициирование звонка с FCM уведомлением
+ */
 app.post('/api/calls/initiate', async (req, res) => {
     try {
         const { callerEmail, receiverEmail, callType } = req.body;
@@ -1843,25 +1949,8 @@ app.post('/api/calls/initiate', async (req, res) => {
         };
         
         activeCalls.set(roomId, callData);
-        pendingCalls.set(roomId, callData);
         
-        // Автоматически удаляем через 30 секунд если не принят
-        setTimeout(() => {
-            if (pendingCalls.has(roomId) && pendingCalls.get(roomId).status === 'ringing') {
-                pendingCalls.delete(roomId);
-                activeCalls.delete(roomId);
-                console.log(`⏰ Звонок ${roomId} автоматически отменен (таймаут)`);
-                
-                const callerSocketId = emailToSocket.get(callerEmail.toLowerCase());
-                if (callerSocketId) {
-                    io.to(callerSocketId).emit('call-timeout', {
-                        roomId,
-                        message: 'Собеседник не ответил'
-                    });
-                }
-            }
-        }, 30000);
-        
+        // Отправляем FCM уведомление получателю
         const fcmSent = await sendFCMNotification(
             receiverEmail,
             '📞 Входящий звонок',
@@ -1879,11 +1968,20 @@ app.post('/api/calls/initiate', async (req, res) => {
         
         console.log(`📱 FCM уведомление ${fcmSent ? 'отправлено' : 'не отправлено'}`);
         
-        const receiverSocketId = emailToSocket.get(receiverEmail.toLowerCase());
+        // Отправляем через Socket.IO для онлайн пользователей
+        const receiverSocketId = emailToSocket.get(receiverEmail);
         if (receiverSocketId) {
             console.log(`📱 Получатель онлайн, socketId: ${receiverSocketId}`);
             
             io.to(receiverSocketId).emit('incoming-call', {
+                type: 'incoming-call',
+                roomId: roomId,
+                caller: callerEmail,
+                callType: callType || 'audio',
+                timestamp: new Date().toISOString()
+            });
+            
+            io.to(receiverSocketId).emit(`call:${receiverEmail}`, {
                 type: 'incoming-call',
                 roomId: roomId,
                 caller: callerEmail,
@@ -1911,7 +2009,9 @@ app.post('/api/calls/initiate', async (req, res) => {
     }
 });
 
-// ===== Принять звонок =====
+/**
+ * Принять звонок
+ */
 app.post('/api/calls/accept', async (req, res) => {
     try {
         const { roomId, userEmail } = req.body;
@@ -1923,7 +2023,7 @@ app.post('/api/calls/accept', async (req, res) => {
             });
         }
         
-        const callData = activeCalls.get(roomId) || pendingCalls.get(roomId);
+        const callData = activeCalls.get(roomId);
         
         if (!callData) {
             return res.status(404).json({
@@ -1940,14 +2040,11 @@ app.post('/api/calls/accept', async (req, res) => {
         }
         
         callData.status = 'connected';
-        if (!callData.participants.includes(userEmail)) {
-            callData.participants.push(userEmail);
-        }
+        callData.participants.push(userEmail);
         callData.answeredAt = new Date().toISOString();
         activeCalls.set(roomId, callData);
-        pendingCalls.delete(roomId);
         
-        const callerSocketId = emailToSocket.get(callData.caller.toLowerCase());
+        const callerSocketId = emailToSocket.get(callData.caller);
         
         if (callerSocketId) {
             io.to(callerSocketId).emit('call-accepted', {
@@ -1975,7 +2072,9 @@ app.post('/api/calls/accept', async (req, res) => {
     }
 });
 
-// ===== Отклонить звонок =====
+/**
+ * Отклонить звонок
+ */
 app.post('/api/calls/reject', async (req, res) => {
     try {
         const { roomId, userEmail } = req.body;
@@ -1987,10 +2086,10 @@ app.post('/api/calls/reject', async (req, res) => {
             });
         }
         
-        const callData = activeCalls.get(roomId) || pendingCalls.get(roomId);
+        const callData = activeCalls.get(roomId);
         
         if (callData) {
-            const callerSocketId = emailToSocket.get(callData.caller.toLowerCase());
+            const callerSocketId = emailToSocket.get(callData.caller);
             
             if (callerSocketId) {
                 io.to(callerSocketId).emit('call-rejected', {
@@ -2002,7 +2101,6 @@ app.post('/api/calls/reject', async (req, res) => {
             }
             
             activeCalls.delete(roomId);
-            pendingCalls.delete(roomId);
         }
         
         console.log(`❌ Звонок ${roomId} отклонен пользователем ${userEmail}`);
@@ -2021,7 +2119,9 @@ app.post('/api/calls/reject', async (req, res) => {
     }
 });
 
-// ===== Проверить FCM токен =====
+/**
+ * Проверить FCM токен пользователя
+ */
 app.get('/api/fcm/check/:email', async (req, res) => {
     try {
         const { email } = req.params;
@@ -2070,7 +2170,9 @@ app.get('/api/fcm/check/:email', async (req, res) => {
     }
 });
 
-// ===== Завершить звонок =====
+/**
+ * Завершить звонок
+ */
 app.post('/api/calls/end', async (req, res) => {
     try {
         const { roomId, userEmail } = req.body;
@@ -2087,7 +2189,7 @@ app.post('/api/calls/end', async (req, res) => {
         if (callData) {
             callData.participants.forEach(email => {
                 if (email !== userEmail) {
-                    const participantSocketId = emailToSocket.get(email.toLowerCase());
+                    const participantSocketId = emailToSocket.get(email);
                     if (participantSocketId) {
                         io.to(participantSocketId).emit('call-ended', {
                             type: 'call-ended',
@@ -2111,7 +2213,6 @@ app.post('/api/calls/end', async (req, res) => {
             callHistory.set(historyId, endedCall);
             
             activeCalls.delete(roomId);
-            pendingCalls.delete(roomId);
         }
         
         console.log(`📴 Звонок ${roomId} завершен пользователем ${userEmail || 'system'}`);
@@ -2130,12 +2231,14 @@ app.post('/api/calls/end', async (req, res) => {
     }
 });
 
-// ===== Получить информацию о звонке =====
+/**
+ * Получить информацию о звонке
+ */
 app.get('/api/calls/:roomId', async (req, res) => {
     try {
         const { roomId } = req.params;
         
-        const callData = activeCalls.get(roomId) || pendingCalls.get(roomId);
+        const callData = activeCalls.get(roomId);
         
         if (!callData) {
             return res.status(404).json({
@@ -2158,28 +2261,18 @@ app.get('/api/calls/:roomId', async (req, res) => {
     }
 });
 
-// ===== Получить активные звонки пользователя =====
+/**
+ * Получить активные звонки пользователя
+ */
 app.get('/api/calls/user/:email', async (req, res) => {
     try {
         const { email } = req.params;
-        const normalizedEmail = email.toLowerCase();
         
         const userCalls = [];
         
         for (const [roomId, callData] of activeCalls.entries()) {
-            if (callData.caller.toLowerCase() === normalizedEmail || 
-                callData.receiver.toLowerCase() === normalizedEmail || 
-                (callData.participants && callData.participants.some(p => p.toLowerCase() === normalizedEmail))) {
-                userCalls.push({
-                    roomId,
-                    ...callData
-                });
-            }
-        }
-        
-        for (const [roomId, callData] of pendingCalls.entries()) {
-            if (callData.receiver.toLowerCase() === normalizedEmail && 
-                !userCalls.some(c => c.roomId === roomId)) {
+            if (callData.caller === email || callData.receiver === email || 
+                (callData.participants && callData.participants.includes(email))) {
                 userCalls.push({
                     roomId,
                     ...callData
@@ -2201,7 +2294,11 @@ app.get('/api/calls/user/:email', async (req, res) => {
     }
 });
 
-// ===== Сохранить FCM токен =====
+// ===== FCM ЭНДПОИНТЫ =====
+
+/**
+ * Сохранить FCM токен пользователя
+ */
 app.post('/api/fcm/token', async (req, res) => {
     try {
         const { userEmail, fcmToken } = req.body;
@@ -2240,7 +2337,9 @@ app.post('/api/fcm/token', async (req, res) => {
     }
 });
 
-// ===== Тестовый FCM эндпоинт =====
+/**
+ * Тестовый эндпоинт для отправки FCM уведомления
+ */
 app.post('/api/fcm/test', async (req, res) => {
     try {
         const { userEmail, title, body } = req.body;
@@ -2272,7 +2371,11 @@ app.post('/api/fcm/test', async (req, res) => {
     }
 });
 
-// ===== Регистрация пользователя =====
+// ===== РЕГИСТРАЦИЯ И ПОЛЬЗОВАТЕЛИ =====
+
+/**
+ * Регистрация обычного пользователя
+ */
 app.post('/register', async (req, res) => {
     try {
         const { email, firstName, lastName } = req.body;
@@ -2314,7 +2417,9 @@ app.post('/register', async (req, res) => {
     }
 });
 
-// ===== Получение информации о пользователе =====
+/**
+ * Получение информации о пользователе
+ */
 app.get('/user/:email', async (req, res) => {
     try {
         const email = decodeURIComponent(req.params.email).toLowerCase();
@@ -2343,7 +2448,9 @@ app.get('/user/:email', async (req, res) => {
     }
 });
 
-// ===== Получение всех пользователей =====
+/**
+ * Получение всех пользователей
+ */
 app.get('/users', async (req, res) => {
     try {
         const [regularResult, berestaResult] = await Promise.all([
@@ -2369,7 +2476,9 @@ app.get('/users', async (req, res) => {
     }
 });
 
-// ===== Получение чатов пользователя =====
+/**
+ * Получение чатов пользователя
+ */
 app.get('/chats/:userEmail', async (req, res) => {
     try {
         const userEmail = req.params.userEmail.toLowerCase();
@@ -2430,12 +2539,15 @@ app.get('/chats/:userEmail', async (req, res) => {
     }
 });
 
-// ===== Получение сообщений между пользователями =====
+/**
+ * Получение сообщений между пользователями
+ */
 app.get('/messages/:userEmail/:friendEmail', async (req, res) => {
     try {
         const userEmail = req.params.userEmail.toLowerCase();
         const friendEmail = req.params.friendEmail.toLowerCase();
 
+        // Получаем сообщения с информацией о файлах
         const { data, error } = await supabase
             .from('messages')
             .select(`
@@ -2457,7 +2569,9 @@ app.get('/messages/:userEmail/:friendEmail', async (req, res) => {
     }
 });
 
-// ===== Отправка текстового сообщения =====
+/**
+ * Отправка текстового сообщения
+ */
 app.post('/send-message', async (req, res) => {
     try {
         const { senderEmail, receiverEmail, message, duration } = req.body;
@@ -2493,6 +2607,7 @@ app.post('/send-message', async (req, res) => {
 
         await addToChatsAutomatically(senderEmail, receiverEmail);
 
+        // Отправляем FCM уведомление получателю
         const senderName = `${senderInfo.first_name || ''} ${senderInfo.last_name || ''}`.trim() || senderEmail;
         await sendFCMNotificationForMessage(
             receiverEmail,
@@ -2503,6 +2618,7 @@ app.post('/send-message', async (req, res) => {
             false
         );
 
+        // Отправляем через Socket.IO если получатель онлайн
         const receiverSocketId = emailToSocket.get(receiverEmail.toLowerCase());
         if (receiverSocketId) {
             io.to(receiverSocketId).emit('new_message', {
@@ -2523,7 +2639,9 @@ app.post('/send-message', async (req, res) => {
     }
 });
 
-// ===== Отправка группового сообщения =====
+/**
+ * Отправка группового сообщения
+ */
 app.post('/send-group-message', async (req, res) => {
     try {
         const { groupId, senderEmail, message, duration } = req.body;
@@ -2555,12 +2673,14 @@ app.post('/send-group-message', async (req, res) => {
 
         if (error) throw error;
 
+        // Получаем название группы
         const { data: groupData } = await supabase
             .from('groups')
             .select('name')
             .eq('id', groupId)
             .single();
 
+        // Получаем всех участников группы
         const { data: members, error: membersError } = await supabase
             .from('group_members')
             .select('user_email')
@@ -2570,6 +2690,7 @@ app.post('/send-group-message', async (req, res) => {
             const senderName = `${senderInfo.first_name || ''} ${senderInfo.last_name || ''}`.trim() || senderEmail;
             const groupName = groupData?.name || 'Группа';
             
+            // Отправляем уведомления всем участникам кроме отправителя
             for (const member of members) {
                 if (member.user_email !== senderEmail.toLowerCase()) {
                     await sendFCMNotificationForMessage(
@@ -2596,7 +2717,9 @@ app.post('/send-group-message', async (req, res) => {
     }
 });
 
-// ===== Добавление друга =====
+/**
+ * Добавление друга
+ */
 app.post('/add-friend', async (req, res) => {
     try {
         const { userEmail, friendEmail } = req.body;
@@ -2659,54 +2782,7 @@ app.post('/add-friend', async (req, res) => {
     }
 });
 
-// ===== Диагностические эндпоинты =====
-
-// Диагностика WebRTC
-app.get('/api/debug/webrtc', (req, res) => {
-    const connections = [];
-    emailToSocket.forEach((socketId, email) => {
-        connections.push({
-            email,
-            socketId,
-            online: true
-        });
-    });
-    
-    const roomDetails = [];
-    rooms.forEach((participants, roomId) => {
-        roomDetails.push({
-            roomId,
-            participantCount: participants.size,
-            participants: Array.from(participants).map(id => ({
-                socketId: id,
-                email: socketToEmail.get(id) || 'unknown'
-            }))
-        });
-    });
-    
-    res.json({
-        success: true,
-        serverId: SERVER_ID,
-        activeConnections: connections.length,
-        connections: connections,
-        activeRooms: rooms.size,
-        roomDetails: roomDetails,
-        activeCalls: Array.from(activeCalls.entries()).map(([id, data]) => ({
-            id,
-            caller: data.caller,
-            receiver: data.receiver,
-            status: data.status,
-            type: data.type
-        })),
-        pendingCalls: Array.from(pendingCalls.entries()).map(([id, data]) => ({
-            id,
-            caller: data.caller,
-            receiver: data.receiver,
-            status: data.status
-        }))
-    });
-});
-
+// ===== ДЕБАГ ЭНДПОИНТЫ =====
 app.get('/api/debug/mappings', (req, res) => {
     res.json({
         success: true,
@@ -2748,7 +2824,7 @@ app.get('/api/debug/storage', async (req, res) => {
     }
 });
 
-// ===== СТАТИЧЕСКИЕ ФАЙЛЫ =====
+// ===== СТАТИЧЕСКИЕ ФАЙЛЫ (для обратной совместимости) =====
 app.use('/uploads', express.static(uploadDir));
 
 // ===== ВЕБ-ИНТЕРФЕЙС =====
@@ -2765,8 +2841,6 @@ app.get('/', (req, res) => {
             .online { color: green; }
             .storage { color: blue; }
             .feature { margin-left: 20px; }
-            .debug-link { margin-top: 20px; }
-            .debug-link a { margin-right: 10px; }
         </style>
     </head>
     <body>
@@ -2780,15 +2854,6 @@ app.get('/', (req, res) => {
             <p><strong>Active Calls:</strong> ${activeCalls.size}</p>
             <p><strong>Total Users:</strong> ${users.size}</p>
         </div>
-        <div class="debug-link">
-            <h2>🔍 Диагностика:</h2>
-            <a href="/api/debug/webrtc">WebRTC статус</a>
-            <a href="/api/debug/mappings">Маппинги</a>
-            <a href="/api/debug/firebase">Firebase статус</a>
-            <a href="/api/debug/storage">Storage статус</a>
-            <a href="/api/rooms">Комнаты</a>
-            <a href="/api/calls/active">Активные звонки</a>
-        </div>
         <div class="features">
             <h2>📋 Доступные эндпоинты:</h2>
             <ul>
@@ -2801,11 +2866,6 @@ app.get('/', (req, res) => {
                 <li><strong>POST /send-group-message</strong> - Отправка группового сообщения</li>
                 <li><strong>GET /chats/:userEmail</strong> - Чаты пользователя</li>
                 <li><strong>GET /messages/:userEmail/:friendEmail</strong> - История переписки</li>
-                <li><strong>POST /api/calls/initiate</strong> - Инициировать звонок</li>
-                <li><strong>POST /api/calls/accept</strong> - Принять звонок</li>
-                <li><strong>POST /api/calls/reject</strong> - Отклонить звонок</li>
-                <li><strong>POST /api/calls/end</strong> - Завершить звонок</li>
-                <li><strong>GET /api/calls/user/:email</strong> - Звонки пользователя</li>
             </ul>
         </div>
     </body>
@@ -2831,6 +2891,7 @@ server.listen(PORT, '0.0.0.0', async () => {
     console.log(`🧹 Автоочистка файлов: каждые 24 часа (файлы старше 10 дней)`);
     console.log('='.repeat(60) + '\n');
     
+    // Запускаем планировщик очистки файлов
     startFileCleanupScheduler();
 });
 
@@ -2848,6 +2909,7 @@ process.on('SIGINT', async () => {
         console.error('❌ Ошибка очистки присутствия:', error);
     }
     
+    // Очистка временной папки при остановке
     try {
         const files = fs.readdirSync(tempDir);
         for (const file of files) {
