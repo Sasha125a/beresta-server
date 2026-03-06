@@ -1237,6 +1237,77 @@ app.get('/users/:email/files', async (req, res) => {
     }
 });
 
+/**
+ * Получение сообщений группы
+ */
+app.get('/group-messages/:groupId', async (req, res) => {
+    try {
+        const groupId = req.params.groupId;
+        
+        console.log(`📥 Запрос сообщений для группы ID: ${groupId}`);
+
+        // Получаем сообщения группы с информацией об отправителях
+        const { data: messages, error } = await supabase
+            .from('group_messages')
+            .select(`
+                id,
+                group_id,
+                sender_email,
+                message,
+                timestamp,
+                file_id,
+                duration,
+                regular_users!group_messages_sender_email_fkey (
+                    first_name,
+                    last_name
+                ),
+                files:file_id (*)
+            `)
+            .eq('group_id', groupId)
+            .order('timestamp', { ascending: true });
+
+        if (error) {
+            console.error('❌ Ошибка получения групповых сообщений:', error);
+            throw error;
+        }
+
+        console.log(`✅ Найдено сообщений: ${messages?.length || 0}`);
+
+        // Форматируем сообщения для отправки клиенту
+        const formattedMessages = (messages || []).map(msg => ({
+            id: msg.id,
+            group_id: msg.group_id,
+            sender_email: msg.sender_email,
+            first_name: msg.regular_users?.first_name || '',
+            last_name: msg.regular_users?.last_name || '',
+            message: msg.message || '',
+            timestamp: msg.timestamp,
+            duration: msg.duration || 0,
+            // Информация о файле, если есть
+            files: msg.files ? {
+                id: msg.files.id,
+                file_name: msg.files.file_name,
+                file_url: msg.files.file_url,
+                file_type: msg.files.file_type,
+                file_size: msg.files.file_size
+            } : null
+        }));
+
+        res.json({
+            success: true,
+            messages: formattedMessages
+        });
+
+    } catch (error) {
+        console.error('❌ Ошибка получения групповых сообщений:', error);
+        res.status(500).json({
+            success: false,
+            error: 'Ошибка получения сообщений группы',
+            details: error.message
+        });
+    }
+});
+
 // ===== Удаление файла =====
 app.delete('/files/:fileId', async (req, res) => {
     try {
