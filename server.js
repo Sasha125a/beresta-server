@@ -1238,6 +1238,168 @@ app.get('/users/:email/files', async (req, res) => {
 });
 
 /**
+ * Обновление профиля пользователя
+ */
+app.post('/update-profile', upload.single('avatar'), async (req, res) => {
+    try {
+        const { email, firstName, lastName, removeAvatar } = req.body;
+        const file = req.file;
+
+        if (!email) {
+            return res.status(400).json({
+                success: false,
+                error: 'Email обязателен'
+            });
+        }
+
+        console.log(`📝 Обновление профиля для: ${email}`);
+        console.log(`📝 Данные: firstName=${firstName}, lastName=${lastName}, removeAvatar=${removeAvatar}`);
+
+        const normalizedEmail = email.toLowerCase();
+
+        // Проверяем существование пользователя
+        const { data: existingUser, error: checkError } = await supabase
+            .from('regular_users')
+            .select('*')
+            .eq('email', normalizedEmail)
+            .single();
+
+        if (checkError || !existingUser) {
+            console.error('❌ Пользователь не найден:', normalizedEmail);
+            return res.status(404).json({
+                success: false,
+                error: 'Пользователь не найден'
+            });
+        }
+
+        // Подготавливаем данные для обновления
+        const updateData = {
+            first_name: firstName || existingUser.first_name,
+            last_name: lastName || existingUser.last_name,
+            updated_at: new Date().toISOString()
+        };
+
+        // Обработка аватара
+        if (removeAvatar === 'true') {
+            // Удаляем старый аватар, если он был
+            if (existingUser.avatar_filename) {
+                try {
+                    await supabase
+                        .storage
+                        .from(supabaseBucketName)
+                        .remove([`avatars/${existingUser.avatar_filename}`]);
+                } catch (storageError) {
+                    console.warn('⚠️ Ошибка при удалении старого аватара:', storageError.message);
+                }
+            }
+            updateData.avatar_filename = null;
+        } 
+        else if (file) {
+            // Загружаем новый аватар
+            try {
+                console.log('📤 Загрузка нового аватара:', file.originalname);
+                
+                const fileContent = fs.readFileSync(file.path);
+                const fileExt = path.extname(file.originalname);
+                const fileName = `avatar_${Date.now()}${fileExt}`;
+                const filePath = `avatars/${fileName}`;
+
+                // Загружаем в Supabase Storage
+                const { error: uploadError } = await supabase
+                    .storage
+                    .from(supabaseBucketName)
+                    .upload(filePath, fileContent, {
+                        contentType: file.mimetype,
+                        upsert: true
+                    });
+
+                if (uploadError) {
+                    console.error('❌ Ошибка загрузки аватара:', uploadError);
+                    throw uploadError;
+                }
+
+                // Удаляем старый аватар, если был
+                if (existingUser.avatar_filename) {
+                    try {
+                        await supabase
+                            .storage
+                            .from(supabaseBucketName)
+                            .remove([`avatars/${existingUser.avatar_filename}`]);
+                    } catch (storageError) {
+                        console.warn('⚠️ Ошибка при удалении старого аватара:', storageError.message);
+                    }
+                }
+
+                updateData.avatar_filename = fileName;
+                console.log('✅ Аватар загружен:', fileName);
+
+                // Удаляем временный файл
+                fs.unlink(file.path, (err) => {
+                    if (err) console.error('❌ Ошибка удаления временного файла:', err);
+                });
+
+            } catch (uploadError) {
+                console.error('❌ Ошибка загрузки аватара:', uploadError);
+                return res.status(500).json({
+                    success: false,
+                    error: 'Ошибка загрузки аватара'
+                });
+            }
+        }
+
+        // Обновляем данные пользователя в базе
+        const { data, error: updateError } = await supabase
+            .from('regular_users')
+            .update(updateData)
+            .eq('email', normalizedEmail)
+            .select();
+
+        if (updateError) {
+            console.error('❌ Ошибка обновления профиля:', updateError);
+            throw updateError;
+        }
+
+        console.log('✅ Профиль успешно обновлен для:', normalizedEmail);
+
+        // Получаем публичный URL аватара, если он есть
+        let avatarUrl = null;
+        if (updateData.avatar_filename) {
+            const { data: urlData } = supabase
+                .storage
+                .from(supabaseBucketName)
+                .getPublicUrl(`avatars/${updateData.avatar_filename}`);
+            avatarUrl = urlData.publicUrl;
+        }
+
+        res.json({
+            success: true,
+            message: 'Профиль обновлен',
+            user: {
+                email: normalizedEmail,
+                first_name: updateData.first_name,
+                last_name: updateData.last_name,
+                avatar_filename: updateData.avatar_filename,
+                avatar_url: avatarUrl
+            }
+        });
+
+    } catch (error) {
+        console.error('❌ Ошибка обновления профиля:', error);
+        
+        // Очищаем временный файл в случае ошибки
+        if (req.file && req.file.path) {
+            fs.unlink(req.file.path, () => {});
+        }
+        
+        res.status(500).json({
+            success: false,
+            error: 'Ошибка обновления профиля',
+            details: error.message
+        });
+    }
+});
+
+/**
  * Получение сообщений группы
  */
 app.get('/group-messages/:groupId', async (req, res) => {
