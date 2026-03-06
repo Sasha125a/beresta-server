@@ -2231,6 +2231,133 @@ app.post('/api/calls/end', async (req, res) => {
     }
 });
 
+// Добавьте в server.js после существующих эндпоинтов для звонков
+
+/**
+ * Инициирование Jitsi звонка
+ */
+app.post('/api/jitsi/initiate', async (req, res) => {
+    try {
+        const { callerEmail, receiverEmail, callType } = req.body;
+        
+        if (!callerEmail || !receiverEmail) {
+            return res.status(400).json({
+                success: false,
+                error: 'Email звонящего и получателя обязательны'
+            });
+        }
+        
+        console.log(`📞 Инициирование Jitsi звонка: ${callerEmail} -> ${receiverEmail}`);
+        
+        if (callerEmail.toLowerCase() === receiverEmail.toLowerCase()) {
+            return res.status(400).json({
+                success: false,
+                error: 'Нельзя позвонить самому себе'
+            });
+        }
+        
+        // Генерируем уникальный ID комнаты для Jitsi
+        const roomId = `beresta_${Date.now()}_${Math.random().toString(36).substring(2, 10)}`;
+        
+        const callData = {
+            roomId,
+            caller: callerEmail,
+            receiver: receiverEmail,
+            type: callType || 'audio',
+            status: 'ringing',
+            platform: 'jitsi',
+            startedAt: new Date().toISOString(),
+            participants: [callerEmail]
+        };
+        
+        activeCalls.set(roomId, callData);
+        
+        // Отправляем FCM уведомление получателю
+        const fcmSent = await sendFCMNotification(
+            receiverEmail,
+            '📞 Входящий звонок',
+            `${callerEmail} (${callType === 'video' ? 'видео' : 'аудио'})`,
+            {
+                type: 'call',
+                roomId: roomId,
+                caller: callerEmail,
+                callType: callType || 'audio',
+                platform: 'jitsi',
+                userEmail: receiverEmail,
+                accept_action: 'ACCEPT_CALL',
+                reject_action: 'REJECT_CALL'
+            }
+        );
+        
+        console.log(`📱 FCM уведомление ${fcmSent ? 'отправлено' : 'не отправлено'}`);
+        
+        // Отправляем через Socket.IO для онлайн пользователей
+        const receiverSocketId = emailToSocket.get(receiverEmail.toLowerCase());
+        if (receiverSocketId) {
+            console.log(`📱 Получатель онлайн, socketId: ${receiverSocketId}`);
+            
+            io.to(receiverSocketId).emit('incoming-call', {
+                type: 'incoming-call',
+                roomId: roomId,
+                caller: callerEmail,
+                callType: callType || 'audio',
+                platform: 'jitsi',
+                timestamp: new Date().toISOString()
+            });
+        }
+        
+        console.log(`✅ Jitsi звонок инициирован, комната: ${roomId}`);
+        
+        res.json({
+            success: true,
+            roomId: roomId,
+            message: 'Звонок инициирован',
+            isReceiverOnline: !!receiverSocketId,
+            fcmSent: fcmSent
+        });
+        
+    } catch (error) {
+        console.error('❌ Ошибка инициации Jitsi звонка:', error);
+        res.status(500).json({
+            success: false,
+            error: error.message
+        });
+    }
+});
+
+/**
+ * Уведомление о начале звонка
+ */
+app.post('/api/calls/started', async (req, res) => {
+    try {
+        const { roomId, userEmail } = req.body;
+        
+        const callData = activeCalls.get(roomId);
+        
+        if (callData) {
+            callData.status = 'connected';
+            if (!callData.participants.includes(userEmail)) {
+                callData.participants.push(userEmail);
+            }
+            callData.answeredAt = new Date().toISOString();
+            activeCalls.set(roomId, callData);
+            
+            console.log(`✅ Звонок ${roomId} начат, участники: ${callData.participants.join(', ')}`);
+        }
+        
+        res.json({
+            success: true
+        });
+        
+    } catch (error) {
+        console.error('❌ Ошибка уведомления о начале звонка:', error);
+        res.status(500).json({
+            success: false,
+            error: error.message
+        });
+    }
+});
+
 /**
  * Получить информацию о звонке
  */
