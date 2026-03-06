@@ -706,55 +706,110 @@ io.on('connection', (socket) => {
         });
     });
 
-    socket.on('join-room', (data) => {
-        const roomId = data.roomId;
-        const userInfo = data.userInfo || {};
-        
-        console.log('📢 ' + socket.id + ' подключается к комнате звонка: ' + roomId);
-        
-        if (userInfo.email) {
-            emailToSocket.set(userInfo.email, socket.id);
-            socketToEmail.set(socket.id, userInfo.email);
-        }
-        
-        if (!rooms.has(roomId)) {
-            rooms.set(roomId, new Set());
-        }
-        
-        const room = rooms.get(roomId);
-        
-        if (room.size >= 2) {
-            console.log('❌ Комната ' + roomId + ' переполнена');
-            socket.emit('room-full');
-            return;
-        }
-        
-        room.add(socket.id);
-        socket.join(roomId);
-        
-        const userData = users.get(socket.id) || {};
-        users.set(socket.id, { ...userData, ...userInfo, roomId, joinedAt: new Date().toISOString() });
-        
-        if (!roomsInfo.has(roomId)) {
-            roomsInfo.set(roomId, {
-                name: roomId,
-                createdAt: new Date().toISOString(),
-                createdBy: socket.id,
-                type: userInfo?.type || 'video'
-            });
-        }
-        
-        console.log('✅ ' + socket.id + ' подключился к ' + roomId + '. Участников: ' + room.size);
-        
-        socket.emit('join-success', { roomId: roomId, participants: Array.from(room) });
-        
-        if (room.size > 1) {
-            io.to(roomId).emit('peer-joined', socket.id);
-        }
-        
-        io.emit('rooms-updated');
-    });
+    // Найдите обработчик 'join-room' и замените его на этот исправленный вариант:
 
+    socket.on('join-room', (data) => {
+        try {
+            const roomId = data.roomId;
+            const userInfo = data.userInfo || {};
+            
+            console.log('📢 ' + socket.id + ' подключается к комнате звонка: ' + roomId);
+            
+            if (userInfo.email) {
+                const email = userInfo.email.toLowerCase();
+                
+                // Важно: удаляем предыдущий маппинг если был
+                const oldSocketId = emailToSocket.get(email);
+                if (oldSocketId && oldSocketId !== socket.id) {
+                    console.log(`⚠️ Обнаружен дубликат для ${email}, старый socket: ${oldSocketId}`);
+                    // Не отключаем старый сокет, просто обновляем маппинг
+                }
+                
+                emailToSocket.set(email, socket.id);
+                socketToEmail.set(socket.id, email);
+                socket.userEmail = email;
+                
+                console.log(`📧 Маппинг: ${email} -> ${socket.id}`);
+            }
+            
+            if (!rooms.has(roomId)) {
+                rooms.set(roomId, new Set());
+            }
+            
+            const room = rooms.get(roomId);
+            
+            // Проверяем, не в комнате ли уже этот сокет
+            if (room.has(socket.id)) {
+                console.log(`⚠️ Сокет ${socket.id} уже в комнате ${roomId}`);
+                return;
+            }
+            
+            if (room.size >= 2) {
+                console.log('❌ Комната ' + roomId + ' переполнена');
+                socket.emit('room-full');
+                return;
+            }
+            
+            room.add(socket.id);
+            socket.join(roomId);
+            
+            const userData = users.get(socket.id) || {};
+            users.set(socket.id, { ...userData, ...userInfo, roomId, joinedAt: new Date().toISOString() });
+            
+            if (!roomsInfo.has(roomId)) {
+                roomsInfo.set(roomId, {
+                    name: roomId,
+                    createdAt: new Date().toISOString(),
+                    createdBy: socket.id,
+                    type: userInfo?.type || 'video'
+                });
+            }
+            
+            console.log('✅ ' + socket.id + ' подключился к ' + roomId + '. Участников: ' + room.size);
+            
+            // Отправляем подтверждение
+            socket.emit('join-success', { 
+                roomId: roomId, 
+                participants: Array.from(room),
+                isFirstParticipant: room.size === 1
+            });
+            
+            // Уведомляем всех в комнате о новом участнике
+            if (room.size > 1) {
+                // Отправляем всем кроме нового участника
+                socket.to(roomId).emit('peer-joined', {
+                    peerId: socket.id,
+                    peerEmail: socket.userEmail,
+                    peerInfo: userInfo
+                });
+                
+                // Отправляем новому участнику информацию о других участниках
+                const otherParticipants = Array.from(room).filter(id => id !== socket.id);
+                socket.emit('peer-list', {
+                    participants: otherParticipants.map(id => ({
+                        socketId: id,
+                        email: socketToEmail.get(id) || 'unknown'
+                    }))
+                });
+                
+                // Отправляем сигнал готовности через небольшую задержку
+                setTimeout(() => {
+                    if (rooms.has(roomId) && rooms.get(roomId).has(socket.id)) {
+                        socket.emit('peer-ready', {
+                            message: 'Собеседник готов к соединению',
+                            participants: otherParticipants
+                        });
+                    }
+                }, 1000);
+            }
+            
+            io.emit('rooms-updated');
+            
+        } catch (error) {
+            console.error('❌ Ошибка в join-room:', error);
+            socket.emit('join-error', { message: error.message });
+        }
+    });
     socket.on('offer', (data) => {
         console.log('📤 Оффер от ' + socket.id + ' к ' + data.target);
         
@@ -840,6 +895,7 @@ io.on('connection', (socket) => {
 
 function handleDisconnect(socket, specificRoom = null) {
     let roomId = specificRoom;
+    let email = socket.userEmail || socketToEmail.get(socket.id);
     
     if (!roomId) {
         for (const [rId, members] of rooms.entries()) {
@@ -854,14 +910,39 @@ function handleDisconnect(socket, specificRoom = null) {
         const room = rooms.get(roomId);
         room.delete(socket.id);
         
-        io.to(roomId).emit('peer-disconnected');
+        // Уведомляем остальных участников
+        if (room.size > 0) {
+            socket.to(roomId).emit('peer-disconnected', {
+                peerId: socket.id,
+                peerEmail: email,
+                reason: 'disconnected'
+            });
+        }
         
+        // Если комната пуста, удаляем её
         if (room.size === 0) {
             rooms.delete(roomId);
             roomsInfo.delete(roomId);
+            
+            // Завершаем активный звонок если был
+            if (activeCalls.has(roomId)) {
+                const callData = activeCalls.get(roomId);
+                const endedCall = {
+                    ...callData,
+                    endedBy: 'system',
+                    endTime: new Date().toISOString(),
+                    status: 'ended',
+                    duration: calculateDuration(callData.startedAt)
+                };
+                const historyId = 'hist_' + Date.now();
+                callHistory.set(historyId, endedCall);
+                activeCalls.delete(roomId);
+                pendingCalls.delete(roomId);
+                console.log(`📴 Звонок ${roomId} завершен (комната пуста)`);
+            }
+        } else {
+            console.log('👋 ' + socket.id + ' покинул комнату ' + roomId + ', осталось: ' + room.size);
         }
-        
-        console.log('👋 ' + socket.id + ' покинул комнату ' + roomId);
     }
     
     users.delete(socket.id);
