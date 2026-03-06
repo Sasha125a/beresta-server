@@ -547,6 +547,115 @@ async function sendFCMNotificationForMessage(receiverEmail, senderName, senderEm
     }
 }
 
+// ===== ФУНКЦИИ ДЛЯ АВТОМАТИЧЕСКОЙ ОЧИСТКИ ФАЙЛОВ =====
+
+/**
+ * Удаление старых файлов (старше 10 дней)
+ */
+async function cleanupOldFiles() {
+    try {
+        console.log('🧹 Запуск очистки старых файлов...');
+        
+        // Вычисляем дату 10 дней назад
+        const tenDaysAgo = new Date();
+        tenDaysAgo.setDate(tenDaysAgo.getDate() - 10);
+        const cutoffDate = tenDaysAgo.toISOString();
+        
+        console.log(`📅 Удаляем файлы старше: ${cutoffDate}`);
+
+        // Находим все файлы старше 10 дней
+        const { data: oldFiles, error: selectError } = await supabase
+            .from('files')
+            .select('*')
+            .lt('uploaded_at', cutoffDate);
+
+        if (selectError) {
+            console.error('❌ Ошибка при поиске старых файлов:', selectError);
+            return;
+        }
+
+        if (!oldFiles || oldFiles.length === 0) {
+            console.log('✅ Старых файлов не найдено');
+            return;
+        }
+
+        console.log(`📦 Найдено ${oldFiles.length} старых файлов для удаления`);
+
+        let deletedCount = 0;
+        let errorCount = 0;
+
+        for (const file of oldFiles) {
+            try {
+                // Удаляем файл из Supabase Storage
+                if (file.file_path) {
+                    const { error: storageError } = await supabase
+                        .storage
+                        .from(supabaseBucketName)
+                        .remove([file.file_path]);
+
+                    if (storageError) {
+                        console.error(`❌ Ошибка удаления из storage: ${file.file_path}`, storageError);
+                        errorCount++;
+                        continue;
+                    }
+                }
+
+                // Удаляем запись из базы данных
+                const { error: dbError } = await supabase
+                    .from('files')
+                    .delete()
+                    .eq('id', file.id);
+
+                if (dbError) {
+                    console.error(`❌ Ошибка удаления из БД: файл ID ${file.id}`, dbError);
+                    errorCount++;
+                    continue;
+                }
+
+                // Обнуляем file_id в связанных сообщениях
+                await supabase
+                    .from('messages')
+                    .update({ file_id: null })
+                    .eq('file_id', file.id);
+
+                await supabase
+                    .from('group_messages')
+                    .update({ file_id: null })
+                    .eq('file_id', file.id);
+
+                deletedCount++;
+                console.log(`✅ Удален файл ID ${file.id}: ${file.file_name} (загружен ${file.uploaded_at})`);
+
+            } catch (error) {
+                console.error(`❌ Ошибка при удалении файла ID ${file.id}:`, error);
+                errorCount++;
+            }
+        }
+
+        console.log(`🧹 Очистка завершена: удалено ${deletedCount} файлов, ошибок: ${errorCount}`);
+
+    } catch (error) {
+        console.error('❌ Ошибка в cleanupOldFiles:', error);
+    }
+}
+
+/**
+ * Запуск периодической очистки старых файлов
+ */
+function startFileCleanupScheduler() {
+    console.log('⏰ Запуск планировщика очистки файлов (каждые 24 часа)');
+    
+    // Запускаем сразу при старте сервера
+    setTimeout(() => {
+        cleanupOldFiles();
+    }, 60000); // Через 1 минуту после запуска
+    
+    // Затем запускаем каждые 24 часа
+    setInterval(() => {
+        cleanupOldFiles();
+    }, 24 * 60 * 60 * 1000); // 24 часа
+}
+
 // ==================== SOCKET.IO ОБРАБОТЧИКИ ====================
 io.on('connection', (socket) => {
     console.log('👤 Пользователь подключился:', socket.id);
@@ -1040,37 +1149,6 @@ app.post('/upload', upload.single('file'), async (req, res) => {
     }
 });
 
-// ===== Получение информации о файле =====
-app.get('/files/:fileId', async (req, res) => {
-    try {
-        const { fileId } = req.params;
-
-        const { data, error } = await supabase
-            .from('files')
-            .select('*')
-            .eq('id', fileId)
-            .single();
-
-        if (error || !data) {
-            return res.status(404).json({
-                success: false,
-                error: 'Файл не найден'
-            });
-        }
-
-        res.json({
-            success: true,
-            file: data
-        });
-    } catch (error) {
-        console.error('❌ Ошибка получения информации о файле:', error);
-        res.status(500).json({ 
-            success: false, 
-            error: 'Internal server error' 
-        });
-    }
-});
-
 // ===== Получение файлов сообщения =====
 app.get('/messages/:messageId/files', async (req, res) => {
     try {
@@ -1265,6 +1343,151 @@ app.get('/groups/:userEmail', async (req, res) => {
         });
     } catch (error) {
         console.error('❌ Ошибка получения групп:', error);
+        res.status(500).json({ 
+            success: false, 
+            error: 'Internal server error' 
+        });
+    }
+});
+
+/**
+ * Очистка истории чата между пользователями
+ */
+app.post('/clear-chat', async (req, res) => {
+    try {
+        const { userEmail, friendEmail } = req.body;
+        
+        if (!userEmail || !friendEmail) {
+            return res.status(400).json({
+                success: false,
+                error: 'Email пользователя и друга обязательны'
+            });
+        }
+        
+        const normalizedUserEmail = userEmail.toLowerCase();
+        const normalizedFriendEmail = friendEmail.toLowerCase();
+        
+        console.log(`🧹 Очистка чата между ${normalizedUserEmail} и ${normalizedFriendEmail}`);
+        
+        // Находим все сообщения между пользователями
+        const { data: messages, error: selectError } = await supabase
+            .from('messages')
+            .select('id, file_id')
+            .or(`and(sender_email.eq.${normalizedUserEmail},receiver_email.eq.${normalizedFriendEmail}),and(sender_email.eq.${normalizedFriendEmail},receiver_email.eq.${normalizedUserEmail})`);
+        
+        if (selectError) {
+            console.error('❌ Ошибка при поиске сообщений:', selectError);
+            throw selectError;
+        }
+        
+        console.log(`📊 Найдено сообщений: ${messages?.length || 0}`);
+        
+        if (messages && messages.length > 0) {
+            // Собираем все file_id из сообщений
+            const fileIds = messages
+                .filter(msg => msg.file_id !== null)
+                .map(msg => msg.file_id);
+            
+            console.log(`📎 Найдено файлов: ${fileIds.length}`);
+            
+            // Удаляем сами сообщения
+            const { error: deleteMessagesError } = await supabase
+                .from('messages')
+                .delete()
+                .or(`and(sender_email.eq.${normalizedUserEmail},receiver_email.eq.${normalizedFriendEmail}),and(sender_email.eq.${normalizedFriendEmail},receiver_email.eq.${normalizedUserEmail})`);
+            
+            if (deleteMessagesError) {
+                console.error('❌ Ошибка при удалении сообщений:', deleteMessagesError);
+                throw deleteMessagesError;
+            }
+            
+            // Удаляем файлы, если они есть
+            if (fileIds.length > 0) {
+                for (const fileId of fileIds) {
+                    try {
+                        // Получаем информацию о файле
+                        const { data: fileData } = await supabase
+                            .from('files')
+                            .select('file_path')
+                            .eq('id', fileId)
+                            .single();
+                        
+                        if (fileData && fileData.file_path) {
+                            // Удаляем из Supabase Storage
+                            await supabase
+                                .storage
+                                .from(supabaseBucketName)
+                                .remove([fileData.file_path]);
+                        }
+                        
+                        // Удаляем запись из БД
+                        await supabase
+                            .from('files')
+                            .delete()
+                            .eq('id', fileId);
+                            
+                        console.log(`✅ Удален файл ID ${fileId}`);
+                    } catch (fileError) {
+                        console.error(`❌ Ошибка при удалении файла ID ${fileId}:`, fileError);
+                    }
+                }
+            }
+        }
+        
+        console.log('✅ Чат успешно очищен');
+        
+        res.json({
+            success: true,
+            message: 'История чата очищена'
+        });
+        
+    } catch (error) {
+        console.error('❌ Ошибка очистки чата:', error);
+        res.status(500).json({
+            success: false,
+            error: 'Ошибка при очистке чата',
+            details: error.message
+        });
+    }
+});
+
+/**
+ * Получение информации о файле с проверкой возраста
+ */
+app.get('/files/:fileId', async (req, res) => {
+    try {
+        const { fileId } = req.params;
+
+        const { data, error } = await supabase
+            .from('files')
+            .select('*')
+            .eq('id', fileId)
+            .single();
+
+        if (error || !data) {
+            return res.status(404).json({
+                success: false,
+                error: 'Файл не найден'
+            });
+        }
+
+        // Проверяем возраст файла (опционально)
+        const uploadedAt = new Date(data.uploaded_at);
+        const now = new Date();
+        const daysOld = Math.floor((now - uploadedAt) / (1000 * 60 * 60 * 24));
+        
+        console.log(`📎 Информация о файле ID ${fileId}: ${data.file_name}, возраст: ${daysOld} дней`);
+
+        res.json({
+            success: true,
+            file: {
+                ...data,
+                days_old: daysOld,
+                will_be_deleted_at: new Date(uploadedAt.getTime() + 10 * 24 * 60 * 60 * 1000).toISOString()
+            }
+        });
+    } catch (error) {
+        console.error('❌ Ошибка получения информации о файле:', error);
         res.status(500).json({ 
             success: false, 
             error: 'Internal server error' 
@@ -2432,7 +2655,11 @@ server.listen(PORT, '0.0.0.0', async () => {
     console.log(`📁 Локальная папка загрузок (временная): ${tempDir}`);
     console.log(`📧 Маппинг email->socketId активен`);
     console.log(`🔥 Firebase: ${firebaseInitialized ? 'активен' : 'не настроен'}`);
+    console.log(`🧹 Автоочистка файлов: каждые 24 часа (файлы старше 10 дней)`);
     console.log('='.repeat(60) + '\n');
+    
+    // Запускаем планировщик очистки файлов
+    startFileCleanupScheduler();
 });
 
 // ===== Graceful shutdown =====
