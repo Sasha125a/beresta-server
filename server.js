@@ -2294,6 +2294,72 @@ app.get('/api/calls/user/:email', async (req, res) => {
     }
 });
 
+/**
+ * Создание видеозвонка через LiveKit
+ */
+app.post('/api/livekit/create-call', async (req, res) => {
+    try {
+        const { callerEmail, receiverEmail } = req.body;
+        
+        if (!callerEmail || !receiverEmail) {
+            return res.status(400).json({
+                success: false,
+                error: 'Email обязательны'
+            });
+        }
+        
+        const roomId = `livekit_${Date.now()}_${Math.random().toString(36).substring(2, 10)}`;
+        
+        // Здесь можно сохранить информацию о звонке в БД
+        
+        res.json({
+            success: true,
+            roomId: roomId,
+            message: 'Видеозвонок создан'
+        });
+        
+    } catch (error) {
+        console.error('❌ Ошибка создания видеозвонка:', error);
+        res.status(500).json({
+            success: false,
+            error: error.message
+        });
+    }
+});
+
+/**
+ * Получение токена LiveKit
+ */
+app.post('/api/livekit/token', async (req, res) => {
+    try {
+        const { roomName, identity } = req.body;
+        
+        if (!roomName || !identity) {
+            return res.status(400).json({
+                success: false,
+                error: 'roomName и identity обязательны'
+            });
+        }
+        
+        // Здесь нужно сгенерировать JWT токен для LiveKit
+        // Используйте библиотеку livekit-server-sdk
+        
+        const token = generateLiveKitToken(roomName, identity);
+        
+        res.json({
+            success: true,
+            token: token
+        });
+        
+    } catch (error) {
+        console.error('❌ Ошибка генерации токена:', error);
+        res.status(500).json({
+            success: false,
+            error: error.message
+        });
+    }
+});
+
 // ===== FCM ЭНДПОИНТЫ =====
 
 /**
