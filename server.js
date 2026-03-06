@@ -82,6 +82,21 @@ try {
     console.error('❌ Стек ошибки:', error.stack);
 }
 
+// ==================== MIDDLEWARE ====================
+app.use(cors({
+    origin: isRender ? ["https://beresta-server-5udn.onrender.com"] : "*",
+    methods: ["GET", "POST", "PUT", "DELETE"],
+    credentials: true
+}));
+
+// ВАЖНО: Добавляем middleware для парсинга JSON и URL-encoded данных
+app.use(bodyParser.json({ limit: '50mb' }));
+app.use(bodyParser.urlencoded({ extended: true, limit: '50mb' }));
+
+// Альтернативно можно использовать встроенный express.json()
+// app.use(express.json({ limit: '50mb' }));
+// app.use(express.urlencoded({ extended: true, limit: '50mb' }));
+
 // ==================== SUPABASE ====================
 const supabaseUrl = process.env.SUPABASE_URL;
 const supabaseKey = process.env.SUPABASE_SERVICE_KEY;
