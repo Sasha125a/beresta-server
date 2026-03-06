@@ -14,6 +14,7 @@ const admin = require('firebase-admin');
 const axios = require('axios'); // Для скачивания файлов из Supabase
 const stream = require('stream');
 const util = require('util');
+const mime = require('mime-types');
 
 // ==================== КОНФИГУРАЦИЯ ====================
 const isRender = process.env.NODE_ENV === 'production';
