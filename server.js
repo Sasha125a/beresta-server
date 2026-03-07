@@ -36,6 +36,8 @@ const io = socketIo(server, {
     pingInterval: 25000
 });
 
+const callTimeouts = new Map();
+
 // ==================== FIREBASE ADMIN ====================
 let firebaseInitialized = false;
 
@@ -309,6 +311,55 @@ async function deleteFileFromSupabase(filePath, bucket = supabaseBucketName) {
     } catch (error) {
         console.error('❌ Ошибка удаления из Supabase:', error);
         return { success: false, error: error.message };
+    }
+}
+
+/**
+ * Функция отправки уведомления о пропущенном звонке
+ */
+async function sendMissedCallNotification(receiverEmail, callerEmail, callType, roomId) {
+    try {
+        // Получаем информацию о звонящем
+        const callerInfo = await getUserInfo(callerEmail);
+        const callerName = callerInfo ? 
+            `${callerInfo.first_name || ''} ${callerInfo.last_name || ''}`.trim() || callerEmail : 
+            callerEmail;
+        
+        console.log(`📱 Отправка уведомления о пропущенном звонке для ${receiverEmail} от ${callerName}`);
+        
+        // Отправляем через FCM
+        const fcmSent = await sendFCMNotification(
+            receiverEmail,
+            '📞 Пропущенный звонок',
+            `${callerName} (${callType === 'video' ? 'видео' : 'аудио'})`,
+            {
+                type: 'missed_call',
+                roomId: roomId,
+                caller: callerEmail,
+                callerName: callerName,
+                callType: callType || 'audio',
+                userEmail: receiverEmail,
+                timestamp: new Date().toISOString()
+            }
+        );
+        
+        // Отправляем через Socket.IO если получатель онлайн
+        const receiverSocketId = emailToSocket.get(receiverEmail.toLowerCase());
+        if (receiverSocketId) {
+            io.to(receiverSocketId).emit('missed-call', {
+                type: 'missed-call',
+                roomId: roomId,
+                caller: callerEmail,
+                callerName: callerName,
+                callType: callType || 'audio',
+                timestamp: new Date().toISOString()
+            });
+        }
+        
+        return fcmSent;
+    } catch (error) {
+        console.error('❌ Ошибка отправки уведомления о пропущенном звонке:', error);
+        return false;
     }
 }
 
@@ -1995,7 +2046,7 @@ app.get('/api/calls/active', (req, res) => {
 // ===== ЭНДПОИНТЫ ДЛЯ ЗВОНКОВ =====
 
 /**
- * Инициирование звонка с FCM уведомлением
+ * Инициирование звонка с FCM уведомлением и таймаутом
  */
 app.post('/api/calls/initiate', async (req, res) => {
     try {
@@ -2050,7 +2101,7 @@ app.post('/api/calls/initiate', async (req, res) => {
         console.log(`📱 FCM уведомление ${fcmSent ? 'отправлено' : 'не отправлено'}`);
         
         // Отправляем через Socket.IO для онлайн пользователей
-        const receiverSocketId = emailToSocket.get(receiverEmail);
+        const receiverSocketId = emailToSocket.get(receiverEmail.toLowerCase());
         if (receiverSocketId) {
             console.log(`📱 Получатель онлайн, socketId: ${receiverSocketId}`);
             
@@ -2071,14 +2122,66 @@ app.post('/api/calls/initiate', async (req, res) => {
             });
         }
         
-        console.log(`✅ Звонок инициирован, комната: ${roomId}`);
+        // УСТАНАВЛИВАЕМ ТАЙМАУТ НА 30 СЕКУНД
+        const timeoutId = setTimeout(async () => {
+            const call = activeCalls.get(roomId);
+            if (call && call.status === 'ringing') {
+                console.log(`⏰ Таймаут звонка ${roomId} - никто не ответил`);
+                
+                // Обновляем статус звонка
+                call.status = 'missed';
+                call.endedAt = new Date().toISOString();
+                
+                // Сохраняем в историю как пропущенный
+                const missedCall = {
+                    ...call,
+                    endedBy: 'timeout',
+                    endTime: new Date().toISOString(),
+                    status: 'missed',
+                    duration: 0
+                };
+                
+                const historyId = 'hist_' + Date.now();
+                callHistory.set(historyId, missedCall);
+                
+                // Удаляем из активных звонков
+                activeCalls.delete(roomId);
+                
+                // Отправляем уведомление звонящему о том, что никто не ответил
+                const callerSocketId = emailToSocket.get(callerEmail.toLowerCase());
+                if (callerSocketId) {
+                    io.to(callerSocketId).emit('call-missed', {
+                        type: 'call-missed',
+                        roomId: roomId,
+                        receiver: receiverEmail,
+                        timestamp: new Date().toISOString()
+                    });
+                }
+                
+                // ОТПРАВЛЯЕМ УВЕДОМЛЕНИЕ О ПРОПУЩЕННОМ ЗВОНКЕ ПОЛУЧАТЕЛЮ
+                await sendMissedCallNotification(
+                    receiverEmail,
+                    callerEmail,
+                    callType || 'audio',
+                    roomId
+                );
+            }
+            
+            // Удаляем таймаут из мапы
+            callTimeouts.delete(roomId);
+        }, 30000); // 30 секунд
+        
+        callTimeouts.set(roomId, timeoutId);
+        
+        console.log(`✅ Звонок инициирован, комната: ${roomId}, таймаут установлен на 30 сек`);
         
         res.json({
             success: true,
             roomId: roomId,
             message: 'Звонок инициирован',
             isReceiverOnline: !!receiverSocketId,
-            fcmSent: fcmSent
+            fcmSent: fcmSent,
+            timeoutSeconds: 30
         });
         
     } catch (error) {
@@ -2091,7 +2194,7 @@ app.post('/api/calls/initiate', async (req, res) => {
 });
 
 /**
- * Принять звонок
+ * Обновленный обработчик принятия звонка
  */
 app.post('/api/calls/accept', async (req, res) => {
     try {
@@ -2109,7 +2212,7 @@ app.post('/api/calls/accept', async (req, res) => {
         if (!callData) {
             return res.status(404).json({
                 success: false,
-                error: 'Звонок не найден'
+                error: 'Звонок не найден или уже завершен'
             });
         }
         
@@ -2118,6 +2221,13 @@ app.post('/api/calls/accept', async (req, res) => {
                 success: false,
                 error: 'Вы не можете принять этот звонок'
             });
+        }
+        
+        // Отменяем таймаут
+        const timeoutId = callTimeouts.get(roomId);
+        if (timeoutId) {
+            clearTimeout(timeoutId);
+            callTimeouts.delete(roomId);
         }
         
         callData.status = 'connected';
@@ -2154,7 +2264,7 @@ app.post('/api/calls/accept', async (req, res) => {
 });
 
 /**
- * Отклонить звонок
+ * Обновленный обработчик отклонения звонка
  */
 app.post('/api/calls/reject', async (req, res) => {
     try {
@@ -2170,6 +2280,13 @@ app.post('/api/calls/reject', async (req, res) => {
         const callData = activeCalls.get(roomId);
         
         if (callData) {
+            // Отменяем таймаут
+            const timeoutId = callTimeouts.get(roomId);
+            if (timeoutId) {
+                clearTimeout(timeoutId);
+                callTimeouts.delete(roomId);
+            }
+            
             const callerSocketId = emailToSocket.get(callData.caller);
             
             if (callerSocketId) {
@@ -2180,6 +2297,18 @@ app.post('/api/calls/reject', async (req, res) => {
                     timestamp: new Date().toISOString()
                 });
             }
+            
+            // Сохраняем в историю как отклоненный
+            const rejectedCall = {
+                ...callData,
+                status: 'rejected',
+                endedBy: userEmail,
+                endTime: new Date().toISOString(),
+                duration: 0
+            };
+            
+            const historyId = 'hist_' + Date.now();
+            callHistory.set(historyId, rejectedCall);
             
             activeCalls.delete(roomId);
         }
@@ -2193,6 +2322,49 @@ app.post('/api/calls/reject', async (req, res) => {
         
     } catch (error) {
         console.error('❌ Ошибка отклонения звонка:', error);
+        res.status(500).json({
+            success: false,
+            error: error.message
+        });
+    }
+});
+
+/**
+ * Эндпоинт для получения истории пропущенных звонков
+ */
+app.get('/api/calls/missed/:email', async (req, res) => {
+    try {
+        const { email } = req.params;
+        const normalizedEmail = email.toLowerCase();
+        
+        const missedCalls = [];
+        
+        for (const [historyId, call] of callHistory.entries()) {
+            if (call.receiver === normalizedEmail && call.status === 'missed') {
+                // Получаем информацию о звонящем
+                const callerInfo = await getUserInfo(call.caller);
+                const callerName = callerInfo ? 
+                    `${callerInfo.first_name || ''} ${callerInfo.last_name || ''}`.trim() || call.caller : 
+                    call.caller;
+                
+                missedCalls.push({
+                    historyId,
+                    ...call,
+                    callerName
+                });
+            }
+        }
+        
+        // Сортируем по дате (новые сверху)
+        missedCalls.sort((a, b) => new Date(b.startedAt) - new Date(a.startedAt));
+        
+        res.json({
+            success: true,
+            missedCalls: missedCalls.slice(0, 50) // Последние 50 звонков
+        });
+        
+    } catch (error) {
+        console.error('❌ Ошибка получения пропущенных звонков:', error);
         res.status(500).json({
             success: false,
             error: error.message
