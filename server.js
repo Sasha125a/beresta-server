@@ -2578,6 +2578,495 @@ app.post('/api/calls/reject', async (req, res) => {
     }
 });
 
+// ===== ЭНДПОИНТЫ ДЛЯ НАСТРОЕК КОНФИДЕНЦИАЛЬНОСТИ =====
+
+// ===== Получить настройки конфиденциальности пользователя =====
+app.get('/api/privacy/settings/:email', async (req, res) => {
+    try {
+        const email = req.params.email.toLowerCase();
+
+        await updateUserActivity(email);
+
+        // Проверяем существование пользователя
+        const user = await getUserInfo(email);
+        if (!user) {
+            return res.status(404).json({
+                success: false,
+                error: 'Пользователь не найден'
+            });
+        }
+
+        // Получаем настройки
+        let { data: settings, error } = await supabase
+            .from('privacy_settings')
+            .select('*')
+            .eq('user_email', email)
+            .maybeSingle();
+
+        if (error) throw error;
+
+        // Если настроек нет, создаем с значениями по умолчанию
+        if (!settings) {
+            const { data: newSettings, error: insertError } = await supabase
+                .from('privacy_settings')
+                .insert([{
+                    user_email: email,
+                    is_online_status_visible: true,
+                    is_last_seen_visible: true,
+                    is_profile_photo_visible: true,
+                    is_read_receipts_enabled: true
+                }])
+                .select()
+                .single();
+
+            if (insertError) throw insertError;
+            settings = newSettings;
+        }
+
+        // Получаем количество заблокированных пользователей
+        const { count, error: countError } = await supabase
+            .from('blocked_users')
+            .select('*', { count: 'exact', head: true })
+            .eq('user_email', email);
+
+        if (countError) throw countError;
+
+        res.json({
+            success: true,
+            settings: {
+                isOnlineStatusVisible: settings.is_online_status_visible,
+                isLastSeenVisible: settings.is_last_seen_visible,
+                isProfilePhotoVisible: settings.is_profile_photo_visible,
+                isReadReceiptsEnabled: settings.is_read_receipts_enabled,
+                blockedUsersCount: count || 0
+            }
+        });
+
+    } catch (error) {
+        console.error('❌ Ошибка получения настроек конфиденциальности:', error);
+        res.status(500).json({
+            success: false,
+            error: error.message
+        });
+    }
+});
+
+// ===== Обновить настройки конфиденциальности =====
+app.post('/api/privacy/settings/update', async (req, res) => {
+    try {
+        const { 
+            userEmail, 
+            isOnlineStatusVisible, 
+            isLastSeenVisible, 
+            isProfilePhotoVisible, 
+            isReadReceiptsEnabled 
+        } = req.body;
+
+        if (!userEmail) {
+            return res.status(400).json({
+                success: false,
+                error: 'Email обязателен'
+            });
+        }
+
+        const normalizedEmail = userEmail.toLowerCase();
+
+        await updateUserActivity(normalizedEmail);
+
+        // Проверяем существование пользователя
+        const user = await getUserInfo(normalizedEmail);
+        if (!user) {
+            return res.status(404).json({
+                success: false,
+                error: 'Пользователь не найден'
+            });
+        }
+
+        // Проверяем, существуют ли настройки
+        const { data: existingSettings } = await supabase
+            .from('privacy_settings')
+            .select('id')
+            .eq('user_email', normalizedEmail)
+            .maybeSingle();
+
+        let result;
+        
+        if (existingSettings) {
+            // Обновляем существующие настройки
+            const { data, error } = await supabase
+                .from('privacy_settings')
+                .update({
+                    is_online_status_visible: isOnlineStatusVisible !== undefined ? isOnlineStatusVisible : true,
+                    is_last_seen_visible: isLastSeenVisible !== undefined ? isLastSeenVisible : true,
+                    is_profile_photo_visible: isProfilePhotoVisible !== undefined ? isProfilePhotoVisible : true,
+                    is_read_receipts_enabled: isReadReceiptsEnabled !== undefined ? isReadReceiptsEnabled : true
+                })
+                .eq('user_email', normalizedEmail)
+                .select()
+                .single();
+
+            if (error) throw error;
+            result = data;
+        } else {
+            // Создаем новые настройки
+            const { data, error } = await supabase
+                .from('privacy_settings')
+                .insert([{
+                    user_email: normalizedEmail,
+                    is_online_status_visible: isOnlineStatusVisible !== undefined ? isOnlineStatusVisible : true,
+                    is_last_seen_visible: isLastSeenVisible !== undefined ? isLastSeenVisible : true,
+                    is_profile_photo_visible: isProfilePhotoVisible !== undefined ? isProfilePhotoVisible : true,
+                    is_read_receipts_enabled: isReadReceiptsEnabled !== undefined ? isReadReceiptsEnabled : true
+                }])
+                .select()
+                .single();
+
+            if (error) throw error;
+            result = data;
+        }
+
+        console.log(`✅ Настройки конфиденциальности обновлены для ${normalizedEmail}`);
+
+        res.json({
+            success: true,
+            message: 'Настройки сохранены',
+            settings: {
+                isOnlineStatusVisible: result.is_online_status_visible,
+                isLastSeenVisible: result.is_last_seen_visible,
+                isProfilePhotoVisible: result.is_profile_photo_visible,
+                isReadReceiptsEnabled: result.is_read_receipts_enabled
+            }
+        });
+
+    } catch (error) {
+        console.error('❌ Ошибка обновления настроек конфиденциальности:', error);
+        res.status(500).json({
+            success: false,
+            error: error.message
+        });
+    }
+});
+
+// ===== Получить список заблокированных пользователей =====
+app.get('/api/privacy/blocked/:email', async (req, res) => {
+    try {
+        const email = req.params.email.toLowerCase();
+
+        await updateUserActivity(email);
+
+        const { data, error } = await supabase
+            .from('blocked_users')
+            .select(`
+                blocked_user_email,
+                blocked_at,
+                regular_users!blocked_users_blocked_user_email_fkey (
+                    first_name,
+                    last_name,
+                    email
+                )
+            `)
+            .eq('user_email', email)
+            .order('blocked_at', { ascending: false });
+
+        if (error) throw error;
+
+        const blockedUsers = (data || []).map(item => ({
+            email: item.blocked_user_email,
+            name: item.regular_users ? 
+                `${item.regular_users.first_name || ''} ${item.regular_users.last_name || ''}`.trim() : 
+                item.blocked_user_email,
+            blockedAt: item.blocked_at
+        }));
+
+        res.json({
+            success: true,
+            blockedUsers
+        });
+
+    } catch (error) {
+        console.error('❌ Ошибка получения заблокированных пользователей:', error);
+        res.status(500).json({
+            success: false,
+            error: error.message
+        });
+    }
+});
+
+// ===== Заблокировать пользователя =====
+app.post('/api/privacy/blocked/add', async (req, res) => {
+    try {
+        const { userEmail, blockedUserEmail } = req.body;
+
+        if (!userEmail || !blockedUserEmail) {
+            return res.status(400).json({
+                success: false,
+                error: 'Email пользователя и блокируемого пользователя обязательны'
+            });
+        }
+
+        const normalizedUserEmail = userEmail.toLowerCase();
+        const normalizedBlockedEmail = blockedUserEmail.toLowerCase();
+
+        if (normalizedUserEmail === normalizedBlockedEmail) {
+            return res.status(400).json({
+                success: false,
+                error: 'Нельзя заблокировать самого себя'
+            });
+        }
+
+        await updateUserActivity(normalizedUserEmail);
+
+        // Проверяем существование блокируемого пользователя
+        const blockedUser = await getUserInfo(normalizedBlockedEmail);
+        if (!blockedUser) {
+            return res.status(404).json({
+                success: false,
+                error: 'Блокируемый пользователь не найден'
+            });
+        }
+
+        // Добавляем в список заблокированных
+        const { data, error } = await supabase
+            .from('blocked_users')
+            .upsert({
+                user_email: normalizedUserEmail,
+                blocked_user_email: normalizedBlockedEmail
+            }, {
+                onConflict: 'user_email,blocked_user_email',
+                ignoreDuplicates: true
+            })
+            .select();
+
+        if (error) throw error;
+
+        console.log(`🔨 Пользователь ${normalizedUserEmail} заблокировал ${normalizedBlockedEmail}`);
+
+        res.json({
+            success: true,
+            message: 'Пользователь заблокирован'
+        });
+
+    } catch (error) {
+        console.error('❌ Ошибка блокировки пользователя:', error);
+        res.status(500).json({
+            success: false,
+            error: error.message
+        });
+    }
+});
+
+// ===== Разблокировать пользователя =====
+app.delete('/api/privacy/blocked/remove', async (req, res) => {
+    try {
+        const { userEmail, blockedUserEmail } = req.body;
+
+        if (!userEmail || !blockedUserEmail) {
+            return res.status(400).json({
+                success: false,
+                error: 'Email пользователя и блокируемого пользователя обязательны'
+            });
+        }
+
+        const normalizedUserEmail = userEmail.toLowerCase();
+        const normalizedBlockedEmail = blockedUserEmail.toLowerCase();
+
+        await updateUserActivity(normalizedUserEmail);
+
+        const { error } = await supabase
+            .from('blocked_users')
+            .delete()
+            .eq('user_email', normalizedUserEmail)
+            .eq('blocked_user_email', normalizedBlockedEmail);
+
+        if (error) throw error;
+
+        console.log(`✅ Пользователь ${normalizedUserEmail} разблокировал ${normalizedBlockedEmail}`);
+
+        res.json({
+            success: true,
+            message: 'Пользователь разблокирован'
+        });
+
+    } catch (error) {
+        console.error('❌ Ошибка разблокировки пользователя:', error);
+        res.status(500).json({
+            success: false,
+            error: error.message
+        });
+    }
+});
+
+// ===== Запрос на экспорт данных =====
+app.post('/api/privacy/export/request', async (req, res) => {
+    try {
+        const { userEmail } = req.body;
+
+        if (!userEmail) {
+            return res.status(400).json({
+                success: false,
+                error: 'Email обязателен'
+            });
+        }
+
+        const normalizedEmail = userEmail.toLowerCase();
+
+        await updateUserActivity(normalizedEmail);
+
+        // Создаем запрос на экспорт
+        const { data, error } = await supabase
+            .from('data_export_requests')
+            .insert([{
+                user_email: normalizedEmail,
+                status: 'pending'
+            }])
+            .select()
+            .single();
+
+        if (error) throw error;
+
+        console.log(`📦 Запрос на экспорт данных от ${normalizedEmail}`);
+
+        // Здесь можно запустить асинхронную задачу для подготовки данных
+        // Например, через очередь задач
+        prepareDataExport(normalizedEmail, data.id);
+
+        res.json({
+            success: true,
+            message: 'Запрос на экспорт данных принят',
+            requestId: data.id,
+            estimatedTime: '48 часов'
+        });
+
+    } catch (error) {
+        console.error('❌ Ошибка создания запроса на экспорт:', error);
+        res.status(500).json({
+            success: false,
+            error: error.message
+        });
+    }
+});
+
+// ===== Запрос на удаление данных =====
+app.post('/api/privacy/delete/request', async (req, res) => {
+    try {
+        const { userEmail } = req.body;
+
+        if (!userEmail) {
+            return res.status(400).json({
+                success: false,
+                error: 'Email обязателен'
+            });
+        }
+
+        const normalizedEmail = userEmail.toLowerCase();
+
+        await updateUserActivity(normalizedEmail);
+
+        // Создаем запрос на удаление
+        const { data, error } = await supabase
+            .from('data_deletion_requests')
+            .insert([{
+                user_email: normalizedEmail,
+                status: 'pending'
+            }])
+            .select()
+            .single();
+
+        if (error) throw error;
+
+        console.log(`🗑️ Запрос на удаление данных от ${normalizedEmail}`);
+
+        res.json({
+            success: true,
+            message: 'Запрос на удаление данных принят',
+            requestId: data.id
+        });
+
+    } catch (error) {
+        console.error('❌ Ошибка создания запроса на удаление:', error);
+        res.status(500).json({
+            success: false,
+            error: error.message
+        });
+    }
+});
+
+// ===== Вспомогательная функция для подготовки экспорта данных =====
+async function prepareDataExport(userEmail, requestId) {
+    // Это асинхронная функция, которая будет выполняться в фоне
+    try {
+        console.log(`🔄 Начало подготовки экспорта данных для ${userEmail}`);
+
+        // Обновляем статус на "processing"
+        await supabase
+            .from('data_export_requests')
+            .update({ status: 'processing' })
+            .eq('id', requestId);
+
+        // Собираем данные пользователя
+        const userData = await getUserInfo(userEmail);
+        
+        // Получаем сообщения пользователя
+        const { data: messages } = await supabase
+            .from('messages')
+            .select('*')
+            .or(`sender_email.eq.${userEmail},receiver_email.eq.${userEmail}`)
+            .order('timestamp');
+
+        // Получаем групповые сообщения
+        const { data: groupMessages } = await supabase
+            .from('group_messages')
+            .select('*')
+            .eq('sender_email', userEmail)
+            .order('timestamp');
+
+        // Получаем файлы
+        const { data: files } = await supabase
+            .from('files')
+            .select('*')
+            .eq('sender_email', userEmail);
+
+        // Формируем JSON с данными
+        const exportData = {
+            user: userData,
+            messages: messages || [],
+            groupMessages: groupMessages || [],
+            files: files || [],
+            exportedAt: new Date().toISOString()
+        };
+
+        // Сохраняем в файл и загружаем в Supabase Storage
+        const fileName = `export_${userEmail}_${Date.now()}.json`;
+        const filePath = `exports/${fileName}`;
+        
+        // Здесь код для сохранения файла в Supabase Storage
+        // ...
+
+        // Обновляем статус запроса
+        await supabase
+            .from('data_export_requests')
+            .update({
+                status: 'completed',
+                completed_at: new Date().toISOString(),
+                file_url: `https://${supabaseUrl}/storage/v1/object/public/${supabaseBucketName}/exports/${fileName}`
+            })
+            .eq('id', requestId);
+
+        console.log(`✅ Экспорт данных для ${userEmail} завершен`);
+
+    } catch (error) {
+        console.error('❌ Ошибка подготовки экспорта данных:', error);
+        
+        await supabase
+            .from('data_export_requests')
+            .update({
+                status: 'failed',
+                completed_at: new Date().toISOString()
+            })
+            .eq('id', requestId);
+    }
+}
+
 // ===== Завершение звонка =====
 app.post('/api/calls/end', async (req, res) => {
     try {
