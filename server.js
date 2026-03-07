@@ -620,98 +620,17 @@ async function sendFCMNotification(userEmail, title, body, data) {
                 title: title,
                 body: body,
                 type: 'call',
-                click_action: 'OPEN_CALL_ACTIVITY',
-                timestamp: new Date().toISOString()
+                click_action: 'OPEN_CALL_ACTIVITY'
             },
             token: userData[0].fcm_token,
             android: {
                 priority: 'high',
-                notification: {
-                    title: title,
-                    body: body,
-                    channelId: 'calls',
-                    priority: 'high',
-                    visibility: 'public',
-                    clickAction: 'OPEN_CALL_ACTIVITY',
-                    sound: 'default',
-                    defaultSound: true,
-                    defaultVibrate: true,
-                    vibrate: [1000, 1000, 1000, 1000],
-                    color: '#F44336',
-                    icon: 'ic_call',
-                    tag: data.roomId || `call_${Date.now()}`
-                },
-                fcm_options: {
-                    analytics_label: 'call_notification'
-                }
             },
-            apns: {
-                payload: {
-                    aps: {
-                        alert: {
-                            title: title,
-                            body: body
-                        },
-                        sound: 'default',
-                        badge: 1,
-                        category: 'CALL_CATEGORY',
-                        'mutable-content': 1
-                    }
-                },
-                fcm_options: {
-                    analytics_label: 'call_notification_ios'
-                }
-            },
-            webpush: {
-                notification: {
-                    title: title,
-                    body: body,
-                    icon: '/icon.png',
-                    badge: '/badge.png',
-                    vibrate: [200, 100, 200],
-                    data: data,
-                    actions: [
-                        {
-                            action: 'accept',
-                            title: 'Принять'
-                        },
-                        {
-                            action: 'reject',
-                            title: 'Отклонить'
-                        }
-                    ],
-                    requireInteraction: true,
-                    silent: false
-                },
-                fcm_options: {
-                    link: `/call/${data.roomId}`,
-                    analytics_label: 'call_notification_web'
-                }
-            }
         };
 
-        // Добавляем полноэкранный intent для Android
-        if (userData[0].fcm_token.startsWith('c') || userData[0].fcm_token.startsWith('e')) {
-            message.android.notification = {
-                ...message.android.notification,
-                notificationCount: 1,
-                notificationPriority: 'PRIORITY_HIGH',
-                visibility: 'PUBLIC',
-                notificationTimeout: 30000,
-                fullScreenIntent: {
-                    className: 'ru.beresta.messenger.FullScreenCallActivity',
-                    packageName: 'ru.beresta.messenger',
-                    flags: 'FLAG_ACTIVITY_NEW_TASK|FLAG_ACTIVITY_CLEAR_TOP',
-                    extras: data
-                }
-            };
-        }
-
         const response = await admin.messaging().send(message);
-        console.log(`✅ FCM уведомление отправлено для ${userEmail}`);
-        console.log(`📱 Детали звонка: ${title} - ${body}`);
+        console.log(`✅ FCM уведомление о звонке отправлено для ${userEmail}`);
         return true;
-
     } catch (error) {
         console.error('❌ Ошибка отправки FCM:', error);
         
@@ -751,7 +670,6 @@ async function sendFCMNotificationForMessage(receiverEmail, senderName, senderEm
         const title = isGroup ? `💬 ${groupName || 'Групповой чат'}` : '💬 Новое сообщение';
         const body = `${senderName}: ${typeof message === 'string' ? message.substring(0, 50) : 'Файл'}${typeof message === 'string' && message.length > 50 ? '...' : ''}`;
 
-        // Базовая структура сообщения
         const messageData = {
             data: {
                 type: 'message',
@@ -762,39 +680,19 @@ async function sendFCMNotificationForMessage(receiverEmail, senderName, senderEm
                 isGroup: isGroup.toString(),
                 groupId: groupId ? groupId.toString() : '',
                 groupName: groupName || '',
-                title: title,
-                body: body,
                 click_action: 'OPEN_CHAT_ACTIVITY',
-                timestamp: new Date().toISOString()
+                title: title,
+                body: body
             },
             token: userData[0].fcm_token,
             android: {
                 priority: 'high',
-                notification: {
-                    title: title,
-                    body: body,
-                    channelId: 'messages', // Важно: должен совпадать с каналом в Android коде
-                    priority: 'high',
-                    visibility: 'public',
-                    clickAction: 'OPEN_CHAT_ACTIVITY',
-                    sound: 'default',
-                    defaultSound: true,
-                    defaultVibrate: true,
-                    vibrate: [1000, 1000, 1000],
-                    color: '#2196F3',
-                    icon: 'ic_notification',
-                    tag: messageId.toString()
-                }
-            }
+            },
         };
 
-        // Отправляем сообщение
         const response = await admin.messaging().send(messageData);
         console.log(`✅ FCM уведомление о сообщении отправлено для ${receiverEmail}`);
-        console.log(`📱 Детали: ${title} - ${body}`);
-        console.log(`📱 Response:`, response);
         return true;
-
     } catch (error) {
         console.error('❌ Ошибка отправки FCM для сообщения:', error);
         
@@ -809,6 +707,7 @@ async function sendFCMNotificationForMessage(receiverEmail, senderName, senderEm
         return false;
     }
 }
+
 // ===== ФУНКЦИИ ДЛЯ АВТОМАТИЧЕСКОЙ ОЧИСТКИ ФАЙЛОВ =====
 
 async function cleanupOldFiles() {
