@@ -320,8 +320,10 @@ function getFileType(mimetype, filename) {
     
     const ext = path.extname(filename).toLowerCase();
     if (['.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp'].includes(ext)) return 'image';
-    if (['.mp4', '.avi', '.mov', '.mkv', '.webm', '.3gp'].includes(ext)) return 'video';
-    if (['.mp3', '.wav', '.aac', '.flac', '.ogg', '.m4a'].includes(ext)) return 'audio';
+    // ВИДЕО - убираем .3gp
+    if (['.mp4', '.avi', '.mov', '.mkv', '.webm'].includes(ext)) return 'video';
+    // АУДИО - добавляем .3gp сюда
+    if (['.mp3', '.wav', '.aac', '.flac', '.ogg', '.m4a', '.3gp'].includes(ext)) return 'audio';
     if (['.pdf', '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx', '.txt'].includes(ext)) return 'document';
     if (['.zip', '.rar', '.7z', '.tar', '.gz'].includes(ext)) return 'archive';
     
