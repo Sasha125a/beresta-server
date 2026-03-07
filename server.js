@@ -670,7 +670,11 @@ async function sendFCMNotificationForMessage(receiverEmail, senderName, senderEm
         const title = isGroup ? `💬 ${groupName || 'Групповой чат'}` : '💬 Новое сообщение';
         const body = `${senderName}: ${typeof message === 'string' ? message.substring(0, 50) : 'Файл'}${typeof message === 'string' && message.length > 50 ? '...' : ''}`;
 
+        // ОСНОВНОЕ ИЗМЕНЕНИЕ: Добавляем notification секцию с высоким приоритетом
         const messageData = {
+            token: userData[0].fcm_token,
+            
+            // Data секция (для обработки в приложении)
             data: {
                 type: 'message',
                 senderName: senderName,
@@ -680,19 +684,100 @@ async function sendFCMNotificationForMessage(receiverEmail, senderName, senderEm
                 isGroup: isGroup.toString(),
                 groupId: groupId ? groupId.toString() : '',
                 groupName: groupName || '',
-                click_action: 'OPEN_CHAT_ACTIVITY',
                 title: title,
-                body: body
+                body: body,
+                click_action: 'OPEN_CHAT_ACTIVITY',
+                timestamp: new Date().toISOString()
             },
-            token: userData[0].fcm_token,
+            
+            // NOTIFICATION секция (для всплывающего уведомления)
+            notification: {
+                title: title,
+                body: body,
+                image: undefined // Можно добавить URL картинки если нужно
+            },
+            
+            // Android специфичные настройки
             android: {
                 priority: 'high',
+                notification: {
+                    channelId: 'messages', // Должен совпадать с каналом в Android
+                    priority: 'high',
+                    visibility: 'public',
+                    clickAction: 'OPEN_CHAT_ACTIVITY',
+                    sound: 'default',
+                    defaultSound: true,
+                    defaultVibrate: true,
+                    vibrate: [1000, 1000, 1000],
+                    color: '#2196F3',
+                    icon: 'ic_notification',
+                    tag: messageId.toString(),
+                    sticky: false,
+                    // Эти параметры делают уведомление всплывающим
+                    notificationCount: 1,
+                    ticker: title + ': ' + body,
+                    localOnly: false,
+                    notificationPriority: 1, // PRIORITY_HIGH
+                    visibility: 1, // VISIBILITY_PUBLIC
+                    channelId: 'messages'
+                }
             },
+            
+            // APNs для iOS
+            apns: {
+                payload: {
+                    aps: {
+                        alert: {
+                            title: title,
+                            body: body
+                        },
+                        sound: 'default',
+                        badge: 1,
+                        category: 'MESSAGE_CATEGORY',
+                        'mutable-content': 1
+                    }
+                }
+            }
         };
+
+        // Добавляем полноэкранный intent для Android 8.0+
+        // Это гарантирует, что уведомление будет всплывающим
+        if (userData[0].fcm_token && (userData[0].fcm_token.startsWith('c') || userData[0].fcm_token.startsWith('e'))) {
+            // Создаем Intent для открытия приложения
+            const intent = {
+                action: 'OPEN_CHAT_ACTIVITY',
+                type: 'text/plain',
+                flags: ['FLAG_ACTIVITY_NEW_TASK', 'FLAG_ACTIVITY_CLEAR_TOP'],
+                categories: ['android.intent.category.LAUNCHER'],
+                package: 'ru.beresta.messenger',
+                extras: {
+                    'senderName': senderName,
+                    'senderEmail': senderEmail,
+                    'messageId': messageId.toString(),
+                    'isGroup': isGroup,
+                    'groupId': groupId ? groupId.toString() : '',
+                    'groupName': groupName || ''
+                }
+            };
+            
+            messageData.android.notification.clickIntent = intent;
+            
+            // Устанавливаем fullScreenIntent для heads-up уведомления
+            messageData.android.notification.fullScreenIntent = intent;
+        }
+
+        console.log(`📦 Отправка FCM сообщения для ${receiverEmail}:`, JSON.stringify({
+            title: title,
+            body: body,
+            hasNotification: !!messageData.notification,
+            hasAndroid: !!messageData.android
+        }, null, 2));
 
         const response = await admin.messaging().send(messageData);
         console.log(`✅ FCM уведомление о сообщении отправлено для ${receiverEmail}`);
+        console.log(`📱 Response:`, response);
         return true;
+
     } catch (error) {
         console.error('❌ Ошибка отправки FCM для сообщения:', error);
         
