@@ -11,7 +11,7 @@ const multer = require('multer');
 const { v4: uuidv4 } = require('uuid');
 const { createClient } = require('@supabase/supabase-js');
 const admin = require('firebase-admin');
-const axios = require('axios'); // Для скачивания файлов из Supabase
+const axios = require('axios');
 const stream = require('stream');
 const util = require('util');
 const mime = require('mime-types');
@@ -42,11 +42,9 @@ const callTimeouts = new Map();
 let firebaseInitialized = false;
 
 try {
-    // Пробуем загрузить из переменной окружения (для Render.com)
     if (process.env.FIREBASE_SERVICE_ACCOUNT_JSON) {
         console.log('📦 Найден FIREBASE_SERVICE_ACCOUNT_JSON, пытаемся распарсить...');
         
-        // Убираем экранирование если нужно
         let jsonString = process.env.FIREBASE_SERVICE_ACCOUNT_JSON;
         if (jsonString.startsWith('"') && jsonString.endsWith('"')) {
             jsonString = jsonString.slice(1, -1).replace(/\\n/g, '\n').replace(/\\"/g, '"');
@@ -63,10 +61,8 @@ try {
         console.log(`🔥 Проект: ${serviceAccount.project_id}`);
         console.log(`📧 Client email: ${serviceAccount.client_email}`);
     } 
-    // Если нет, пробуем загрузить из файла (для локальной разработки)
     else {
         console.log('📦 FIREBASE_SERVICE_ACCOUNT_JSON не найден, ищем файл...');
-        // Ищем любой файл, содержащий firebase-adminsdk
         const files = fs.readdirSync('./').filter(f => f.includes('firebase-adminsdk') && f.endsWith('.json'));
         if (files.length > 0) {
             const serviceAccount = require('./' + files[0]);
@@ -92,13 +88,118 @@ app.use(cors({
     credentials: true
 }));
 
-// ВАЖНО: Добавляем middleware для парсинга JSON и URL-encoded данных
 app.use(bodyParser.json({ limit: '50mb' }));
 app.use(bodyParser.urlencoded({ extended: true, limit: '50mb' }));
 
-// Альтернативно можно использовать встроенный express.json()
-// app.use(express.json({ limit: '50mb' }));
-// app.use(express.urlencoded({ extended: true, limit: '50mb' }));
+// ==================== ОТСЛЕЖИВАНИЕ АКТИВНОСТИ ПОЛЬЗОВАТЕЛЕЙ ====================
+const userLastActivity = new Map(); // email -> timestamp последней активности
+const ACTIVITY_TIMEOUT = 5 * 60 * 1000; // 5 минут без активности = оффлайн
+const ACTIVITY_CHECK_INTERVAL = 60000; // Проверка каждую минуту
+
+// Функция обновления активности пользователя
+async function updateUserActivity(email) {
+    if (!email) return;
+    
+    const normalizedEmail = email.toLowerCase();
+    const now = Date.now();
+    const lastActivity = userLastActivity.get(normalizedEmail) || 0;
+    
+    // Обновляем время активности
+    userLastActivity.set(normalizedEmail, now);
+    
+    // Если пользователь был неактивен больше ACTIVITY_TIMEOUT, меняем статус на онлайн
+    if (now - lastActivity > ACTIVITY_TIMEOUT) {
+        console.log(`👤 Пользователь ${normalizedEmail} стал онлайн (активность)`);
+        
+        // Обновляем в базе
+        await updateUserPresence(normalizedEmail, null, 'online');
+        
+        // Уведомляем всех о смене статуса
+        io.emit('user_status_changed', {
+            email: normalizedEmail,
+            status: 'online',
+            timestamp: new Date().toISOString(),
+            source: 'activity'
+        });
+    }
+    
+    return true;
+}
+
+// Функция проверки неактивных пользователей
+async function checkInactiveUsers() {
+    const now = Date.now();
+    const offlineThreshold = now - ACTIVITY_TIMEOUT;
+    
+    for (const [email, lastActivity] of userLastActivity.entries()) {
+        if (lastActivity < offlineThreshold) {
+            console.log(`👤 Пользователь ${email} стал оффлайн (неактивен ${Math.round((now - lastActivity)/1000)}с)`);
+            
+            // Удаляем из активных
+            userLastActivity.delete(email);
+            
+            // Обновляем в базе
+            await updateUserPresence(email, null, 'offline');
+            
+            // Уведомляем всех о смене статуса
+            io.emit('user_status_changed', {
+                email: email,
+                status: 'offline',
+                timestamp: new Date().toISOString(),
+                source: 'inactivity'
+            });
+        }
+    }
+}
+
+// Запускаем периодическую проверку неактивных пользователей
+setInterval(checkInactiveUsers, ACTIVITY_CHECK_INTERVAL);
+
+// ==================== MIDDLEWARE ДЛЯ ОТСЛЕЖИВАНИЯ АКТИВНОСТИ ====================
+// Middleware для отслеживания активности по HTTP запросам
+app.use(async (req, res, next) => {
+    // Пропускаем статические файлы и health checks
+    if (req.path.startsWith('/uploads') || req.path === '/health' || req.path === '/' || req.path.startsWith('/api/debug')) {
+        return next();
+    }
+    
+    // Ищем email в разных местах запроса
+    let email = null;
+    
+    // В query параметрах
+    if (req.query.email) {
+        email = req.query.email;
+    }
+    else if (req.query.userEmail) {
+        email = req.query.userEmail;
+    }
+    // В body
+    else if (req.body) {
+        if (req.body.email) email = req.body.email;
+        else if (req.body.userEmail) email = req.body.userEmail;
+        else if (req.body.senderEmail) email = req.body.senderEmail;
+        else if (req.body.callerEmail) email = req.body.callerEmail;
+        else if (req.body.receiverEmail) email = req.body.receiverEmail;
+    }
+    // В params
+    else if (req.params) {
+        if (req.params.email) email = req.params.email;
+        else if (req.params.userEmail) email = req.params.userEmail;
+    }
+    // В headers
+    else if (req.headers['x-user-email']) {
+        email = req.headers['x-user-email'];
+    }
+    
+    if (email) {
+        // Асинхронно обновляем активность (не ждем завершения)
+        updateUserActivity(email).catch(err => 
+            console.error('❌ Ошибка обновления активности:', err)
+        );
+    }
+    
+    next();
+});
 
 // ==================== SUPABASE ====================
 const supabaseUrl = process.env.SUPABASE_URL;
@@ -156,7 +257,6 @@ async function ensureBucketExists() {
 const uploadDir = process.env.UPLOAD_DIR || path.join(__dirname, 'uploads');
 const tempDir = path.join(uploadDir, 'temp');
 
-// Создаем папки, если их нет
 [uploadDir, tempDir].forEach(dir => {
     if (!fs.existsSync(dir)) {
         fs.mkdirSync(dir, { recursive: true });
@@ -164,7 +264,6 @@ const tempDir = path.join(uploadDir, 'temp');
     }
 });
 
-// Настройка multer для загрузки файлов
 const multerStorage = multer.diskStorage({
     destination: (req, file, cb) => {
         cb(null, tempDir);
@@ -176,17 +275,15 @@ const multerStorage = multer.diskStorage({
     }
 });
 
-// Настройка multer для загрузки файлов с учетом лимита Supabase
-const MAX_FILE_SIZE = 50 * 1024 * 1024; // 50 МБ (лимит бесплатного плана Supabase)
+const MAX_FILE_SIZE = 50 * 1024 * 1024; // 50 МБ
 
 const upload = multer({
     storage: multerStorage,
     limits: {
-        fileSize: MAX_FILE_SIZE, // 50MB
+        fileSize: MAX_FILE_SIZE,
         fieldSize: MAX_FILE_SIZE
     },
     fileFilter: (req, file, cb) => {
-        // Проверяем размер файла
         if (file.size > MAX_FILE_SIZE) {
             return cb(new Error(`Файл слишком большой. Максимальный размер: 50 МБ`));
         }
@@ -195,15 +292,14 @@ const upload = multer({
 });
 
 // ==================== ХРАНИЛИЩА ДАННЫХ ====================
-const rooms = new Map();           // Комнаты и их участники
-const roomsInfo = new Map();       // Информация о комнатах
-const users = new Map();           // Информация о пользователях
-const callHistory = new Map();     // История звонков
-const activeCalls = new Map();     // Активные звонки
-const emailToSocket = new Map();   // Маппинг email -> socket.id
-const socketToEmail = new Map();   // Обратный маппинг
+const rooms = new Map();
+const roomsInfo = new Map();
+const users = new Map();
+const callHistory = new Map();
+const activeCalls = new Map();
+const emailToSocket = new Map();
+const socketToEmail = new Map();
 
-// Периодическая очистка старых звонков (раз в 5 минут)
 setInterval(() => {
     const now = Date.now();
     for (const [roomId, callData] of activeCalls.entries()) {
@@ -232,7 +328,6 @@ function getFileType(mimetype, filename) {
     return 'file';
 }
 
-// Функция для загрузки файла в Supabase Storage
 async function uploadFileToSupabase(filePath, fileName, bucket = supabaseBucketName) {
     try {
         console.log(`📤 Загрузка файла в Supabase: ${fileName}`);
@@ -245,7 +340,6 @@ async function uploadFileToSupabase(filePath, fileName, bucket = supabaseBucketN
         console.log(`📁 Путь в bucket: ${filePathInBucket}`);
         console.log(`📊 Размер файла: ${fileContent.length} байт`);
 
-        // Проверяем существование bucket
         const { data: buckets } = await supabase.storage.listBuckets();
         const bucketExists = buckets.some(b => b.name === bucket);
         
@@ -253,7 +347,7 @@ async function uploadFileToSupabase(filePath, fileName, bucket = supabaseBucketN
             console.log(`⚠️ Bucket "${bucket}" не найден, создаем...`);
             await supabase.storage.createBucket(bucket, {
                 public: true,
-                fileSizeLimit: 104857600 // 100MB
+                fileSizeLimit: 104857600
             });
         }
 
@@ -271,7 +365,6 @@ async function uploadFileToSupabase(filePath, fileName, bucket = supabaseBucketN
             throw error;
         }
 
-        // Получаем публичный URL
         const { data: urlData } = supabase
             .storage
             .from(bucket)
@@ -296,7 +389,6 @@ async function uploadFileToSupabase(filePath, fileName, bucket = supabaseBucketN
     }
 }
 
-// Функция для удаления файла из Supabase Storage
 async function deleteFileFromSupabase(filePath, bucket = supabaseBucketName) {
     try {
         const { error } = await supabase
@@ -314,12 +406,8 @@ async function deleteFileFromSupabase(filePath, bucket = supabaseBucketName) {
     }
 }
 
-/**
- * Функция отправки уведомления о пропущенном звонке
- */
 async function sendMissedCallNotification(receiverEmail, callerEmail, callType, roomId) {
     try {
-        // Получаем информацию о звонящем
         const callerInfo = await getUserInfo(callerEmail);
         const callerName = callerInfo ? 
             `${callerInfo.first_name || ''} ${callerInfo.last_name || ''}`.trim() || callerEmail : 
@@ -327,7 +415,6 @@ async function sendMissedCallNotification(receiverEmail, callerEmail, callType, 
         
         console.log(`📱 Отправка уведомления о пропущенном звонке для ${receiverEmail} от ${callerName}`);
         
-        // СОХРАНЯЕМ В БАЗУ ДАННЫХ
         try {
             await supabase
                 .from('missed_calls')
@@ -345,7 +432,6 @@ async function sendMissedCallNotification(receiverEmail, callerEmail, callType, 
             console.error('❌ Ошибка сохранения в БД:', dbError);
         }
         
-        // Отправляем через FCM
         const fcmSent = await sendFCMNotification(
             receiverEmail,
             '📞 Пропущенный звонок',
@@ -361,7 +447,6 @@ async function sendMissedCallNotification(receiverEmail, callerEmail, callType, 
             }
         );
         
-        // Отправляем через Socket.IO если получатель онлайн
         const receiverSocketId = emailToSocket.get(receiverEmail.toLowerCase());
         if (receiverSocketId) {
             io.to(receiverSocketId).emit('missed-call', {
@@ -465,12 +550,18 @@ async function addToChatsAutomatically(user1, user2) {
 
 async function cleanupOldPresence() {
     try {
+        const now = Date.now();
+        const offlineThreshold = new Date(now - ACTIVITY_TIMEOUT).toISOString();
+        
         const { error } = await supabase
             .from('user_presence')
             .delete()
-            .lt('last_seen', new Date(Date.now() - 60000).toISOString());
+            .lt('last_seen', offlineThreshold);
 
         if (error) throw error;
+        
+        await checkInactiveUsers();
+        
     } catch (error) {
         console.error('❌ Ошибка очистки присутствия:', error);
     }
@@ -500,7 +591,6 @@ function getTodayCallsCount() {
 
 // ==================== ФУНКЦИИ ДЛЯ FCM ====================
 
-// Функция для отправки FCM уведомлений о звонках
 async function sendFCMNotification(userEmail, title, body, data) {
     if (!firebaseInitialized) {
         console.log('❌ Firebase не инициализирован');
@@ -618,21 +708,16 @@ async function sendFCMNotificationForMessage(receiverEmail, senderName, senderEm
 
 // ===== ФУНКЦИИ ДЛЯ АВТОМАТИЧЕСКОЙ ОЧИСТКИ ФАЙЛОВ =====
 
-/**
- * Удаление старых файлов (старше 10 дней)
- */
 async function cleanupOldFiles() {
     try {
         console.log('🧹 Запуск очистки старых файлов...');
         
-        // Вычисляем дату 10 дней назад
         const tenDaysAgo = new Date();
         tenDaysAgo.setDate(tenDaysAgo.getDate() - 10);
         const cutoffDate = tenDaysAgo.toISOString();
         
         console.log(`📅 Удаляем файлы старше: ${cutoffDate}`);
 
-        // Находим все файлы старше 10 дней
         const { data: oldFiles, error: selectError } = await supabase
             .from('files')
             .select('*')
@@ -655,7 +740,6 @@ async function cleanupOldFiles() {
 
         for (const file of oldFiles) {
             try {
-                // Удаляем файл из Supabase Storage
                 if (file.file_path) {
                     const { error: storageError } = await supabase
                         .storage
@@ -669,7 +753,6 @@ async function cleanupOldFiles() {
                     }
                 }
 
-                // Удаляем запись из базы данных
                 const { error: dbError } = await supabase
                     .from('files')
                     .delete()
@@ -681,7 +764,6 @@ async function cleanupOldFiles() {
                     continue;
                 }
 
-                // Обнуляем file_id в связанных сообщениях
                 await supabase
                     .from('messages')
                     .update({ file_id: null })
@@ -708,21 +790,16 @@ async function cleanupOldFiles() {
     }
 }
 
-/**
- * Запуск периодической очистки старых файлов
- */
 function startFileCleanupScheduler() {
     console.log('⏰ Запуск планировщика очистки файлов (каждые 24 часа)');
     
-    // Запускаем сразу при старте сервера
     setTimeout(() => {
         cleanupOldFiles();
-    }, 60000); // Через 1 минуту после запуска
+    }, 60000);
     
-    // Затем запускаем каждые 24 часа
     setInterval(() => {
         cleanupOldFiles();
-    }, 24 * 60 * 60 * 1000); // 24 часа
+    }, 24 * 60 * 60 * 1000);
 }
 
 // ==================== SOCKET.IO ОБРАБОТЧИКИ ====================
@@ -744,6 +821,8 @@ io.on('connection', (socket) => {
                 socketToEmail.set(socket.id, email);
                 
                 console.log(`📧 Маппинг: ${email} -> ${socket.id}`);
+                
+                await updateUserActivity(email);
                 
                 await updateUserPresence(email, socket.id, 'online');
                 
@@ -775,8 +854,6 @@ io.on('connection', (socket) => {
         });
     });
 
-    // Найдите обработчик 'join-room' и замените его на этот исправленный вариант:
-
     socket.on('join-room', (data) => {
         try {
             const roomId = data.roomId;
@@ -787,11 +864,9 @@ io.on('connection', (socket) => {
             if (userInfo.email) {
                 const email = userInfo.email.toLowerCase();
                 
-                // Важно: удаляем предыдущий маппинг если был
                 const oldSocketId = emailToSocket.get(email);
                 if (oldSocketId && oldSocketId !== socket.id) {
                     console.log(`⚠️ Обнаружен дубликат для ${email}, старый socket: ${oldSocketId}`);
-                    // Не отключаем старый сокет, просто обновляем маппинг
                 }
                 
                 emailToSocket.set(email, socket.id);
@@ -807,7 +882,6 @@ io.on('connection', (socket) => {
             
             const room = rooms.get(roomId);
             
-            // Проверяем, не в комнате ли уже этот сокет
             if (room.has(socket.id)) {
                 console.log(`⚠️ Сокет ${socket.id} уже в комнате ${roomId}`);
                 return;
@@ -836,23 +910,19 @@ io.on('connection', (socket) => {
             
             console.log('✅ ' + socket.id + ' подключился к ' + roomId + '. Участников: ' + room.size);
             
-            // Отправляем подтверждение
             socket.emit('join-success', { 
                 roomId: roomId, 
                 participants: Array.from(room),
                 isFirstParticipant: room.size === 1
             });
             
-            // Уведомляем всех в комнате о новом участнике
             if (room.size > 1) {
-                // Отправляем всем кроме нового участника
                 socket.to(roomId).emit('peer-joined', {
                     peerId: socket.id,
                     peerEmail: socket.userEmail,
                     peerInfo: userInfo
                 });
                 
-                // Отправляем новому участнику информацию о других участниках
                 const otherParticipants = Array.from(room).filter(id => id !== socket.id);
                 socket.emit('peer-list', {
                     participants: otherParticipants.map(id => ({
@@ -861,7 +931,6 @@ io.on('connection', (socket) => {
                     }))
                 });
                 
-                // Отправляем сигнал готовности через небольшую задержку
                 setTimeout(() => {
                     if (rooms.has(roomId) && rooms.get(roomId).has(socket.id)) {
                         socket.emit('peer-ready', {
@@ -879,6 +948,7 @@ io.on('connection', (socket) => {
             socket.emit('join-error', { message: error.message });
         }
     });
+    
     socket.on('offer', (data) => {
         console.log('📤 Оффер от ' + socket.id + ' к ' + data.target);
         
@@ -945,16 +1015,6 @@ io.on('connection', (socket) => {
         }
         
         handleDisconnect(socket);
-        
-        if (socket.userEmail) {
-            await updateUserPresence(socket.userEmail, socket.id, 'offline');
-            
-            socket.broadcast.emit('user_status_changed', {
-                email: socket.userEmail,
-                status: 'offline',
-                timestamp: new Date().toISOString()
-            });
-        }
     });
 
     socket.on('error', (error) => {
@@ -979,7 +1039,6 @@ function handleDisconnect(socket, specificRoom = null) {
         const room = rooms.get(roomId);
         room.delete(socket.id);
         
-        // Уведомляем остальных участников
         if (room.size > 0) {
             socket.to(roomId).emit('peer-disconnected', {
                 peerId: socket.id,
@@ -988,12 +1047,10 @@ function handleDisconnect(socket, specificRoom = null) {
             });
         }
         
-        // Если комната пуста, удаляем её
         if (room.size === 0) {
             rooms.delete(roomId);
             roomsInfo.delete(roomId);
             
-            // Завершаем активный звонок если был
             if (activeCalls.has(roomId)) {
                 const callData = activeCalls.get(roomId);
                 const endedCall = {
@@ -1006,7 +1063,6 @@ function handleDisconnect(socket, specificRoom = null) {
                 const historyId = 'hist_' + Date.now();
                 callHistory.set(historyId, endedCall);
                 activeCalls.delete(roomId);
-                pendingCalls.delete(roomId);
                 console.log(`📴 Звонок ${roomId} завершен (комната пуста)`);
             }
         } else {
@@ -1039,9 +1095,12 @@ app.get('/health', async (req, res) => {
             dirStatus[path.basename(dir)] = fs.existsSync(dir);
         });
 
-        // Проверка Supabase Storage
         const { data: buckets } = await supabase.storage.listBuckets();
         const storageAvailable = buckets && buckets.some(b => b.name === supabaseBucketName);
+        
+        const onlineUsers = Array.from(userLastActivity.entries())
+            .filter(([_, lastActivity]) => Date.now() - lastActivity < ACTIVITY_TIMEOUT)
+            .length;
 
         res.json({
             success: true,
@@ -1051,7 +1110,8 @@ app.get('/health', async (req, res) => {
                 activeRooms: rooms.size,
                 totalUsers: users.size,
                 activeCalls: activeCalls.size,
-                onlineUsers: count || 0,
+                onlineUsers: onlineUsers,
+                databaseOnlineUsers: count || 0,
                 totalCallsToday: getTodayCallsCount()
             },
             uptime: process.uptime(),
@@ -1060,6 +1120,10 @@ app.get('/health', async (req, res) => {
             supabaseStorage: {
                 bucket: supabaseBucketName,
                 available: storageAvailable
+            },
+            activityTracking: {
+                timeout: ACTIVITY_TIMEOUT / 1000 / 60 + ' минут',
+                trackedUsers: userLastActivity.size
             },
             timestamp: new Date().toISOString()
         });
@@ -1073,7 +1137,7 @@ app.get('/health', async (req, res) => {
     }
 });
 
-// Загрузка файла с сохранением в Supabase
+// ===== Загрузка файла =====
 app.post('/upload', upload.single('file'), async (req, res) => {
     try {
         if (!req.file) {
@@ -1089,7 +1153,10 @@ app.post('/upload', upload.single('file'), async (req, res) => {
         console.log('📤 Загрузка файла:', file.originalname);
         console.log('📤 Данные:', { senderEmail, receiverEmail, isGroup, groupId });
 
-        // Загружаем файл в Supabase Storage
+        if (senderEmail) {
+            await updateUserActivity(senderEmail);
+        }
+
         const uploadResult = await uploadFileToSupabase(file.path, file.originalname);
 
         if (!uploadResult.success) {
@@ -1099,10 +1166,8 @@ app.post('/upload', upload.single('file'), async (req, res) => {
             });
         }
 
-        // Определяем тип файла
         const fileType = getFileType(file.mimetype, file.originalname);
 
-        // Создаем запись о файле в базе данных
         const fileRecord = {
             file_name: file.originalname,
             file_path: uploadResult.path,
@@ -1123,23 +1188,20 @@ app.post('/upload', upload.single('file'), async (req, res) => {
 
         if (fileError) {
             console.error('❌ Ошибка сохранения записи о файле:', fileError);
-            // Пытаемся удалить файл из Supabase
             await deleteFileFromSupabase(uploadResult.path);
             throw fileError;
         }
 
         console.log('✅ Файл сохранен в БД с ID:', fileData[0].id);
 
-        // Если это сообщение, создаем запись в messages или group_messages
         if (senderEmail && (receiverEmail || groupId)) {
             if (groupId) {
-                // Групповое сообщение с файлом
                 const { data: messageData, error: messageError } = await supabase
                     .from('group_messages')
                     .insert([{
                         group_id: groupId,
                         sender_email: senderEmail.toLowerCase(),
-                        message: req.body.message || '', // Используем переданное сообщение
+                        message: req.body.message || '',
                         file_id: fileData[0].id,
                         duration: 0
                     }])
@@ -1149,7 +1211,6 @@ app.post('/upload', upload.single('file'), async (req, res) => {
 
                 console.log('✅ Групповое сообщение создано с ID:', messageData[0].id);
 
-                // Получаем информацию о группе и отправителе для уведомлений
                 const { data: groupData } = await supabase
                     .from('groups')
                     .select('name')
@@ -1164,7 +1225,6 @@ app.post('/upload', upload.single('file'), async (req, res) => {
                 const senderInfo = await getUserInfo(senderEmail);
                 const senderName = senderInfo ? `${senderInfo.first_name || ''} ${senderInfo.last_name || ''}`.trim() : senderEmail;
 
-                // Отправляем уведомления
                 if (members) {
                     for (const member of members) {
                         if (member.user_email !== senderEmail.toLowerCase()) {
@@ -1195,13 +1255,12 @@ app.post('/upload', upload.single('file'), async (req, res) => {
                     messageId: messageData[0].id
                 });
             } else if (receiverEmail) {
-                // Личное сообщение с файлом
                 const { data: messageData, error: messageError } = await supabase
                     .from('messages')
                     .insert([{
                         sender_email: senderEmail.toLowerCase(),
                         receiver_email: receiverEmail.toLowerCase(),
-                        message: req.body.message || '', // Используем переданное сообщение
+                        message: req.body.message || '',
                         file_id: fileData[0].id,
                         duration: 0
                     }])
@@ -1212,10 +1271,8 @@ app.post('/upload', upload.single('file'), async (req, res) => {
                 console.log('✅ Личное сообщение создано с ID:', messageData[0].id);
                 console.log('✅ Привязан файл ID:', fileData[0].id);
 
-                // Добавляем в чаты автоматически
                 await addToChatsAutomatically(senderEmail, receiverEmail);
 
-                // Отправляем уведомление получателю
                 const senderInfo = await getUserInfo(senderEmail);
                 const senderName = senderInfo ? `${senderInfo.first_name || ''} ${senderInfo.last_name || ''}`.trim() : senderEmail;
 
@@ -1228,7 +1285,6 @@ app.post('/upload', upload.single('file'), async (req, res) => {
                     false
                 );
 
-                // Отправляем через Socket.IO
                 const receiverSocketId = emailToSocket.get(receiverEmail.toLowerCase());
                 if (receiverSocketId) {
                     io.to(receiverSocketId).emit('new_message', {
@@ -1283,7 +1339,6 @@ app.post('/upload', upload.single('file'), async (req, res) => {
             });
         }
 
-        // Удаляем временный файл после загрузки в Supabase
         fs.unlink(file.path, (err) => {
             if (err) console.error('❌ Ошибка удаления временного файла:', err);
             else console.log('🗑️ Временный файл удален:', file.path);
@@ -1304,7 +1359,6 @@ app.get('/messages/:messageId/files', async (req, res) => {
     try {
         const { messageId } = req.params;
 
-        // Проверяем в обычных сообщениях
         const { data: messageData, error: messageError } = await supabase
             .from('messages')
             .select('file_id')
@@ -1326,7 +1380,6 @@ app.get('/messages/:messageId/files', async (req, res) => {
             }
         }
 
-        // Проверяем в групповых сообщениях
         const { data: groupMessageData, error: groupMessageError } = await supabase
             .from('group_messages')
             .select('file_id')
@@ -1366,6 +1419,8 @@ app.get('/users/:email/files', async (req, res) => {
     try {
         const email = req.params.email.toLowerCase();
 
+        await updateUserActivity(email);
+
         const { data, error } = await supabase
             .from('files')
             .select('*')
@@ -1387,9 +1442,7 @@ app.get('/users/:email/files', async (req, res) => {
     }
 });
 
-/**
- * Обновление профиля пользователя
- */
+// ===== Обновление профиля пользователя =====
 app.post('/update-profile', upload.single('avatar'), async (req, res) => {
     try {
         const { email, firstName, lastName, removeAvatar } = req.body;
@@ -1406,8 +1459,9 @@ app.post('/update-profile', upload.single('avatar'), async (req, res) => {
         console.log(`📝 Данные: firstName=${firstName}, lastName=${lastName}, removeAvatar=${removeAvatar}`);
 
         const normalizedEmail = email.toLowerCase();
+        
+        await updateUserActivity(normalizedEmail);
 
-        // Проверяем существование пользователя
         const { data: existingUser, error: checkError } = await supabase
             .from('regular_users')
             .select('*')
@@ -1422,16 +1476,13 @@ app.post('/update-profile', upload.single('avatar'), async (req, res) => {
             });
         }
 
-        // Подготавливаем данные для обновления
         const updateData = {
             first_name: firstName || existingUser.first_name,
             last_name: lastName || existingUser.last_name,
             updated_at: new Date().toISOString()
         };
 
-        // Обработка аватара
         if (removeAvatar === 'true') {
-            // Удаляем старый аватар, если он был
             if (existingUser.avatar_filename) {
                 try {
                     await supabase
@@ -1445,7 +1496,6 @@ app.post('/update-profile', upload.single('avatar'), async (req, res) => {
             updateData.avatar_filename = null;
         } 
         else if (file) {
-            // Загружаем новый аватар
             try {
                 console.log('📤 Загрузка нового аватара:', file.originalname);
                 
@@ -1454,7 +1504,6 @@ app.post('/update-profile', upload.single('avatar'), async (req, res) => {
                 const fileName = `avatar_${Date.now()}${fileExt}`;
                 const filePath = `avatars/${fileName}`;
 
-                // Загружаем в Supabase Storage
                 const { error: uploadError } = await supabase
                     .storage
                     .from(supabaseBucketName)
@@ -1468,7 +1517,6 @@ app.post('/update-profile', upload.single('avatar'), async (req, res) => {
                     throw uploadError;
                 }
 
-                // Удаляем старый аватар, если был
                 if (existingUser.avatar_filename) {
                     try {
                         await supabase
@@ -1483,7 +1531,6 @@ app.post('/update-profile', upload.single('avatar'), async (req, res) => {
                 updateData.avatar_filename = fileName;
                 console.log('✅ Аватар загружен:', fileName);
 
-                // Удаляем временный файл
                 fs.unlink(file.path, (err) => {
                     if (err) console.error('❌ Ошибка удаления временного файла:', err);
                 });
@@ -1497,7 +1544,6 @@ app.post('/update-profile', upload.single('avatar'), async (req, res) => {
             }
         }
 
-        // Обновляем данные пользователя в базе
         const { data, error: updateError } = await supabase
             .from('regular_users')
             .update(updateData)
@@ -1511,7 +1557,6 @@ app.post('/update-profile', upload.single('avatar'), async (req, res) => {
 
         console.log('✅ Профиль успешно обновлен для:', normalizedEmail);
 
-        // Получаем публичный URL аватара, если он есть
         let avatarUrl = null;
         if (updateData.avatar_filename) {
             const { data: urlData } = supabase
@@ -1536,7 +1581,6 @@ app.post('/update-profile', upload.single('avatar'), async (req, res) => {
     } catch (error) {
         console.error('❌ Ошибка обновления профиля:', error);
         
-        // Очищаем временный файл в случае ошибки
         if (req.file && req.file.path) {
             fs.unlink(req.file.path, () => {});
         }
@@ -1549,16 +1593,13 @@ app.post('/update-profile', upload.single('avatar'), async (req, res) => {
     }
 });
 
-/**
- * Получение сообщений группы
- */
+// ===== Получение сообщений группы =====
 app.get('/group-messages/:groupId', async (req, res) => {
     try {
         const groupId = req.params.groupId;
         
         console.log(`📥 Запрос сообщений для группы ID: ${groupId}`);
 
-        // Получаем сообщения группы с информацией об отправителях
         const { data: messages, error } = await supabase
             .from('group_messages')
             .select(`
@@ -1585,7 +1626,6 @@ app.get('/group-messages/:groupId', async (req, res) => {
 
         console.log(`✅ Найдено сообщений: ${messages?.length || 0}`);
 
-        // Форматируем сообщения для отправки клиенту
         const formattedMessages = (messages || []).map(msg => ({
             id: msg.id,
             group_id: msg.group_id,
@@ -1595,7 +1635,6 @@ app.get('/group-messages/:groupId', async (req, res) => {
             message: msg.message || '',
             timestamp: msg.timestamp,
             duration: msg.duration || 0,
-            // Информация о файле, если есть
             files: msg.files ? {
                 id: msg.files.id,
                 file_name: msg.files.file_name,
@@ -1625,7 +1664,6 @@ app.delete('/files/:fileId', async (req, res) => {
     try {
         const { fileId } = req.params;
 
-        // Получаем информацию о файле
         const { data: fileData, error: fileError } = await supabase
             .from('files')
             .select('*')
@@ -1639,14 +1677,12 @@ app.delete('/files/:fileId', async (req, res) => {
             });
         }
 
-        // Удаляем из Supabase Storage
         const deleteResult = await deleteFileFromSupabase(fileData.file_path);
 
         if (!deleteResult.success) {
             console.warn('⚠️ Не удалось удалить файл из хранилища:', deleteResult.error);
         }
 
-        // Удаляем запись из базы данных
         const { error: deleteError } = await supabase
             .from('files')
             .delete()
@@ -1654,7 +1690,6 @@ app.delete('/files/:fileId', async (req, res) => {
 
         if (deleteError) throw deleteError;
 
-        // Удаляем ссылки на файл в сообщениях
         await supabase
             .from('messages')
             .update({ file_id: null })
@@ -1678,12 +1713,12 @@ app.delete('/files/:fileId', async (req, res) => {
     }
 });
 
-/**
- * Получение групп пользователя
- */
+// ===== Получение групп пользователя =====
 app.get('/groups/:userEmail', async (req, res) => {
     try {
         const userEmail = req.params.userEmail.toLowerCase();
+
+        await updateUserActivity(userEmail);
 
         const { data, error } = await supabase
             .from('group_members')
@@ -1702,7 +1737,6 @@ app.get('/groups/:userEmail', async (req, res) => {
 
         if (error) throw error;
 
-        // Получаем количество участников для каждой группы
         const groups = await Promise.all((data || []).map(async (item) => {
             const { count } = await supabase
                 .from('group_members')
@@ -1733,9 +1767,7 @@ app.get('/groups/:userEmail', async (req, res) => {
     }
 });
 
-/**
- * Сохранение пропущенного звонка в базу данных
- */
+// ===== Сохранение пропущенного звонка =====
 app.post('/api/calls/missed/save', async (req, res) => {
     try {
         const { roomId, caller, callerName, receiver, callType, startedAt } = req.body;
@@ -1749,7 +1781,6 @@ app.post('/api/calls/missed/save', async (req, res) => {
 
         console.log(`💾 Сохранение пропущенного звонка в БД: ${caller} -> ${receiver}`);
 
-        // Проверяем, не сохранен ли уже этот звонок
         const { data: existingCall, error: checkError } = await supabase
             .from('missed_calls')
             .select('id')
@@ -1769,7 +1800,6 @@ app.post('/api/calls/missed/save', async (req, res) => {
             });
         }
 
-        // Сохраняем пропущенный звонок
         const { data, error } = await supabase
             .from('missed_calls')
             .insert([{
@@ -1808,23 +1838,22 @@ app.post('/api/calls/missed/save', async (req, res) => {
     }
 });
 
-/**
- * Получение пропущенных звонков пользователя из БД
- */
+// ===== Получение пропущенных звонков =====
 app.get('/api/calls/missed/:email', async (req, res) => {
     try {
         const { email } = req.params;
         const normalizedEmail = email.toLowerCase();
 
         console.log(`📞 Запрос пропущенных звонков для: ${normalizedEmail}`);
+        
+        await updateUserActivity(normalizedEmail);
 
-        // Получаем пропущенные звонки из БД
         const { data, error } = await supabase
             .from('missed_calls')
             .select('*')
             .eq('receiver_email', normalizedEmail)
             .order('started_at', { ascending: false })
-            .limit(100); // Ограничиваем последними 100 звонками
+            .limit(100);
 
         if (error) {
             console.error('❌ Ошибка получения пропущенных звонков:', error);
@@ -1833,7 +1862,6 @@ app.get('/api/calls/missed/:email', async (req, res) => {
 
         console.log(`✅ Найдено пропущенных звонков: ${data?.length || 0}`);
 
-        // Форматируем для клиента
         const missedCalls = (data || []).map(call => ({
             historyId: call.id.toString(),
             roomId: call.room_id,
@@ -1860,9 +1888,7 @@ app.get('/api/calls/missed/:email', async (req, res) => {
     }
 });
 
-/**
- * Отметить пропущенные звонки как прочитанные
- */
+// ===== Отметить пропущенные звонки как прочитанные =====
 app.post('/api/calls/missed/mark-read', async (req, res) => {
     try {
         const { userEmail, callIds } = req.body;
@@ -1882,7 +1908,6 @@ app.post('/api/calls/missed/mark-read', async (req, res) => {
             .eq('receiver_email', userEmail.toLowerCase())
             .eq('is_read', false);
 
-        // Если переданы конкретные ID, обновляем только их
         if (callIds && Array.isArray(callIds) && callIds.length > 0) {
             query = query.in('id', callIds);
         }
@@ -1911,13 +1936,11 @@ app.post('/api/calls/missed/mark-read', async (req, res) => {
     }
 });
 
-/**
- * Удаление старых пропущенных звонков (можно запускать по расписанию)
- */
+// ===== Удаление старых пропущенных звонков =====
 app.delete('/api/calls/missed/cleanup', async (req, res) => {
     try {
         const { days } = req.query;
-        const daysToKeep = parseInt(days) || 30; // По умолчанию храним 30 дней
+        const daysToKeep = parseInt(days) || 30;
 
         const cutoffDate = new Date();
         cutoffDate.setDate(cutoffDate.getDate() - daysToKeep);
@@ -1952,9 +1975,7 @@ app.delete('/api/calls/missed/cleanup', async (req, res) => {
     }
 });
 
-/**
- * Очистка истории чата между пользователями
- */
+// ===== Очистка истории чата =====
 app.post('/clear-chat', async (req, res) => {
     try {
         const { userEmail, friendEmail } = req.body;
@@ -1971,7 +1992,8 @@ app.post('/clear-chat', async (req, res) => {
         
         console.log(`🧹 Очистка чата между ${normalizedUserEmail} и ${normalizedFriendEmail}`);
         
-        // Находим все сообщения между пользователями
+        await updateUserActivity(normalizedUserEmail);
+        
         const { data: messages, error: selectError } = await supabase
             .from('messages')
             .select('id, file_id')
@@ -1985,14 +2007,12 @@ app.post('/clear-chat', async (req, res) => {
         console.log(`📊 Найдено сообщений: ${messages?.length || 0}`);
         
         if (messages && messages.length > 0) {
-            // Собираем все file_id из сообщений
             const fileIds = messages
                 .filter(msg => msg.file_id !== null)
                 .map(msg => msg.file_id);
             
             console.log(`📎 Найдено файлов: ${fileIds.length}`);
             
-            // Удаляем сами сообщения
             const { error: deleteMessagesError } = await supabase
                 .from('messages')
                 .delete()
@@ -2003,11 +2023,9 @@ app.post('/clear-chat', async (req, res) => {
                 throw deleteMessagesError;
             }
             
-            // Удаляем файлы, если они есть
             if (fileIds.length > 0) {
                 for (const fileId of fileIds) {
                     try {
-                        // Получаем информацию о файле
                         const { data: fileData } = await supabase
                             .from('files')
                             .select('file_path')
@@ -2015,14 +2033,12 @@ app.post('/clear-chat', async (req, res) => {
                             .single();
                         
                         if (fileData && fileData.file_path) {
-                            // Удаляем из Supabase Storage
                             await supabase
                                 .storage
                                 .from(supabaseBucketName)
                                 .remove([fileData.file_path]);
                         }
                         
-                        // Удаляем запись из БД
                         await supabase
                             .from('files')
                             .delete()
@@ -2053,9 +2069,7 @@ app.post('/clear-chat', async (req, res) => {
     }
 });
 
-/**
- * Получение информации о файле с проверкой возраста
- */
+// ===== Получение информации о файле =====
 app.get('/files/:fileId', async (req, res) => {
     try {
         const { fileId } = req.params;
@@ -2073,7 +2087,6 @@ app.get('/files/:fileId', async (req, res) => {
             });
         }
 
-        // Проверяем возраст файла (опционально)
         const uploadedAt = new Date(data.uploaded_at);
         const now = new Date();
         const daysOld = Math.floor((now - uploadedAt) / (1000 * 60 * 60 * 24));
@@ -2099,6 +2112,10 @@ app.get('/files/:fileId', async (req, res) => {
 
 // ===== Статус сервера =====
 app.get('/api/status', (req, res) => {
+    const onlineUsers = Array.from(userLastActivity.entries())
+        .filter(([_, lastActivity]) => Date.now() - lastActivity < ACTIVITY_TIMEOUT)
+        .length;
+    
     res.json({
         status: 'online',
         timestamp: new Date().toISOString(),
@@ -2107,7 +2124,12 @@ app.get('/api/status', (req, res) => {
             activeRooms: rooms.size,
             totalUsers: users.size,
             activeCalls: activeCalls.size,
+            onlineUsers: onlineUsers,
             totalCallsToday: getTodayCallsCount()
+        },
+        activityTracking: {
+            timeout: ACTIVITY_TIMEOUT / 1000 / 60 + ' минут',
+            trackedUsers: userLastActivity.size
         }
     });
 });
@@ -2158,7 +2180,7 @@ app.get('/api/rooms/:roomId', (req, res) => {
     });
 });
 
-// ===== Создать комнату (через API) =====
+// ===== Создать комнату =====
 app.post('/api/rooms', (req, res) => {
     const { roomId, roomName, createdBy, type = 'video' } = req.body;
     
@@ -2282,9 +2304,7 @@ app.get('/api/calls/active', (req, res) => {
 
 // ===== ЭНДПОИНТЫ ДЛЯ ЗВОНКОВ =====
 
-/**
- * Инициирование звонка с FCM уведомлением и таймаутом
- */
+// ===== Инициирование звонка =====
 app.post('/api/calls/initiate', async (req, res) => {
     try {
         const { callerEmail, receiverEmail, callType } = req.body;
@@ -2297,6 +2317,8 @@ app.post('/api/calls/initiate', async (req, res) => {
         }
         
         console.log(`📞 Инициирование звонка: ${callerEmail} -> ${receiverEmail}`);
+        
+        await updateUserActivity(callerEmail);
         
         if (callerEmail.toLowerCase() === receiverEmail.toLowerCase()) {
             return res.status(400).json({
@@ -2319,7 +2341,6 @@ app.post('/api/calls/initiate', async (req, res) => {
         
         activeCalls.set(roomId, callData);
         
-        // Отправляем FCM уведомление получателю
         const fcmSent = await sendFCMNotification(
             receiverEmail,
             '📞 Входящий звонок',
@@ -2337,7 +2358,6 @@ app.post('/api/calls/initiate', async (req, res) => {
         
         console.log(`📱 FCM уведомление ${fcmSent ? 'отправлено' : 'не отправлено'}`);
         
-        // Отправляем через Socket.IO для онлайн пользователей
         const receiverSocketId = emailToSocket.get(receiverEmail.toLowerCase());
         if (receiverSocketId) {
             console.log(`📱 Получатель онлайн, socketId: ${receiverSocketId}`);
@@ -2359,17 +2379,14 @@ app.post('/api/calls/initiate', async (req, res) => {
             });
         }
         
-        // УСТАНАВЛИВАЕМ ТАЙМАУТ НА 30 СЕКУНД
         const timeoutId = setTimeout(async () => {
             const call = activeCalls.get(roomId);
             if (call && call.status === 'ringing') {
                 console.log(`⏰ Таймаут звонка ${roomId} - никто не ответил`);
                 
-                // Обновляем статус звонка
                 call.status = 'missed';
                 call.endedAt = new Date().toISOString();
                 
-                // Сохраняем в историю как пропущенный
                 const missedCall = {
                     ...call,
                     endedBy: 'timeout',
@@ -2381,10 +2398,8 @@ app.post('/api/calls/initiate', async (req, res) => {
                 const historyId = 'hist_' + Date.now();
                 callHistory.set(historyId, missedCall);
                 
-                // Удаляем из активных звонков
                 activeCalls.delete(roomId);
                 
-                // Отправляем уведомление звонящему о том, что никто не ответил
                 const callerSocketId = emailToSocket.get(callerEmail.toLowerCase());
                 if (callerSocketId) {
                     io.to(callerSocketId).emit('call-missed', {
@@ -2395,7 +2410,6 @@ app.post('/api/calls/initiate', async (req, res) => {
                     });
                 }
                 
-                // ОТПРАВЛЯЕМ УВЕДОМЛЕНИЕ О ПРОПУЩЕННОМ ЗВОНКЕ ПОЛУЧАТЕЛЮ
                 await sendMissedCallNotification(
                     receiverEmail,
                     callerEmail,
@@ -2404,9 +2418,8 @@ app.post('/api/calls/initiate', async (req, res) => {
                 );
             }
             
-            // Удаляем таймаут из мапы
             callTimeouts.delete(roomId);
-        }, 30000); // 30 секунд
+        }, 30000);
         
         callTimeouts.set(roomId, timeoutId);
         
@@ -2430,9 +2443,7 @@ app.post('/api/calls/initiate', async (req, res) => {
     }
 });
 
-/**
- * Обновленный обработчик принятия звонка
- */
+// ===== Принятие звонка =====
 app.post('/api/calls/accept', async (req, res) => {
     try {
         const { roomId, userEmail } = req.body;
@@ -2443,6 +2454,8 @@ app.post('/api/calls/accept', async (req, res) => {
                 error: 'ID комнаты и email обязательны'
             });
         }
+        
+        await updateUserActivity(userEmail);
         
         const callData = activeCalls.get(roomId);
         
@@ -2460,7 +2473,6 @@ app.post('/api/calls/accept', async (req, res) => {
             });
         }
         
-        // Отменяем таймаут
         const timeoutId = callTimeouts.get(roomId);
         if (timeoutId) {
             clearTimeout(timeoutId);
@@ -2500,9 +2512,7 @@ app.post('/api/calls/accept', async (req, res) => {
     }
 });
 
-/**
- * Обновленный обработчик отклонения звонка
- */
+// ===== Отклонение звонка =====
 app.post('/api/calls/reject', async (req, res) => {
     try {
         const { roomId, userEmail } = req.body;
@@ -2514,10 +2524,11 @@ app.post('/api/calls/reject', async (req, res) => {
             });
         }
         
+        await updateUserActivity(userEmail);
+        
         const callData = activeCalls.get(roomId);
         
         if (callData) {
-            // Отменяем таймаут
             const timeoutId = callTimeouts.get(roomId);
             if (timeoutId) {
                 clearTimeout(timeoutId);
@@ -2535,7 +2546,6 @@ app.post('/api/calls/reject', async (req, res) => {
                 });
             }
             
-            // Сохраняем в историю как отклоненный
             const rejectedCall = {
                 ...callData,
                 status: 'rejected',
@@ -2566,103 +2576,7 @@ app.post('/api/calls/reject', async (req, res) => {
     }
 });
 
-/**
- * Эндпоинт для получения истории пропущенных звонков
- */
-app.get('/api/calls/missed/:email', async (req, res) => {
-    try {
-        const { email } = req.params;
-        const normalizedEmail = email.toLowerCase();
-        
-        const missedCalls = [];
-        
-        for (const [historyId, call] of callHistory.entries()) {
-            if (call.receiver === normalizedEmail && call.status === 'missed') {
-                // Получаем информацию о звонящем
-                const callerInfo = await getUserInfo(call.caller);
-                const callerName = callerInfo ? 
-                    `${callerInfo.first_name || ''} ${callerInfo.last_name || ''}`.trim() || call.caller : 
-                    call.caller;
-                
-                missedCalls.push({
-                    historyId,
-                    ...call,
-                    callerName
-                });
-            }
-        }
-        
-        // Сортируем по дате (новые сверху)
-        missedCalls.sort((a, b) => new Date(b.startedAt) - new Date(a.startedAt));
-        
-        res.json({
-            success: true,
-            missedCalls: missedCalls.slice(0, 50) // Последние 50 звонков
-        });
-        
-    } catch (error) {
-        console.error('❌ Ошибка получения пропущенных звонков:', error);
-        res.status(500).json({
-            success: false,
-            error: error.message
-        });
-    }
-});
-
-/**
- * Проверить FCM токен пользователя
- */
-app.get('/api/fcm/check/:email', async (req, res) => {
-    try {
-        const { email } = req.params;
-        const normalizedEmail = email.toLowerCase();
-        
-        console.log(`🔍 Проверка FCM токена для: ${normalizedEmail}`);
-        
-        const { data, error } = await supabase
-            .from('user_fcm_tokens')
-            .select('*')
-            .eq('user_email', normalizedEmail)
-            .order('created_at', { ascending: false });
-            
-        if (error) {
-            console.error('❌ Ошибка запроса к Supabase:', error);
-            throw error;
-        }
-        
-        const userInfo = await getUserInfo(normalizedEmail);
-        
-        const response = {
-            success: true,
-            email: normalizedEmail,
-            exists: userInfo !== null,
-            hasToken: data && data.length > 0,
-            tokenCount: data ? data.length : 0,
-            tokens: data ? data.map(t => ({
-                token_preview: t.fcm_token.substring(0, 20) + '...',
-                created_at: t.created_at,
-                updated_at: t.updated_at
-            })) : [],
-            message: data && data.length > 0 
-                ? `✅ Токен найден: ${data[0].fcm_token.substring(0, 20)}...` 
-                : '❌ Токен не найден'
-        };
-        
-        console.log(response.message);
-        
-        res.json(response);
-    } catch (error) {
-        console.error('❌ Ошибка проверки FCM токена:', error);
-        res.status(500).json({ 
-            success: false, 
-            error: error.message 
-        });
-    }
-});
-
-/**
- * Завершить звонок
- */
+// ===== Завершение звонка =====
 app.post('/api/calls/end', async (req, res) => {
     try {
         const { roomId, userEmail } = req.body;
@@ -2672,6 +2586,10 @@ app.post('/api/calls/end', async (req, res) => {
                 success: false,
                 error: 'ID комнаты обязателен'
             });
+        }
+        
+        if (userEmail) {
+            await updateUserActivity(userEmail);
         }
         
         const callData = activeCalls.get(roomId);
@@ -2721,9 +2639,7 @@ app.post('/api/calls/end', async (req, res) => {
     }
 });
 
-/**
- * Получить информацию о звонке
- */
+// ===== Получить информацию о звонке =====
 app.get('/api/calls/:roomId', async (req, res) => {
     try {
         const { roomId } = req.params;
@@ -2751,12 +2667,12 @@ app.get('/api/calls/:roomId', async (req, res) => {
     }
 });
 
-/**
- * Получить активные звонки пользователя
- */
+// ===== Получить активные звонки пользователя =====
 app.get('/api/calls/user/:email', async (req, res) => {
     try {
         const { email } = req.params;
+        
+        await updateUserActivity(email);
         
         const userCalls = [];
         
@@ -2784,11 +2700,149 @@ app.get('/api/calls/user/:email', async (req, res) => {
     }
 });
 
+// ===== ЭНДПОИНТЫ ДЛЯ УПРАВЛЕНИЯ СТАТУСАМИ =====
+
+// ===== Получить статус пользователя =====
+app.get('/api/status/:email', async (req, res) => {
+    try {
+        const email = req.params.email.toLowerCase();
+        
+        await updateUserActivity(email);
+        
+        const lastActivity = userLastActivity.get(email);
+        const isOnline = lastActivity ? (Date.now() - lastActivity) < ACTIVITY_TIMEOUT : false;
+        
+        const { data, error } = await supabase
+            .from('user_presence')
+            .select('status, last_seen, socket_id, server_id')
+            .eq('user_email', email)
+            .maybeSingle();
+        
+        res.json({
+            success: true,
+            email: email,
+            status: isOnline ? 'online' : 'offline',
+            lastActivity: lastActivity ? new Date(lastActivity).toISOString() : null,
+            database: data || null,
+            isOnline: isOnline,
+            activityTimeout: ACTIVITY_TIMEOUT / 1000 / 60 + ' минут'
+        });
+    } catch (error) {
+        console.error('❌ Ошибка получения статуса:', error);
+        res.status(500).json({
+            success: false,
+            error: error.message
+        });
+    }
+});
+
+// ===== Получить статусы нескольких пользователей =====
+app.post('/api/status/batch', async (req, res) => {
+    try {
+        const { emails } = req.body;
+        
+        if (!emails || !Array.isArray(emails)) {
+            return res.status(400).json({
+                success: false,
+                error: 'Требуется массив emails'
+            });
+        }
+        
+        const now = Date.now();
+        const statuses = {};
+        
+        for (const email of emails) {
+            const normalizedEmail = email.toLowerCase();
+            const lastActivity = userLastActivity.get(normalizedEmail);
+            const isOnline = lastActivity ? (now - lastActivity) < ACTIVITY_TIMEOUT : false;
+            
+            statuses[normalizedEmail] = {
+                status: isOnline ? 'online' : 'offline',
+                lastActivity: lastActivity ? new Date(lastActivity).toISOString() : null
+            };
+        }
+        
+        res.json({
+            success: true,
+            statuses: statuses,
+            timestamp: new Date().toISOString()
+        });
+    } catch (error) {
+        console.error('❌ Ошибка получения статусов:', error);
+        res.status(500).json({
+            success: false,
+            error: error.message
+        });
+    }
+});
+
+// ===== Принудительно обновить активность пользователя =====
+app.post('/api/activity/ping', async (req, res) => {
+    try {
+        const { email } = req.body;
+        
+        if (!email) {
+            return res.status(400).json({
+                success: false,
+                error: 'Email обязателен'
+            });
+        }
+        
+        await updateUserActivity(email);
+        
+        res.json({
+            success: true,
+            message: 'Активность обновлена',
+            email: email.toLowerCase(),
+            timestamp: new Date().toISOString()
+        });
+    } catch (error) {
+        console.error('❌ Ошибка обновления активности:', error);
+        res.status(500).json({
+            success: false,
+            error: error.message
+        });
+    }
+});
+
+// ===== Получить всех онлайн пользователей =====
+app.get('/api/status/online/all', async (req, res) => {
+    try {
+        const now = Date.now();
+        const onlineUsers = [];
+        
+        for (const [email, lastActivity] of userLastActivity.entries()) {
+            if (now - lastActivity < ACTIVITY_TIMEOUT) {
+                const userInfo = await getUserInfo(email);
+                onlineUsers.push({
+                    email: email,
+                    name: userInfo ? `${userInfo.first_name || ''} ${userInfo.last_name || ''}`.trim() : email,
+                    lastActivity: new Date(lastActivity).toISOString(),
+                    activeSeconds: Math.round((now - lastActivity) / 1000)
+                });
+            }
+        }
+        
+        onlineUsers.sort((a, b) => b.lastActivity.localeCompare(a.lastActivity));
+        
+        res.json({
+            success: true,
+            total: onlineUsers.length,
+            users: onlineUsers,
+            timeout: ACTIVITY_TIMEOUT / 1000 / 60 + ' минут'
+        });
+    } catch (error) {
+        console.error('❌ Ошибка получения онлайн пользователей:', error);
+        res.status(500).json({
+            success: false,
+            error: error.message
+        });
+    }
+});
+
 // ===== FCM ЭНДПОИНТЫ =====
 
-/**
- * Сохранить FCM токен пользователя
- */
+// ===== Сохранить FCM токен =====
 app.post('/api/fcm/token', async (req, res) => {
     try {
         const { userEmail, fcmToken } = req.body;
@@ -2799,6 +2853,8 @@ app.post('/api/fcm/token', async (req, res) => {
                 error: 'Email и токен обязательны' 
             });
         }
+
+        await updateUserActivity(userEmail);
 
         const { error } = await supabase
             .from('user_fcm_tokens')
@@ -2827,9 +2883,58 @@ app.post('/api/fcm/token', async (req, res) => {
     }
 });
 
-/**
- * Тестовый эндпоинт для отправки FCM уведомления
- */
+// ===== Проверить FCM токен =====
+app.get('/api/fcm/check/:email', async (req, res) => {
+    try {
+        const { email } = req.params;
+        const normalizedEmail = email.toLowerCase();
+        
+        console.log(`🔍 Проверка FCM токена для: ${normalizedEmail}`);
+        
+        await updateUserActivity(normalizedEmail);
+        
+        const { data, error } = await supabase
+            .from('user_fcm_tokens')
+            .select('*')
+            .eq('user_email', normalizedEmail)
+            .order('created_at', { ascending: false });
+            
+        if (error) {
+            console.error('❌ Ошибка запроса к Supabase:', error);
+            throw error;
+        }
+        
+        const userInfo = await getUserInfo(normalizedEmail);
+        
+        const response = {
+            success: true,
+            email: normalizedEmail,
+            exists: userInfo !== null,
+            hasToken: data && data.length > 0,
+            tokenCount: data ? data.length : 0,
+            tokens: data ? data.map(t => ({
+                token_preview: t.fcm_token.substring(0, 20) + '...',
+                created_at: t.created_at,
+                updated_at: t.updated_at
+            })) : [],
+            message: data && data.length > 0 
+                ? `✅ Токен найден: ${data[0].fcm_token.substring(0, 20)}...` 
+                : '❌ Токен не найден'
+        };
+        
+        console.log(response.message);
+        
+        res.json(response);
+    } catch (error) {
+        console.error('❌ Ошибка проверки FCM токена:', error);
+        res.status(500).json({ 
+            success: false, 
+            error: error.message 
+        });
+    }
+});
+
+// ===== Тестовый эндпоинт для FCM =====
 app.post('/api/fcm/test', async (req, res) => {
     try {
         const { userEmail, title, body } = req.body;
@@ -2840,6 +2945,8 @@ app.post('/api/fcm/test', async (req, res) => {
                 error: 'Email обязателен' 
             });
         }
+
+        await updateUserActivity(userEmail);
 
         const result = await sendFCMNotification(
             userEmail,
@@ -2863,9 +2970,7 @@ app.post('/api/fcm/test', async (req, res) => {
 
 // ===== РЕГИСТРАЦИЯ И ПОЛЬЗОВАТЕЛИ =====
 
-/**
- * Регистрация обычного пользователя
- */
+// ===== Регистрация обычного пользователя =====
 app.post('/register', async (req, res) => {
     try {
         const { email, firstName, lastName } = req.body;
@@ -2896,6 +3001,8 @@ app.post('/register', async (req, res) => {
 
         if (error) throw error;
 
+        await updateUserActivity(email);
+
         res.json({
             success: true,
             message: 'Пользователь успешно зарегистрирован',
@@ -2907,13 +3014,13 @@ app.post('/register', async (req, res) => {
     }
 });
 
-/**
- * Получение информации о пользователе
- */
+// ===== Получение информации о пользователе =====
 app.get('/user/:email', async (req, res) => {
     try {
         const email = decodeURIComponent(req.params.email).toLowerCase();
         console.log('🔍 Поиск пользователя по email:', email);
+
+        await updateUserActivity(email);
 
         const user = await getUserInfo(email);
 
@@ -2938,9 +3045,7 @@ app.get('/user/:email', async (req, res) => {
     }
 });
 
-/**
- * Получение всех пользователей
- */
+// ===== Получение всех пользователей =====
 app.get('/users', async (req, res) => {
     try {
         const [regularResult, berestaResult] = await Promise.all([
@@ -2966,14 +3071,14 @@ app.get('/users', async (req, res) => {
     }
 });
 
-/**
- * Получение чатов пользователя
- */
+// ===== Получение чатов пользователя =====
 app.get('/chats/:userEmail', async (req, res) => {
     try {
         const userEmail = req.params.userEmail.toLowerCase();
 
         console.log('🔄 Получение чатов для:', userEmail);
+
+        await updateUserActivity(userEmail);
 
         const { data: friends, error: friendsError } = await supabase
             .from('friends')
@@ -3029,15 +3134,14 @@ app.get('/chats/:userEmail', async (req, res) => {
     }
 });
 
-/**
- * Получение сообщений между пользователями
- */
+// ===== Получение сообщений между пользователями =====
 app.get('/messages/:userEmail/:friendEmail', async (req, res) => {
     try {
         const userEmail = req.params.userEmail.toLowerCase();
         const friendEmail = req.params.friendEmail.toLowerCase();
 
-        // Получаем сообщения с информацией о файлах
+        await updateUserActivity(userEmail);
+
         const { data, error } = await supabase
             .from('messages')
             .select(`
@@ -3059,9 +3163,7 @@ app.get('/messages/:userEmail/:friendEmail', async (req, res) => {
     }
 });
 
-/**
- * Отправка текстового сообщения
- */
+// ===== Отправка текстового сообщения =====
 app.post('/send-message', async (req, res) => {
     try {
         const { senderEmail, receiverEmail, message, duration } = req.body;
@@ -3083,6 +3185,8 @@ app.post('/send-message', async (req, res) => {
             });
         }
 
+        await updateUserActivity(senderEmail);
+
         const { data, error } = await supabase
             .from('messages')
             .insert([{
@@ -3097,7 +3201,6 @@ app.post('/send-message', async (req, res) => {
 
         await addToChatsAutomatically(senderEmail, receiverEmail);
 
-        // Отправляем FCM уведомление получателю
         const senderName = `${senderInfo.first_name || ''} ${senderInfo.last_name || ''}`.trim() || senderEmail;
         await sendFCMNotificationForMessage(
             receiverEmail,
@@ -3108,7 +3211,6 @@ app.post('/send-message', async (req, res) => {
             false
         );
 
-        // Отправляем через Socket.IO если получатель онлайн
         const receiverSocketId = emailToSocket.get(receiverEmail.toLowerCase());
         if (receiverSocketId) {
             io.to(receiverSocketId).emit('new_message', {
@@ -3129,9 +3231,7 @@ app.post('/send-message', async (req, res) => {
     }
 });
 
-/**
- * Отправка группового сообщения
- */
+// ===== Отправка группового сообщения =====
 app.post('/send-group-message', async (req, res) => {
     try {
         const { groupId, senderEmail, message, duration } = req.body;
@@ -3151,6 +3251,8 @@ app.post('/send-group-message', async (req, res) => {
             });
         }
 
+        await updateUserActivity(senderEmail);
+
         const { data, error } = await supabase
             .from('group_messages')
             .insert([{
@@ -3163,14 +3265,12 @@ app.post('/send-group-message', async (req, res) => {
 
         if (error) throw error;
 
-        // Получаем название группы
         const { data: groupData } = await supabase
             .from('groups')
             .select('name')
             .eq('id', groupId)
             .single();
 
-        // Получаем всех участников группы
         const { data: members, error: membersError } = await supabase
             .from('group_members')
             .select('user_email')
@@ -3180,7 +3280,6 @@ app.post('/send-group-message', async (req, res) => {
             const senderName = `${senderInfo.first_name || ''} ${senderInfo.last_name || ''}`.trim() || senderEmail;
             const groupName = groupData?.name || 'Группа';
             
-            // Отправляем уведомления всем участникам кроме отправителя
             for (const member of members) {
                 if (member.user_email !== senderEmail.toLowerCase()) {
                     await sendFCMNotificationForMessage(
@@ -3207,9 +3306,7 @@ app.post('/send-group-message', async (req, res) => {
     }
 });
 
-/**
- * Добавление друга
- */
+// ===== Добавление друга =====
 app.post('/add-friend', async (req, res) => {
     try {
         const { userEmail, friendEmail } = req.body;
@@ -3237,6 +3334,8 @@ app.post('/add-friend', async (req, res) => {
                 error: 'Пользователи не найдены'
             });
         }
+
+        await updateUserActivity(normalizedUserEmail);
 
         await supabase
             .from('friends')
@@ -3314,11 +3413,32 @@ app.get('/api/debug/storage', async (req, res) => {
     }
 });
 
-// ===== СТАТИЧЕСКИЕ ФАЙЛЫ (для обратной совместимости) =====
+app.get('/api/debug/activity', (req, res) => {
+    const now = Date.now();
+    const activityData = Array.from(userLastActivity.entries()).map(([email, lastActivity]) => ({
+        email,
+        lastActivity: new Date(lastActivity).toISOString(),
+        isOnline: now - lastActivity < ACTIVITY_TIMEOUT,
+        secondsAgo: Math.round((now - lastActivity) / 1000)
+    }));
+    
+    res.json({
+        success: true,
+        total: activityData.length,
+        users: activityData,
+        timeout: ACTIVITY_TIMEOUT / 1000 / 60 + ' минут'
+    });
+});
+
+// ===== СТАТИЧЕСКИЕ ФАЙЛЫ =====
 app.use('/uploads', express.static(uploadDir));
 
 // ===== ВЕБ-ИНТЕРФЕЙС =====
 app.get('/', (req, res) => {
+    const onlineUsers = Array.from(userLastActivity.entries())
+        .filter(([_, lastActivity]) => Date.now() - lastActivity < ACTIVITY_TIMEOUT)
+        .length;
+    
     res.send(`
     <!DOCTYPE html>
     <html>
@@ -3331,6 +3451,10 @@ app.get('/', (req, res) => {
             .online { color: green; }
             .storage { color: blue; }
             .feature { margin-left: 20px; }
+            .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 10px; margin-top: 20px; }
+            .stat-card { background: white; padding: 15px; border-radius: 5px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); }
+            .stat-value { font-size: 24px; font-weight: bold; color: #333; }
+            .stat-label { font-size: 14px; color: #666; }
         </style>
     </head>
     <body>
@@ -3340,10 +3464,27 @@ app.get('/', (req, res) => {
             <p><strong>Server ID:</strong> ${SERVER_ID}</p>
             <p><strong>Firebase:</strong> ${firebaseInitialized ? '✅ Активен' : '❌ Не настроен'}</p>
             <p><strong>Supabase Storage:</strong> <span class="storage">✅ Активен (bucket: ${supabaseBucketName})</span></p>
-            <p><strong>Active Rooms:</strong> ${rooms.size}</p>
-            <p><strong>Active Calls:</strong> ${activeCalls.size}</p>
-            <p><strong>Total Users:</strong> ${users.size}</p>
         </div>
+        
+        <div class="stats">
+            <div class="stat-card">
+                <div class="stat-value">${onlineUsers}</div>
+                <div class="stat-label">Онлайн пользователей</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-value">${rooms.size}</div>
+                <div class="stat-label">Активных комнат</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-value">${activeCalls.size}</div>
+                <div class="stat-label">Активных звонков</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-value">${userLastActivity.size}</div>
+                <div class="stat-label">Отслеживаемых пользователей</div>
+            </div>
+        </div>
+        
         <div class="features">
             <h2>📋 Доступные эндпоинты:</h2>
             <ul>
@@ -3356,6 +3497,14 @@ app.get('/', (req, res) => {
                 <li><strong>POST /send-group-message</strong> - Отправка группового сообщения</li>
                 <li><strong>GET /chats/:userEmail</strong> - Чаты пользователя</li>
                 <li><strong>GET /messages/:userEmail/:friendEmail</strong> - История переписки</li>
+            </ul>
+            
+            <h3>👤 Эндпоинты для статусов:</h3>
+            <ul>
+                <li><strong>GET /api/status/:email</strong> - Статус пользователя</li>
+                <li><strong>POST /api/status/batch</strong> - Статусы нескольких пользователей</li>
+                <li><strong>GET /api/status/online/all</strong> - Все онлайн пользователи</li>
+                <li><strong>POST /api/activity/ping</strong> - Обновить активность</li>
             </ul>
         </div>
     </body>
@@ -3379,10 +3528,30 @@ server.listen(PORT, '0.0.0.0', async () => {
     console.log(`📧 Маппинг email->socketId активен`);
     console.log(`🔥 Firebase: ${firebaseInitialized ? 'активен' : 'не настроен'}`);
     console.log(`🧹 Автоочистка файлов: каждые 24 часа (файлы старше 10 дней)`);
+    console.log(`👤 Отслеживание активности: включено (таймаут ${ACTIVITY_TIMEOUT/1000/60} минут)`);
     console.log('='.repeat(60) + '\n');
     
-    // Запускаем планировщик очистки файлов
+    await ensureBucketExists();
+    
     startFileCleanupScheduler();
+    
+    try {
+        const { data: activeUsers } = await supabase
+            .from('user_presence')
+            .select('user_email, last_seen')
+            .eq('status', 'online')
+            .gte('last_seen', new Date(Date.now() - 60000).toISOString());
+        
+        if (activeUsers) {
+            const now = Date.now();
+            for (const user of activeUsers) {
+                userLastActivity.set(user.user_email, now - 10000);
+            }
+            console.log(`👥 Восстановлена активность для ${activeUsers.length} пользователей`);
+        }
+    } catch (error) {
+        console.error('❌ Ошибка загрузки активных пользователей:', error);
+    }
 });
 
 // ===== Graceful shutdown =====
@@ -3399,7 +3568,6 @@ process.on('SIGINT', async () => {
         console.error('❌ Ошибка очистки присутствия:', error);
     }
     
-    // Очистка временной папки при остановке
     try {
         const files = fs.readdirSync(tempDir);
         for (const file of files) {
