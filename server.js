@@ -620,17 +620,98 @@ async function sendFCMNotification(userEmail, title, body, data) {
                 title: title,
                 body: body,
                 type: 'call',
-                click_action: 'OPEN_CALL_ACTIVITY'
+                click_action: 'OPEN_CALL_ACTIVITY',
+                timestamp: new Date().toISOString()
             },
             token: userData[0].fcm_token,
             android: {
                 priority: 'high',
+                notification: {
+                    title: title,
+                    body: body,
+                    channelId: 'calls',
+                    priority: 'high',
+                    visibility: 'public',
+                    clickAction: 'OPEN_CALL_ACTIVITY',
+                    sound: 'default',
+                    defaultSound: true,
+                    defaultVibrate: true,
+                    vibrate: [1000, 1000, 1000, 1000],
+                    color: '#F44336',
+                    icon: 'ic_call',
+                    tag: data.roomId || `call_${Date.now()}`
+                },
+                fcm_options: {
+                    analytics_label: 'call_notification'
+                }
             },
+            apns: {
+                payload: {
+                    aps: {
+                        alert: {
+                            title: title,
+                            body: body
+                        },
+                        sound: 'default',
+                        badge: 1,
+                        category: 'CALL_CATEGORY',
+                        'mutable-content': 1
+                    }
+                },
+                fcm_options: {
+                    analytics_label: 'call_notification_ios'
+                }
+            },
+            webpush: {
+                notification: {
+                    title: title,
+                    body: body,
+                    icon: '/icon.png',
+                    badge: '/badge.png',
+                    vibrate: [200, 100, 200],
+                    data: data,
+                    actions: [
+                        {
+                            action: 'accept',
+                            title: 'Принять'
+                        },
+                        {
+                            action: 'reject',
+                            title: 'Отклонить'
+                        }
+                    ],
+                    requireInteraction: true,
+                    silent: false
+                },
+                fcm_options: {
+                    link: `/call/${data.roomId}`,
+                    analytics_label: 'call_notification_web'
+                }
+            }
         };
 
+        // Добавляем полноэкранный intent для Android
+        if (userData[0].fcm_token.startsWith('c') || userData[0].fcm_token.startsWith('e')) {
+            message.android.notification = {
+                ...message.android.notification,
+                notificationCount: 1,
+                notificationPriority: 'PRIORITY_HIGH',
+                visibility: 'PUBLIC',
+                notificationTimeout: 30000,
+                fullScreenIntent: {
+                    className: 'ru.beresta.messenger.FullScreenCallActivity',
+                    packageName: 'ru.beresta.messenger',
+                    flags: 'FLAG_ACTIVITY_NEW_TASK|FLAG_ACTIVITY_CLEAR_TOP',
+                    extras: data
+                }
+            };
+        }
+
         const response = await admin.messaging().send(message);
-        console.log(`✅ FCM уведомление о звонке отправлено для ${userEmail}`);
+        console.log(`✅ FCM уведомление отправлено для ${userEmail}`);
+        console.log(`📱 Детали звонка: ${title} - ${body}`);
         return true;
+
     } catch (error) {
         console.error('❌ Ошибка отправки FCM:', error);
         
@@ -680,19 +761,116 @@ async function sendFCMNotificationForMessage(receiverEmail, senderName, senderEm
                 isGroup: isGroup.toString(),
                 groupId: groupId ? groupId.toString() : '',
                 groupName: groupName || '',
-                click_action: 'OPEN_CHAT_ACTIVITY',
                 title: title,
-                body: body
+                body: body,
+                click_action: 'OPEN_CHAT_ACTIVITY',
+                timestamp: new Date().toISOString()
             },
             token: userData[0].fcm_token,
             android: {
                 priority: 'high',
+                notification: {
+                    title: title,
+                    body: body,
+                    channelId: 'messages',
+                    priority: 'high',
+                    visibility: 'public',
+                    clickAction: 'OPEN_CHAT_ACTIVITY',
+                    sound: 'default',
+                    defaultSound: true,
+                    defaultVibrate: true,
+                    vibrate: [1000, 1000, 1000],
+                    color: '#2196F3',
+                    icon: 'ic_notification',
+                    tag: messageId.toString()
+                },
+                fcm_options: {
+                    analytics_label: 'message_notification'
+                }
             },
+            apns: {
+                payload: {
+                    aps: {
+                        alert: {
+                            title: title,
+                            body: body
+                        },
+                        sound: 'default',
+                        badge: 1,
+                        category: 'MESSAGE_CATEGORY',
+                        'mutable-content': 1
+                    }
+                },
+                fcm_options: {
+                    analytics_label: 'message_notification_ios'
+                }
+            },
+            webpush: {
+                notification: {
+                    title: title,
+                    body: body,
+                    icon: '/icon.png',
+                    badge: '/badge.png',
+                    vibrate: [200, 100, 200],
+                    data: {
+                        type: 'message',
+                        senderName: senderName,
+                        senderEmail: senderEmail,
+                        messageId: messageId,
+                        isGroup: isGroup,
+                        groupId: groupId,
+                        groupName: groupName
+                    },
+                    actions: [
+                        {
+                            action: 'open',
+                            title: 'Открыть'
+                        },
+                        {
+                            action: 'reply',
+                            title: 'Ответить'
+                        }
+                    ],
+                    requireInteraction: true,
+                    silent: false
+                },
+                fcm_options: {
+                    link: isGroup ? `/group/${groupId}` : `/chat/${senderEmail}`,
+                    analytics_label: 'message_notification_web'
+                }
+            }
         };
+
+        // Добавляем полноэкранный intent для Android, как у звонков
+        if (userData[0].fcm_token.startsWith('c') || userData[0].fcm_token.startsWith('e')) { // Android токены обычно начинаются с c или e
+            messageData.android.notification = {
+                ...messageData.android.notification,
+                notificationCount: 1,
+                notificationPriority: 'PRIORITY_HIGH',
+                visibility: 'PUBLIC',
+                notificationTimeout: 30000,
+                fullScreenIntent: {
+                    className: 'ru.beresta.messenger.FullScreenMessageActivity',
+                    packageName: 'ru.beresta.messenger',
+                    flags: 'FLAG_ACTIVITY_NEW_TASK|FLAG_ACTIVITY_CLEAR_TOP',
+                    extras: {
+                        senderName: senderName,
+                        senderEmail: senderEmail,
+                        message: message,
+                        isGroup: isGroup,
+                        messageId: messageId,
+                        groupId: groupId,
+                        groupName: groupName
+                    }
+                }
+            };
+        }
 
         const response = await admin.messaging().send(messageData);
         console.log(`✅ FCM уведомление о сообщении отправлено для ${receiverEmail}`);
+        console.log(`📱 Детали: ${title} - ${body}`);
         return true;
+
     } catch (error) {
         console.error('❌ Ошибка отправки FCM для сообщения:', error);
         
