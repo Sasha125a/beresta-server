@@ -751,6 +751,7 @@ async function sendFCMNotificationForMessage(receiverEmail, senderName, senderEm
         const title = isGroup ? `💬 ${groupName || 'Групповой чат'}` : '💬 Новое сообщение';
         const body = `${senderName}: ${typeof message === 'string' ? message.substring(0, 50) : 'Файл'}${typeof message === 'string' && message.length > 50 ? '...' : ''}`;
 
+        // Базовая структура сообщения
         const messageData = {
             data: {
                 type: 'message',
@@ -772,7 +773,7 @@ async function sendFCMNotificationForMessage(receiverEmail, senderName, senderEm
                 notification: {
                     title: title,
                     body: body,
-                    channelId: 'messages',
+                    channelId: 'messages', // Важно: должен совпадать с каналом в Android коде
                     priority: 'high',
                     visibility: 'public',
                     clickAction: 'OPEN_CHAT_ACTIVITY',
@@ -783,92 +784,15 @@ async function sendFCMNotificationForMessage(receiverEmail, senderName, senderEm
                     color: '#2196F3',
                     icon: 'ic_notification',
                     tag: messageId.toString()
-                },
-                fcm_options: {
-                    analytics_label: 'message_notification'
-                }
-            },
-            apns: {
-                payload: {
-                    aps: {
-                        alert: {
-                            title: title,
-                            body: body
-                        },
-                        sound: 'default',
-                        badge: 1,
-                        category: 'MESSAGE_CATEGORY',
-                        'mutable-content': 1
-                    }
-                },
-                fcm_options: {
-                    analytics_label: 'message_notification_ios'
-                }
-            },
-            webpush: {
-                notification: {
-                    title: title,
-                    body: body,
-                    icon: '/icon.png',
-                    badge: '/badge.png',
-                    vibrate: [200, 100, 200],
-                    data: {
-                        type: 'message',
-                        senderName: senderName,
-                        senderEmail: senderEmail,
-                        messageId: messageId,
-                        isGroup: isGroup,
-                        groupId: groupId,
-                        groupName: groupName
-                    },
-                    actions: [
-                        {
-                            action: 'open',
-                            title: 'Открыть'
-                        },
-                        {
-                            action: 'reply',
-                            title: 'Ответить'
-                        }
-                    ],
-                    requireInteraction: true,
-                    silent: false
-                },
-                fcm_options: {
-                    link: isGroup ? `/group/${groupId}` : `/chat/${senderEmail}`,
-                    analytics_label: 'message_notification_web'
                 }
             }
         };
 
-        // Добавляем полноэкранный intent для Android, как у звонков
-        if (userData[0].fcm_token.startsWith('c') || userData[0].fcm_token.startsWith('e')) { // Android токены обычно начинаются с c или e
-            messageData.android.notification = {
-                ...messageData.android.notification,
-                notificationCount: 1,
-                notificationPriority: 'PRIORITY_HIGH',
-                visibility: 'PUBLIC',
-                notificationTimeout: 30000,
-                fullScreenIntent: {
-                    className: 'ru.beresta.messenger.FullScreenMessageActivity',
-                    packageName: 'ru.beresta.messenger',
-                    flags: 'FLAG_ACTIVITY_NEW_TASK|FLAG_ACTIVITY_CLEAR_TOP',
-                    extras: {
-                        senderName: senderName,
-                        senderEmail: senderEmail,
-                        message: message,
-                        isGroup: isGroup,
-                        messageId: messageId,
-                        groupId: groupId,
-                        groupName: groupName
-                    }
-                }
-            };
-        }
-
+        // Отправляем сообщение
         const response = await admin.messaging().send(messageData);
         console.log(`✅ FCM уведомление о сообщении отправлено для ${receiverEmail}`);
         console.log(`📱 Детали: ${title} - ${body}`);
+        console.log(`📱 Response:`, response);
         return true;
 
     } catch (error) {
@@ -885,7 +809,6 @@ async function sendFCMNotificationForMessage(receiverEmail, senderName, senderEm
         return false;
     }
 }
-
 // ===== ФУНКЦИИ ДЛЯ АВТОМАТИЧЕСКОЙ ОЧИСТКИ ФАЙЛОВ =====
 
 async function cleanupOldFiles() {
