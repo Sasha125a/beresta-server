@@ -3231,6 +3231,96 @@ app.post('/send-message', async (req, res) => {
     }
 });
 
+/**
+ * Обновление длительности аудио-сообщения
+ */
+app.post('/update-message-duration', async (req, res) => {
+    try {
+        const { messageId, duration } = req.body;
+
+        const { error } = await supabase
+            .from('messages')
+            .update({ duration: duration })
+            .eq('id', messageId);
+
+        if (error) throw error;
+
+        res.json({ success: true });
+    } catch (error) {
+        console.error('❌ Ошибка обновления длительности:', error);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+/**
+ * Обновление длительности группового аудио-сообщения
+ */
+app.post('/update-group-message-duration', async (req, res) => {
+    try {
+        const { messageId, duration } = req.body;
+
+        const { error } = await supabase
+            .from('group_messages')
+            .update({ duration: duration })
+            .eq('id', messageId);
+
+        if (error) throw error;
+
+        res.json({ success: true });
+    } catch (error) {
+        console.error('❌ Ошибка обновления длительности группового:', error);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+/**
+ * Получение информации об истечении срока аудио
+ */
+app.get('/audio/:type/:messageId/expiration', async (req, res) => {
+    try {
+        const { type, messageId } = req.params;
+        
+        let query;
+        if (type === 'group') {
+            query = supabase
+                .from('group_messages')
+                .select('timestamp, files!group_messages_file_id_fkey(file_name, file_path, uploaded_at)')
+                .eq('id', messageId)
+                .single();
+        } else {
+            query = supabase
+                .from('messages')
+                .select('timestamp, files!messages_file_id_fkey(file_name, file_path, uploaded_at)')
+                .eq('id', messageId)
+                .single();
+        }
+
+        const { data, error } = await query;
+
+        if (error) throw error;
+
+        const uploadedAt = data.files?.uploaded_at || data.timestamp;
+        const uploadedDate = new Date(uploadedAt);
+        const now = new Date();
+        const ageInDays = Math.floor((now - uploadedDate) / (1000 * 60 * 60 * 24));
+        const daysLeft = Math.max(0, 10 - ageInDays);
+        const willBeDeletedAt = new Date(uploadedDate.getTime() + 10 * 24 * 60 * 60 * 1000);
+
+        res.json({
+            success: true,
+            uploadedAt: uploadedAt,
+            ageInDays: ageInDays,
+            daysLeft: daysLeft,
+            willBeDeletedAt: willBeDeletedAt.toISOString(),
+            isExpired: ageInDays >= 10
+        });
+
+    } catch (error) {
+        console.error('❌ Ошибка получения информации об удалении:', error);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
 // ===== Отправка группового сообщения =====
 app.post('/send-group-message', async (req, res) => {
     try {
