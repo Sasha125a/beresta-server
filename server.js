@@ -327,6 +327,24 @@ async function sendMissedCallNotification(receiverEmail, callerEmail, callType, 
         
         console.log(`📱 Отправка уведомления о пропущенном звонке для ${receiverEmail} от ${callerName}`);
         
+        // СОХРАНЯЕМ В БАЗУ ДАННЫХ
+        try {
+            await supabase
+                .from('missed_calls')
+                .insert([{
+                    room_id: roomId,
+                    caller_email: callerEmail.toLowerCase(),
+                    caller_name: callerName,
+                    receiver_email: receiverEmail.toLowerCase(),
+                    call_type: callType || 'audio',
+                    started_at: new Date().toISOString(),
+                    is_read: false
+                }]);
+            console.log(`💾 Пропущенный звонок сохранен в БД`);
+        } catch (dbError) {
+            console.error('❌ Ошибка сохранения в БД:', dbError);
+        }
+        
         // Отправляем через FCM
         const fcmSent = await sendFCMNotification(
             receiverEmail,
@@ -1711,6 +1729,225 @@ app.get('/groups/:userEmail', async (req, res) => {
         res.status(500).json({ 
             success: false, 
             error: 'Internal server error' 
+        });
+    }
+});
+
+/**
+ * Сохранение пропущенного звонка в базу данных
+ */
+app.post('/api/calls/missed/save', async (req, res) => {
+    try {
+        const { roomId, caller, callerName, receiver, callType, startedAt } = req.body;
+
+        if (!roomId || !caller || !receiver) {
+            return res.status(400).json({
+                success: false,
+                error: 'Недостаточно данных для сохранения пропущенного звонка'
+            });
+        }
+
+        console.log(`💾 Сохранение пропущенного звонка в БД: ${caller} -> ${receiver}`);
+
+        // Проверяем, не сохранен ли уже этот звонок
+        const { data: existingCall, error: checkError } = await supabase
+            .from('missed_calls')
+            .select('id')
+            .eq('room_id', roomId)
+            .maybeSingle();
+
+        if (checkError) {
+            console.error('❌ Ошибка проверки существующего звонка:', checkError);
+        }
+
+        if (existingCall) {
+            console.log('⚠️ Звонок уже сохранен в БД');
+            return res.json({
+                success: true,
+                message: 'Звонок уже существует',
+                missedCallId: existingCall.id
+            });
+        }
+
+        // Сохраняем пропущенный звонок
+        const { data, error } = await supabase
+            .from('missed_calls')
+            .insert([{
+                room_id: roomId,
+                caller_email: caller.toLowerCase(),
+                caller_name: callerName || caller,
+                receiver_email: receiver.toLowerCase(),
+                call_type: callType || 'audio',
+                started_at: startedAt || new Date().toISOString(),
+                is_read: false
+            }])
+            .select();
+
+        if (error) {
+            console.error('❌ Ошибка сохранения пропущенного звонка:', error);
+            return res.status(500).json({
+                success: false,
+                error: 'Ошибка сохранения в БД'
+            });
+        }
+
+        console.log(`✅ Пропущенный звонок сохранен с ID: ${data[0].id}`);
+
+        res.json({
+            success: true,
+            missedCallId: data[0].id,
+            message: 'Пропущенный звонок сохранен'
+        });
+
+    } catch (error) {
+        console.error('❌ Ошибка в /api/calls/missed/save:', error);
+        res.status(500).json({
+            success: false,
+            error: error.message
+        });
+    }
+});
+
+/**
+ * Получение пропущенных звонков пользователя из БД
+ */
+app.get('/api/calls/missed/:email', async (req, res) => {
+    try {
+        const { email } = req.params;
+        const normalizedEmail = email.toLowerCase();
+
+        console.log(`📞 Запрос пропущенных звонков для: ${normalizedEmail}`);
+
+        // Получаем пропущенные звонки из БД
+        const { data, error } = await supabase
+            .from('missed_calls')
+            .select('*')
+            .eq('receiver_email', normalizedEmail)
+            .order('started_at', { ascending: false })
+            .limit(100); // Ограничиваем последними 100 звонками
+
+        if (error) {
+            console.error('❌ Ошибка получения пропущенных звонков:', error);
+            throw error;
+        }
+
+        console.log(`✅ Найдено пропущенных звонков: ${data?.length || 0}`);
+
+        // Форматируем для клиента
+        const missedCalls = (data || []).map(call => ({
+            historyId: call.id.toString(),
+            roomId: call.room_id,
+            caller: call.caller_email,
+            callerName: call.caller_name,
+            callType: call.call_type,
+            startedAt: call.started_at,
+            status: 'missed',
+            isRead: call.is_read,
+            createdAt: call.created_at
+        }));
+
+        res.json({
+            success: true,
+            missedCalls: missedCalls
+        });
+
+    } catch (error) {
+        console.error('❌ Ошибка получения пропущенных звонков:', error);
+        res.status(500).json({
+            success: false,
+            error: error.message
+        });
+    }
+});
+
+/**
+ * Отметить пропущенные звонки как прочитанные
+ */
+app.post('/api/calls/missed/mark-read', async (req, res) => {
+    try {
+        const { userEmail, callIds } = req.body;
+
+        if (!userEmail) {
+            return res.status(400).json({
+                success: false,
+                error: 'Email обязателен'
+            });
+        }
+
+        console.log(`📖 Отметка пропущенных звонков как прочитанных для: ${userEmail}`);
+
+        let query = supabase
+            .from('missed_calls')
+            .update({ is_read: true })
+            .eq('receiver_email', userEmail.toLowerCase())
+            .eq('is_read', false);
+
+        // Если переданы конкретные ID, обновляем только их
+        if (callIds && Array.isArray(callIds) && callIds.length > 0) {
+            query = query.in('id', callIds);
+        }
+
+        const { data, error } = await query.select();
+
+        if (error) {
+            console.error('❌ Ошибка обновления статуса:', error);
+            throw error;
+        }
+
+        console.log(`✅ Отмечено как прочитанные: ${data?.length || 0} звонков`);
+
+        res.json({
+            success: true,
+            updated: data?.length || 0,
+            message: 'Статус обновлен'
+        });
+
+    } catch (error) {
+        console.error('❌ Ошибка отметки звонков как прочитанных:', error);
+        res.status(500).json({
+            success: false,
+            error: error.message
+        });
+    }
+});
+
+/**
+ * Удаление старых пропущенных звонков (можно запускать по расписанию)
+ */
+app.delete('/api/calls/missed/cleanup', async (req, res) => {
+    try {
+        const { days } = req.query;
+        const daysToKeep = parseInt(days) || 30; // По умолчанию храним 30 дней
+
+        const cutoffDate = new Date();
+        cutoffDate.setDate(cutoffDate.getDate() - daysToKeep);
+
+        console.log(`🧹 Очистка пропущенных звонков старше ${daysToKeep} дней`);
+
+        const { data, error } = await supabase
+            .from('missed_calls')
+            .delete()
+            .lt('started_at', cutoffDate.toISOString())
+            .select();
+
+        if (error) {
+            console.error('❌ Ошибка очистки:', error);
+            throw error;
+        }
+
+        console.log(`✅ Удалено старых пропущенных звонков: ${data?.length || 0}`);
+
+        res.json({
+            success: true,
+            deleted: data?.length || 0,
+            message: `Удалено звонков старше ${daysToKeep} дней`
+        });
+
+    } catch (error) {
+        console.error('❌ Ошибка очистки пропущенных звонков:', error);
+        res.status(500).json({
+            success: false,
+            error: error.message
         });
     }
 });
