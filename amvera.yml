@@ -1,0 +1,14 @@
+meta:
+  environment: node
+  toolchain:
+    name: npm
+    version: 18
+
+build:
+  # Команда для установки зависимостей (npm install выполняется автоматически)
+  additionalCommands: ""  # можно оставить пустым, если нет доп. команд
+
+run:
+  scriptName: server.js
+  containerPort: 3000  # Ваш сервер слушает порт 3000
+  persistenceMount: /data  # Для постоянного хранения, если понадобится
