@@ -36,7 +36,8 @@ const io = socketIo(server, {
     pingInterval: 25000
 });
 
-const callTimeouts = new Map();
+// Хранилище для таймаутов звонков
+const callTimeouts = new Map(); // roomId -> { timeoutId, createdAt }
 
 // ==================== FIREBASE ADMIN ====================
 let firebaseInitialized = false;
@@ -156,24 +157,19 @@ async function checkInactiveUsers() {
 setInterval(checkInactiveUsers, ACTIVITY_CHECK_INTERVAL);
 
 // ==================== MIDDLEWARE ДЛЯ ОТСЛЕЖИВАНИЯ АКТИВНОСТИ ====================
-// Middleware для отслеживания активности по HTTP запросам
 app.use(async (req, res, next) => {
-    // Пропускаем статические файлы и health checks
     if (req.path.startsWith('/uploads') || req.path === '/health' || req.path === '/' || req.path.startsWith('/api/debug')) {
         return next();
     }
     
-    // Ищем email в разных местах запроса
     let email = null;
     
-    // В query параметрах
     if (req.query.email) {
         email = req.query.email;
     }
     else if (req.query.userEmail) {
         email = req.query.userEmail;
     }
-    // В body
     else if (req.body) {
         if (req.body.email) email = req.body.email;
         else if (req.body.userEmail) email = req.body.userEmail;
@@ -181,18 +177,15 @@ app.use(async (req, res, next) => {
         else if (req.body.callerEmail) email = req.body.callerEmail;
         else if (req.body.receiverEmail) email = req.body.receiverEmail;
     }
-    // В params
     else if (req.params) {
         if (req.params.email) email = req.params.email;
         else if (req.params.userEmail) email = req.params.userEmail;
     }
-    // В headers
     else if (req.headers['x-user-email']) {
         email = req.headers['x-user-email'];
     }
     
     if (email) {
-        // Асинхронно обновляем активность (не ждем завершения)
         updateUserActivity(email).catch(err => 
             console.error('❌ Ошибка обновления активности:', err)
         );
@@ -320,9 +313,7 @@ function getFileType(mimetype, filename) {
     
     const ext = path.extname(filename).toLowerCase();
     if (['.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp'].includes(ext)) return 'image';
-    // ВИДЕО - убираем .3gp
     if (['.mp4', '.avi', '.mov', '.mkv', '.webm'].includes(ext)) return 'video';
-    // АУДИО - добавляем .3gp сюда
     if (['.mp3', '.wav', '.aac', '.flac', '.ogg', '.m4a', '.3gp'].includes(ext)) return 'audio';
     if (['.pdf', '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx', '.txt'].includes(ext)) return 'document';
     if (['.zip', '.rar', '.7z', '.tar', '.gz'].includes(ext)) return 'archive';
@@ -670,11 +661,9 @@ async function sendFCMNotificationForMessage(receiverEmail, senderName, senderEm
         const title = isGroup ? `💬 ${groupName || 'Групповой чат'}` : '💬 Новое сообщение';
         const body = `${senderName}: ${typeof message === 'string' ? message.substring(0, 50) : 'Файл'}${typeof message === 'string' && message.length > 50 ? '...' : ''}`;
 
-        // ОСНОВНОЕ ИЗМЕНЕНИЕ: Добавляем notification секцию с высоким приоритетом
         const messageData = {
             token: userData[0].fcm_token,
             
-            // Data секция (для обработки в приложении)
             data: {
                 type: 'message',
                 senderName: senderName,
@@ -690,18 +679,16 @@ async function sendFCMNotificationForMessage(receiverEmail, senderName, senderEm
                 timestamp: new Date().toISOString()
             },
             
-            // NOTIFICATION секция (для всплывающего уведомления)
             notification: {
                 title: title,
                 body: body,
-                image: undefined // Можно добавить URL картинки если нужно
+                image: undefined
             },
             
-            // Android специфичные настройки
             android: {
                 priority: 'high',
                 notification: {
-                    channelId: 'messages', // Должен совпадать с каналом в Android
+                    channelId: 'messages',
                     priority: 'high',
                     visibility: 'public',
                     clickAction: 'OPEN_CHAT_ACTIVITY',
@@ -713,17 +700,14 @@ async function sendFCMNotificationForMessage(receiverEmail, senderName, senderEm
                     icon: 'ic_notification',
                     tag: messageId.toString(),
                     sticky: false,
-                    // Эти параметры делают уведомление всплывающим
                     notificationCount: 1,
                     ticker: title + ': ' + body,
                     localOnly: false,
-                    notificationPriority: 1, // PRIORITY_HIGH
-                    visibility: 1, // VISIBILITY_PUBLIC
-                    channelId: 'messages'
+                    notificationPriority: 1,
+                    visibility: 1
                 }
             },
             
-            // APNs для iOS
             apns: {
                 payload: {
                     aps: {
@@ -740,10 +724,7 @@ async function sendFCMNotificationForMessage(receiverEmail, senderName, senderEm
             }
         };
 
-        // Добавляем полноэкранный intent для Android 8.0+
-        // Это гарантирует, что уведомление будет всплывающим
         if (userData[0].fcm_token && (userData[0].fcm_token.startsWith('c') || userData[0].fcm_token.startsWith('e'))) {
-            // Создаем Intent для открытия приложения
             const intent = {
                 action: 'OPEN_CHAT_ACTIVITY',
                 type: 'text/plain',
@@ -761,21 +742,13 @@ async function sendFCMNotificationForMessage(receiverEmail, senderName, senderEm
             };
             
             messageData.android.notification.clickIntent = intent;
-            
-            // Устанавливаем fullScreenIntent для heads-up уведомления
             messageData.android.notification.fullScreenIntent = intent;
         }
 
-        console.log(`📦 Отправка FCM сообщения для ${receiverEmail}:`, JSON.stringify({
-            title: title,
-            body: body,
-            hasNotification: !!messageData.notification,
-            hasAndroid: !!messageData.android
-        }, null, 2));
+        console.log(`📦 Отправка FCM сообщения для ${receiverEmail}`);
 
         const response = await admin.messaging().send(messageData);
         console.log(`✅ FCM уведомление о сообщении отправлено для ${receiverEmail}`);
-        console.log(`📱 Response:`, response);
         return true;
 
     } catch (error) {
@@ -1211,6 +1184,14 @@ app.get('/health', async (req, res) => {
             activityTracking: {
                 timeout: ACTIVITY_TIMEOUT / 1000 / 60 + ' минут',
                 trackedUsers: userLastActivity.size
+            },
+            callTimeouts: {
+                active: callTimeouts.size,
+                timeouts: Array.from(callTimeouts.entries()).map(([roomId, data]) => ({
+                    roomId,
+                    createdAt: data.createdAt,
+                    age: Date.now() - new Date(data.createdAt).getTime()
+                }))
             },
             timestamp: new Date().toISOString()
         });
@@ -2217,6 +2198,9 @@ app.get('/api/status', (req, res) => {
         activityTracking: {
             timeout: ACTIVITY_TIMEOUT / 1000 / 60 + ' минут',
             trackedUsers: userLastActivity.size
+        },
+        callTimeouts: {
+            active: callTimeouts.size
         }
     });
 });
@@ -2389,7 +2373,7 @@ app.get('/api/calls/active', (req, res) => {
     });
 });
 
-// ===== ЭНДПОИНТЫ ДЛЯ ЗВОНКОВ =====
+// ==================== ИСПРАВЛЕННЫЕ ЭНДПОИНТЫ ДЛЯ ЗВОНКОВ ====================
 
 // ===== Инициирование звонка =====
 app.post('/api/calls/initiate', async (req, res) => {
@@ -2428,6 +2412,75 @@ app.post('/api/calls/initiate', async (req, res) => {
         
         activeCalls.set(roomId, callData);
         
+        // ИСПРАВЛЕНИЕ: Улучшенное сохранение таймаута
+        const timeoutId = setTimeout(async () => {
+            const call = activeCalls.get(roomId);
+            
+            // Проверяем, что звонок все еще в статусе ringing
+            if (call && call.status === 'ringing') {
+                console.log(`⏰ Таймаут звонка ${roomId} - никто не ответил (прошло 30 секунд)`);
+                
+                // Обновляем статус звонка
+                call.status = 'missed';
+                call.endedAt = new Date().toISOString();
+                
+                // Сохраняем в историю
+                const missedCall = {
+                    ...call,
+                    endedBy: 'timeout',
+                    endTime: call.endedAt,
+                    status: 'missed',
+                    duration: 0
+                };
+                
+                const historyId = 'hist_' + Date.now();
+                callHistory.set(historyId, missedCall);
+                
+                // Удаляем из активных звонков
+                activeCalls.delete(roomId);
+                
+                // Уведомляем звонящего
+                const callerSocketId = emailToSocket.get(callerEmail.toLowerCase());
+                if (callerSocketId) {
+                    io.to(callerSocketId).emit('call-missed', {
+                        type: 'call-missed',
+                        roomId: roomId,
+                        receiver: receiverEmail,
+                        timestamp: new Date().toISOString()
+                    });
+                }
+                
+                // Отправляем уведомление о пропущенном звонке
+                await sendMissedCallNotification(
+                    receiverEmail,
+                    callerEmail,
+                    callType || 'audio',
+                    roomId
+                );
+            }
+            
+            // Всегда удаляем таймаут из хранилища после выполнения
+            callTimeouts.delete(roomId);
+            console.log(`⏱️ Таймаут для комнаты ${roomId} удален из хранилища`);
+            
+        }, 30000);
+        
+        // Сохраняем таймаут с дополнительной информацией для отладки
+        callTimeouts.set(roomId, {
+            timeoutId,
+            createdAt: new Date().toISOString(),
+            caller: callerEmail,
+            receiver: receiverEmail
+        });
+        
+        console.log(`⏱️ Таймаут установлен для комнаты ${roomId}:`, {
+            timeoutId: timeoutId,
+            createdAt: new Date().toISOString(),
+            caller: callerEmail,
+            receiver: receiverEmail
+        });
+        
+        // Отправляем FCM уведомление
         const fcmSent = await sendFCMNotification(
             receiverEmail,
             '📞 Входящий звонок',
@@ -2445,6 +2498,7 @@ app.post('/api/calls/initiate', async (req, res) => {
         
         console.log(`📱 FCM уведомление ${fcmSent ? 'отправлено' : 'не отправлено'}`);
         
+        // Отправляем сокет-уведомление, если получатель онлайн
         const receiverSocketId = emailToSocket.get(receiverEmail.toLowerCase());
         if (receiverSocketId) {
             console.log(`📱 Получатель онлайн, socketId: ${receiverSocketId}`);
@@ -2466,50 +2520,6 @@ app.post('/api/calls/initiate', async (req, res) => {
             });
         }
         
-        const timeoutId = setTimeout(async () => {
-            const call = activeCalls.get(roomId);
-            if (call && call.status === 'ringing') {
-                console.log(`⏰ Таймаут звонка ${roomId} - никто не ответил`);
-                
-                call.status = 'missed';
-                call.endedAt = new Date().toISOString();
-                
-                const missedCall = {
-                    ...call,
-                    endedBy: 'timeout',
-                    endTime: new Date().toISOString(),
-                    status: 'missed',
-                    duration: 0
-                };
-                
-                const historyId = 'hist_' + Date.now();
-                callHistory.set(historyId, missedCall);
-                
-                activeCalls.delete(roomId);
-                
-                const callerSocketId = emailToSocket.get(callerEmail.toLowerCase());
-                if (callerSocketId) {
-                    io.to(callerSocketId).emit('call-missed', {
-                        type: 'call-missed',
-                        roomId: roomId,
-                        receiver: receiverEmail,
-                        timestamp: new Date().toISOString()
-                    });
-                }
-                
-                await sendMissedCallNotification(
-                    receiverEmail,
-                    callerEmail,
-                    callType || 'audio',
-                    roomId
-                );
-            }
-            
-            callTimeouts.delete(roomId);
-        }, 30000);
-        
-        callTimeouts.set(roomId, timeoutId);
-        
         console.log(`✅ Звонок инициирован, комната: ${roomId}, таймаут установлен на 30 сек`);
         
         res.json({
@@ -2530,7 +2540,7 @@ app.post('/api/calls/initiate', async (req, res) => {
     }
 });
 
-// ===== Принятие звонка =====
+// ===== Принятие звонка (ИСПРАВЛЕНО) =====
 app.post('/api/calls/accept', async (req, res) => {
     try {
         const { roomId, userEmail } = req.body;
@@ -2542,8 +2552,11 @@ app.post('/api/calls/accept', async (req, res) => {
             });
         }
         
+        console.log(`📞 Принятие звонка: ${userEmail} в комнате ${roomId}`);
+        
         await updateUserActivity(userEmail);
         
+        // Получаем данные звонка
         const callData = activeCalls.get(roomId);
         
         if (!callData) {
@@ -2553,25 +2566,36 @@ app.post('/api/calls/accept', async (req, res) => {
             });
         }
         
-        if (callData.receiver !== userEmail) {
+        // Проверяем, что пользователь - получатель звонка
+        if (callData.receiver.toLowerCase() !== userEmail.toLowerCase()) {
             return res.status(403).json({
                 success: false,
                 error: 'Вы не можете принять этот звонок'
             });
         }
         
-        const timeoutId = callTimeouts.get(roomId);
-        if (timeoutId) {
-            clearTimeout(timeoutId);
+        // ИСПРАВЛЕНИЕ: Очищаем таймаут ДО изменения статуса
+        const timeoutData = callTimeouts.get(roomId);
+        if (timeoutData) {
+            console.log(`⏱️ Найден таймаут для комнаты ${roomId}:`, timeoutData);
+            
+            // Очищаем таймаут
+            clearTimeout(timeoutData.timeoutId);
             callTimeouts.delete(roomId);
+            
+            console.log(`⏱️ Таймаут для комнаты ${roomId} очищен`);
+        } else {
+            console.log(`⚠️ Таймаут для комнаты ${roomId} не найден в хранилище`);
         }
         
+        // Теперь меняем статус звонка
         callData.status = 'connected';
         callData.participants.push(userEmail);
         callData.answeredAt = new Date().toISOString();
         activeCalls.set(roomId, callData);
         
-        const callerSocketId = emailToSocket.get(callData.caller);
+        // Уведомляем звонящего
+        const callerSocketId = emailToSocket.get(callData.caller.toLowerCase());
         
         if (callerSocketId) {
             io.to(callerSocketId).emit('call-accepted', {
@@ -2580,9 +2604,11 @@ app.post('/api/calls/accept', async (req, res) => {
                 receiver: userEmail,
                 timestamp: new Date().toISOString()
             });
+            console.log(`📱 Уведомление об принятии отправлено звонящему ${callData.caller}`);
         }
         
-        console.log(`✅ Звонок ${roomId} принят пользователем ${userEmail}`);
+        console.log(`✅ Звонок ${roomId} ПРИНЯТ пользователем ${userEmail}`);
+        console.log(`📊 Статус звонка обновлен: ringing -> connected`);
         
         res.json({
             success: true,
@@ -2599,7 +2625,7 @@ app.post('/api/calls/accept', async (req, res) => {
     }
 });
 
-// ===== Отклонение звонка =====
+// ===== Отклонение звонка (ИСПРАВЛЕНО) =====
 app.post('/api/calls/reject', async (req, res) => {
     try {
         const { roomId, userEmail } = req.body;
@@ -2611,18 +2637,24 @@ app.post('/api/calls/reject', async (req, res) => {
             });
         }
         
+        console.log(`❌ Отклонение звонка: ${userEmail} в комнате ${roomId}`);
+        
         await updateUserActivity(userEmail);
         
+        // Получаем данные звонка
         const callData = activeCalls.get(roomId);
         
         if (callData) {
-            const timeoutId = callTimeouts.get(roomId);
-            if (timeoutId) {
-                clearTimeout(timeoutId);
+            // ИСПРАВЛЕНИЕ: Очищаем таймаут
+            const timeoutData = callTimeouts.get(roomId);
+            if (timeoutData) {
+                clearTimeout(timeoutData.timeoutId);
                 callTimeouts.delete(roomId);
+                console.log(`⏱️ Таймаут для комнаты ${roomId} очищен при отклонении`);
             }
             
-            const callerSocketId = emailToSocket.get(callData.caller);
+            // Уведомляем звонящего
+            const callerSocketId = emailToSocket.get(callData.caller.toLowerCase());
             
             if (callerSocketId) {
                 io.to(callerSocketId).emit('call-rejected', {
@@ -2633,6 +2665,7 @@ app.post('/api/calls/reject', async (req, res) => {
                 });
             }
             
+            // Сохраняем в историю
             const rejectedCall = {
                 ...callData,
                 status: 'rejected',
@@ -2644,10 +2677,13 @@ app.post('/api/calls/reject', async (req, res) => {
             const historyId = 'hist_' + Date.now();
             callHistory.set(historyId, rejectedCall);
             
+            // Удаляем из активных звонков
             activeCalls.delete(roomId);
+            
+            console.log(`❌ Звонок ${roomId} ОТКЛОНЕН пользователем ${userEmail}`);
+        } else {
+            console.log(`⚠️ Звонок ${roomId} не найден при отклонении`);
         }
-        
-        console.log(`❌ Звонок ${roomId} отклонен пользователем ${userEmail}`);
         
         res.json({
             success: true,
@@ -2663,495 +2699,6 @@ app.post('/api/calls/reject', async (req, res) => {
     }
 });
 
-// ===== ЭНДПОИНТЫ ДЛЯ НАСТРОЕК КОНФИДЕНЦИАЛЬНОСТИ =====
-
-// ===== Получить настройки конфиденциальности пользователя =====
-app.get('/api/privacy/settings/:email', async (req, res) => {
-    try {
-        const email = req.params.email.toLowerCase();
-
-        await updateUserActivity(email);
-
-        // Проверяем существование пользователя
-        const user = await getUserInfo(email);
-        if (!user) {
-            return res.status(404).json({
-                success: false,
-                error: 'Пользователь не найден'
-            });
-        }
-
-        // Получаем настройки
-        let { data: settings, error } = await supabase
-            .from('privacy_settings')
-            .select('*')
-            .eq('user_email', email)
-            .maybeSingle();
-
-        if (error) throw error;
-
-        // Если настроек нет, создаем с значениями по умолчанию
-        if (!settings) {
-            const { data: newSettings, error: insertError } = await supabase
-                .from('privacy_settings')
-                .insert([{
-                    user_email: email,
-                    is_online_status_visible: true,
-                    is_last_seen_visible: true,
-                    is_profile_photo_visible: true,
-                    is_read_receipts_enabled: true
-                }])
-                .select()
-                .single();
-
-            if (insertError) throw insertError;
-            settings = newSettings;
-        }
-
-        // Получаем количество заблокированных пользователей
-        const { count, error: countError } = await supabase
-            .from('blocked_users')
-            .select('*', { count: 'exact', head: true })
-            .eq('user_email', email);
-
-        if (countError) throw countError;
-
-        res.json({
-            success: true,
-            settings: {
-                isOnlineStatusVisible: settings.is_online_status_visible,
-                isLastSeenVisible: settings.is_last_seen_visible,
-                isProfilePhotoVisible: settings.is_profile_photo_visible,
-                isReadReceiptsEnabled: settings.is_read_receipts_enabled,
-                blockedUsersCount: count || 0
-            }
-        });
-
-    } catch (error) {
-        console.error('❌ Ошибка получения настроек конфиденциальности:', error);
-        res.status(500).json({
-            success: false,
-            error: error.message
-        });
-    }
-});
-
-// ===== Обновить настройки конфиденциальности =====
-app.post('/api/privacy/settings/update', async (req, res) => {
-    try {
-        const { 
-            userEmail, 
-            isOnlineStatusVisible, 
-            isLastSeenVisible, 
-            isProfilePhotoVisible, 
-            isReadReceiptsEnabled 
-        } = req.body;
-
-        if (!userEmail) {
-            return res.status(400).json({
-                success: false,
-                error: 'Email обязателен'
-            });
-        }
-
-        const normalizedEmail = userEmail.toLowerCase();
-
-        await updateUserActivity(normalizedEmail);
-
-        // Проверяем существование пользователя
-        const user = await getUserInfo(normalizedEmail);
-        if (!user) {
-            return res.status(404).json({
-                success: false,
-                error: 'Пользователь не найден'
-            });
-        }
-
-        // Проверяем, существуют ли настройки
-        const { data: existingSettings } = await supabase
-            .from('privacy_settings')
-            .select('id')
-            .eq('user_email', normalizedEmail)
-            .maybeSingle();
-
-        let result;
-        
-        if (existingSettings) {
-            // Обновляем существующие настройки
-            const { data, error } = await supabase
-                .from('privacy_settings')
-                .update({
-                    is_online_status_visible: isOnlineStatusVisible !== undefined ? isOnlineStatusVisible : true,
-                    is_last_seen_visible: isLastSeenVisible !== undefined ? isLastSeenVisible : true,
-                    is_profile_photo_visible: isProfilePhotoVisible !== undefined ? isProfilePhotoVisible : true,
-                    is_read_receipts_enabled: isReadReceiptsEnabled !== undefined ? isReadReceiptsEnabled : true
-                })
-                .eq('user_email', normalizedEmail)
-                .select()
-                .single();
-
-            if (error) throw error;
-            result = data;
-        } else {
-            // Создаем новые настройки
-            const { data, error } = await supabase
-                .from('privacy_settings')
-                .insert([{
-                    user_email: normalizedEmail,
-                    is_online_status_visible: isOnlineStatusVisible !== undefined ? isOnlineStatusVisible : true,
-                    is_last_seen_visible: isLastSeenVisible !== undefined ? isLastSeenVisible : true,
-                    is_profile_photo_visible: isProfilePhotoVisible !== undefined ? isProfilePhotoVisible : true,
-                    is_read_receipts_enabled: isReadReceiptsEnabled !== undefined ? isReadReceiptsEnabled : true
-                }])
-                .select()
-                .single();
-
-            if (error) throw error;
-            result = data;
-        }
-
-        console.log(`✅ Настройки конфиденциальности обновлены для ${normalizedEmail}`);
-
-        res.json({
-            success: true,
-            message: 'Настройки сохранены',
-            settings: {
-                isOnlineStatusVisible: result.is_online_status_visible,
-                isLastSeenVisible: result.is_last_seen_visible,
-                isProfilePhotoVisible: result.is_profile_photo_visible,
-                isReadReceiptsEnabled: result.is_read_receipts_enabled
-            }
-        });
-
-    } catch (error) {
-        console.error('❌ Ошибка обновления настроек конфиденциальности:', error);
-        res.status(500).json({
-            success: false,
-            error: error.message
-        });
-    }
-});
-
-// ===== Получить список заблокированных пользователей =====
-app.get('/api/privacy/blocked/:email', async (req, res) => {
-    try {
-        const email = req.params.email.toLowerCase();
-
-        await updateUserActivity(email);
-
-        const { data, error } = await supabase
-            .from('blocked_users')
-            .select(`
-                blocked_user_email,
-                blocked_at,
-                regular_users!blocked_users_blocked_user_email_fkey (
-                    first_name,
-                    last_name,
-                    email
-                )
-            `)
-            .eq('user_email', email)
-            .order('blocked_at', { ascending: false });
-
-        if (error) throw error;
-
-        const blockedUsers = (data || []).map(item => ({
-            email: item.blocked_user_email,
-            name: item.regular_users ? 
-                `${item.regular_users.first_name || ''} ${item.regular_users.last_name || ''}`.trim() : 
-                item.blocked_user_email,
-            blockedAt: item.blocked_at
-        }));
-
-        res.json({
-            success: true,
-            blockedUsers
-        });
-
-    } catch (error) {
-        console.error('❌ Ошибка получения заблокированных пользователей:', error);
-        res.status(500).json({
-            success: false,
-            error: error.message
-        });
-    }
-});
-
-// ===== Заблокировать пользователя =====
-app.post('/api/privacy/blocked/add', async (req, res) => {
-    try {
-        const { userEmail, blockedUserEmail } = req.body;
-
-        if (!userEmail || !blockedUserEmail) {
-            return res.status(400).json({
-                success: false,
-                error: 'Email пользователя и блокируемого пользователя обязательны'
-            });
-        }
-
-        const normalizedUserEmail = userEmail.toLowerCase();
-        const normalizedBlockedEmail = blockedUserEmail.toLowerCase();
-
-        if (normalizedUserEmail === normalizedBlockedEmail) {
-            return res.status(400).json({
-                success: false,
-                error: 'Нельзя заблокировать самого себя'
-            });
-        }
-
-        await updateUserActivity(normalizedUserEmail);
-
-        // Проверяем существование блокируемого пользователя
-        const blockedUser = await getUserInfo(normalizedBlockedEmail);
-        if (!blockedUser) {
-            return res.status(404).json({
-                success: false,
-                error: 'Блокируемый пользователь не найден'
-            });
-        }
-
-        // Добавляем в список заблокированных
-        const { data, error } = await supabase
-            .from('blocked_users')
-            .upsert({
-                user_email: normalizedUserEmail,
-                blocked_user_email: normalizedBlockedEmail
-            }, {
-                onConflict: 'user_email,blocked_user_email',
-                ignoreDuplicates: true
-            })
-            .select();
-
-        if (error) throw error;
-
-        console.log(`🔨 Пользователь ${normalizedUserEmail} заблокировал ${normalizedBlockedEmail}`);
-
-        res.json({
-            success: true,
-            message: 'Пользователь заблокирован'
-        });
-
-    } catch (error) {
-        console.error('❌ Ошибка блокировки пользователя:', error);
-        res.status(500).json({
-            success: false,
-            error: error.message
-        });
-    }
-});
-
-// ===== Разблокировать пользователя =====
-app.delete('/api/privacy/blocked/remove', async (req, res) => {
-    try {
-        const { userEmail, blockedUserEmail } = req.body;
-
-        if (!userEmail || !blockedUserEmail) {
-            return res.status(400).json({
-                success: false,
-                error: 'Email пользователя и блокируемого пользователя обязательны'
-            });
-        }
-
-        const normalizedUserEmail = userEmail.toLowerCase();
-        const normalizedBlockedEmail = blockedUserEmail.toLowerCase();
-
-        await updateUserActivity(normalizedUserEmail);
-
-        const { error } = await supabase
-            .from('blocked_users')
-            .delete()
-            .eq('user_email', normalizedUserEmail)
-            .eq('blocked_user_email', normalizedBlockedEmail);
-
-        if (error) throw error;
-
-        console.log(`✅ Пользователь ${normalizedUserEmail} разблокировал ${normalizedBlockedEmail}`);
-
-        res.json({
-            success: true,
-            message: 'Пользователь разблокирован'
-        });
-
-    } catch (error) {
-        console.error('❌ Ошибка разблокировки пользователя:', error);
-        res.status(500).json({
-            success: false,
-            error: error.message
-        });
-    }
-});
-
-// ===== Запрос на экспорт данных =====
-app.post('/api/privacy/export/request', async (req, res) => {
-    try {
-        const { userEmail } = req.body;
-
-        if (!userEmail) {
-            return res.status(400).json({
-                success: false,
-                error: 'Email обязателен'
-            });
-        }
-
-        const normalizedEmail = userEmail.toLowerCase();
-
-        await updateUserActivity(normalizedEmail);
-
-        // Создаем запрос на экспорт
-        const { data, error } = await supabase
-            .from('data_export_requests')
-            .insert([{
-                user_email: normalizedEmail,
-                status: 'pending'
-            }])
-            .select()
-            .single();
-
-        if (error) throw error;
-
-        console.log(`📦 Запрос на экспорт данных от ${normalizedEmail}`);
-
-        // Здесь можно запустить асинхронную задачу для подготовки данных
-        // Например, через очередь задач
-        prepareDataExport(normalizedEmail, data.id);
-
-        res.json({
-            success: true,
-            message: 'Запрос на экспорт данных принят',
-            requestId: data.id,
-            estimatedTime: '48 часов'
-        });
-
-    } catch (error) {
-        console.error('❌ Ошибка создания запроса на экспорт:', error);
-        res.status(500).json({
-            success: false,
-            error: error.message
-        });
-    }
-});
-
-// ===== Запрос на удаление данных =====
-app.post('/api/privacy/delete/request', async (req, res) => {
-    try {
-        const { userEmail } = req.body;
-
-        if (!userEmail) {
-            return res.status(400).json({
-                success: false,
-                error: 'Email обязателен'
-            });
-        }
-
-        const normalizedEmail = userEmail.toLowerCase();
-
-        await updateUserActivity(normalizedEmail);
-
-        // Создаем запрос на удаление
-        const { data, error } = await supabase
-            .from('data_deletion_requests')
-            .insert([{
-                user_email: normalizedEmail,
-                status: 'pending'
-            }])
-            .select()
-            .single();
-
-        if (error) throw error;
-
-        console.log(`🗑️ Запрос на удаление данных от ${normalizedEmail}`);
-
-        res.json({
-            success: true,
-            message: 'Запрос на удаление данных принят',
-            requestId: data.id
-        });
-
-    } catch (error) {
-        console.error('❌ Ошибка создания запроса на удаление:', error);
-        res.status(500).json({
-            success: false,
-            error: error.message
-        });
-    }
-});
-
-// ===== Вспомогательная функция для подготовки экспорта данных =====
-async function prepareDataExport(userEmail, requestId) {
-    // Это асинхронная функция, которая будет выполняться в фоне
-    try {
-        console.log(`🔄 Начало подготовки экспорта данных для ${userEmail}`);
-
-        // Обновляем статус на "processing"
-        await supabase
-            .from('data_export_requests')
-            .update({ status: 'processing' })
-            .eq('id', requestId);
-
-        // Собираем данные пользователя
-        const userData = await getUserInfo(userEmail);
-        
-        // Получаем сообщения пользователя
-        const { data: messages } = await supabase
-            .from('messages')
-            .select('*')
-            .or(`sender_email.eq.${userEmail},receiver_email.eq.${userEmail}`)
-            .order('timestamp');
-
-        // Получаем групповые сообщения
-        const { data: groupMessages } = await supabase
-            .from('group_messages')
-            .select('*')
-            .eq('sender_email', userEmail)
-            .order('timestamp');
-
-        // Получаем файлы
-        const { data: files } = await supabase
-            .from('files')
-            .select('*')
-            .eq('sender_email', userEmail);
-
-        // Формируем JSON с данными
-        const exportData = {
-            user: userData,
-            messages: messages || [],
-            groupMessages: groupMessages || [],
-            files: files || [],
-            exportedAt: new Date().toISOString()
-        };
-
-        // Сохраняем в файл и загружаем в Supabase Storage
-        const fileName = `export_${userEmail}_${Date.now()}.json`;
-        const filePath = `exports/${fileName}`;
-        
-        // Здесь код для сохранения файла в Supabase Storage
-        // ...
-
-        // Обновляем статус запроса
-        await supabase
-            .from('data_export_requests')
-            .update({
-                status: 'completed',
-                completed_at: new Date().toISOString(),
-                file_url: `https://${supabaseUrl}/storage/v1/object/public/${supabaseBucketName}/exports/${fileName}`
-            })
-            .eq('id', requestId);
-
-        console.log(`✅ Экспорт данных для ${userEmail} завершен`);
-
-    } catch (error) {
-        console.error('❌ Ошибка подготовки экспорта данных:', error);
-        
-        await supabase
-            .from('data_export_requests')
-            .update({
-                status: 'failed',
-                completed_at: new Date().toISOString()
-            })
-            .eq('id', requestId);
-    }
-}
-
 // ===== Завершение звонка =====
 app.post('/api/calls/end', async (req, res) => {
     try {
@@ -3164,16 +2711,27 @@ app.post('/api/calls/end', async (req, res) => {
             });
         }
         
+        console.log(`📴 Завершение звонка: ${roomId} пользователем ${userEmail || 'system'}`);
+        
         if (userEmail) {
             await updateUserActivity(userEmail);
+        }
+        
+        // ИСПРАВЛЕНИЕ: Очищаем таймаут при завершении
+        const timeoutData = callTimeouts.get(roomId);
+        if (timeoutData) {
+            clearTimeout(timeoutData.timeoutId);
+            callTimeouts.delete(roomId);
+            console.log(`⏱️ Таймаут для комнаты ${roomId} очищен при завершении`);
         }
         
         const callData = activeCalls.get(roomId);
         
         if (callData) {
+            // Уведомляем всех участников
             callData.participants.forEach(email => {
                 if (email !== userEmail) {
-                    const participantSocketId = emailToSocket.get(email);
+                    const participantSocketId = emailToSocket.get(email.toLowerCase());
                     if (participantSocketId) {
                         io.to(participantSocketId).emit('call-ended', {
                             type: 'call-ended',
@@ -3185,6 +2743,7 @@ app.post('/api/calls/end', async (req, res) => {
                 }
             });
             
+            // Сохраняем в историю
             const endedCall = {
                 ...callData,
                 endedBy: userEmail || 'system',
@@ -3196,10 +2755,11 @@ app.post('/api/calls/end', async (req, res) => {
             const historyId = 'hist_' + Date.now();
             callHistory.set(historyId, endedCall);
             
+            // Удаляем из активных звонков
             activeCalls.delete(roomId);
+            
+            console.log(`📴 Звонок ${roomId} завершен, длительность: ${endedCall.duration}`);
         }
-        
-        console.log(`📴 Звонок ${roomId} завершен пользователем ${userEmail || 'system'}`);
         
         res.json({
             success: true,
@@ -3229,9 +2789,18 @@ app.get('/api/calls/:roomId', async (req, res) => {
             });
         }
         
+        // Добавляем информацию о таймауте для отладки
+        const timeoutData = callTimeouts.get(roomId);
+        
         res.json({
             success: true,
-            call: callData
+            call: callData,
+            timeout: timeoutData ? {
+                exists: true,
+                createdAt: timeoutData.createdAt
+            } : {
+                exists: false
+            }
         });
         
     } catch (error) {
@@ -3247,14 +2816,16 @@ app.get('/api/calls/:roomId', async (req, res) => {
 app.get('/api/calls/user/:email', async (req, res) => {
     try {
         const { email } = req.params;
+        const normalizedEmail = email.toLowerCase();
         
-        await updateUserActivity(email);
+        await updateUserActivity(normalizedEmail);
         
         const userCalls = [];
         
         for (const [roomId, callData] of activeCalls.entries()) {
-            if (callData.caller === email || callData.receiver === email || 
-                (callData.participants && callData.participants.includes(email))) {
+            if (callData.caller.toLowerCase() === normalizedEmail || 
+                callData.receiver.toLowerCase() === normalizedEmail || 
+                (callData.participants && callData.participants.some(p => p.toLowerCase() === normalizedEmail))) {
                 userCalls.push({
                     roomId,
                     ...callData
@@ -3415,6 +2986,469 @@ app.get('/api/status/online/all', async (req, res) => {
         });
     }
 });
+
+// ===== ЭНДПОИНТЫ ДЛЯ НАСТРОЕК КОНФИДЕНЦИАЛЬНОСТИ =====
+
+// ===== Получить настройки конфиденциальности пользователя =====
+app.get('/api/privacy/settings/:email', async (req, res) => {
+    try {
+        const email = req.params.email.toLowerCase();
+
+        await updateUserActivity(email);
+
+        const user = await getUserInfo(email);
+        if (!user) {
+            return res.status(404).json({
+                success: false,
+                error: 'Пользователь не найден'
+            });
+        }
+
+        let { data: settings, error } = await supabase
+            .from('privacy_settings')
+            .select('*')
+            .eq('user_email', email)
+            .maybeSingle();
+
+        if (error) throw error;
+
+        if (!settings) {
+            const { data: newSettings, error: insertError } = await supabase
+                .from('privacy_settings')
+                .insert([{
+                    user_email: email,
+                    is_online_status_visible: true,
+                    is_last_seen_visible: true,
+                    is_profile_photo_visible: true,
+                    is_read_receipts_enabled: true
+                }])
+                .select()
+                .single();
+
+            if (insertError) throw insertError;
+            settings = newSettings;
+        }
+
+        const { count, error: countError } = await supabase
+            .from('blocked_users')
+            .select('*', { count: 'exact', head: true })
+            .eq('user_email', email);
+
+        if (countError) throw countError;
+
+        res.json({
+            success: true,
+            settings: {
+                isOnlineStatusVisible: settings.is_online_status_visible,
+                isLastSeenVisible: settings.is_last_seen_visible,
+                isProfilePhotoVisible: settings.is_profile_photo_visible,
+                isReadReceiptsEnabled: settings.is_read_receipts_enabled,
+                blockedUsersCount: count || 0
+            }
+        });
+
+    } catch (error) {
+        console.error('❌ Ошибка получения настроек конфиденциальности:', error);
+        res.status(500).json({
+            success: false,
+            error: error.message
+        });
+    }
+});
+
+// ===== Обновить настройки конфиденциальности =====
+app.post('/api/privacy/settings/update', async (req, res) => {
+    try {
+        const { 
+            userEmail, 
+            isOnlineStatusVisible, 
+            isLastSeenVisible, 
+            isProfilePhotoVisible, 
+            isReadReceiptsEnabled 
+        } = req.body;
+
+        if (!userEmail) {
+            return res.status(400).json({
+                success: false,
+                error: 'Email обязателен'
+            });
+        }
+
+        const normalizedEmail = userEmail.toLowerCase();
+
+        await updateUserActivity(normalizedEmail);
+
+        const user = await getUserInfo(normalizedEmail);
+        if (!user) {
+            return res.status(404).json({
+                success: false,
+                error: 'Пользователь не найден'
+            });
+        }
+
+        const { data: existingSettings } = await supabase
+            .from('privacy_settings')
+            .select('id')
+            .eq('user_email', normalizedEmail)
+            .maybeSingle();
+
+        let result;
+        
+        if (existingSettings) {
+            const { data, error } = await supabase
+                .from('privacy_settings')
+                .update({
+                    is_online_status_visible: isOnlineStatusVisible !== undefined ? isOnlineStatusVisible : true,
+                    is_last_seen_visible: isLastSeenVisible !== undefined ? isLastSeenVisible : true,
+                    is_profile_photo_visible: isProfilePhotoVisible !== undefined ? isProfilePhotoVisible : true,
+                    is_read_receipts_enabled: isReadReceiptsEnabled !== undefined ? isReadReceiptsEnabled : true
+                })
+                .eq('user_email', normalizedEmail)
+                .select()
+                .single();
+
+            if (error) throw error;
+            result = data;
+        } else {
+            const { data, error } = await supabase
+                .from('privacy_settings')
+                .insert([{
+                    user_email: normalizedEmail,
+                    is_online_status_visible: isOnlineStatusVisible !== undefined ? isOnlineStatusVisible : true,
+                    is_last_seen_visible: isLastSeenVisible !== undefined ? isLastSeenVisible : true,
+                    is_profile_photo_visible: isProfilePhotoVisible !== undefined ? isProfilePhotoVisible : true,
+                    is_read_receipts_enabled: isReadReceiptsEnabled !== undefined ? isReadReceiptsEnabled : true
+                }])
+                .select()
+                .single();
+
+            if (error) throw error;
+            result = data;
+        }
+
+        console.log(`✅ Настройки конфиденциальности обновлены для ${normalizedEmail}`);
+
+        res.json({
+            success: true,
+            message: 'Настройки сохранены',
+            settings: {
+                isOnlineStatusVisible: result.is_online_status_visible,
+                isLastSeenVisible: result.is_last_seen_visible,
+                isProfilePhotoVisible: result.is_profile_photo_visible,
+                isReadReceiptsEnabled: result.is_read_receipts_enabled
+            }
+        });
+
+    } catch (error) {
+        console.error('❌ Ошибка обновления настроек конфиденциальности:', error);
+        res.status(500).json({
+            success: false,
+            error: error.message
+        });
+    }
+});
+
+// ===== Получить список заблокированных пользователей =====
+app.get('/api/privacy/blocked/:email', async (req, res) => {
+    try {
+        const email = req.params.email.toLowerCase();
+
+        await updateUserActivity(email);
+
+        const { data, error } = await supabase
+            .from('blocked_users')
+            .select(`
+                blocked_user_email,
+                blocked_at,
+                regular_users!blocked_users_blocked_user_email_fkey (
+                    first_name,
+                    last_name,
+                    email
+                )
+            `)
+            .eq('user_email', email)
+            .order('blocked_at', { ascending: false });
+
+        if (error) throw error;
+
+        const blockedUsers = (data || []).map(item => ({
+            email: item.blocked_user_email,
+            name: item.regular_users ? 
+                `${item.regular_users.first_name || ''} ${item.regular_users.last_name || ''}`.trim() : 
+                item.blocked_user_email,
+            blockedAt: item.blocked_at
+        }));
+
+        res.json({
+            success: true,
+            blockedUsers
+        });
+
+    } catch (error) {
+        console.error('❌ Ошибка получения заблокированных пользователей:', error);
+        res.status(500).json({
+            success: false,
+            error: error.message
+        });
+    }
+});
+
+// ===== Заблокировать пользователя =====
+app.post('/api/privacy/blocked/add', async (req, res) => {
+    try {
+        const { userEmail, blockedUserEmail } = req.body;
+
+        if (!userEmail || !blockedUserEmail) {
+            return res.status(400).json({
+                success: false,
+                error: 'Email пользователя и блокируемого пользователя обязательны'
+            });
+        }
+
+        const normalizedUserEmail = userEmail.toLowerCase();
+        const normalizedBlockedEmail = blockedUserEmail.toLowerCase();
+
+        if (normalizedUserEmail === normalizedBlockedEmail) {
+            return res.status(400).json({
+                success: false,
+                error: 'Нельзя заблокировать самого себя'
+            });
+        }
+
+        await updateUserActivity(normalizedUserEmail);
+
+        const blockedUser = await getUserInfo(normalizedBlockedEmail);
+        if (!blockedUser) {
+            return res.status(404).json({
+                success: false,
+                error: 'Блокируемый пользователь не найден'
+            });
+        }
+
+        const { data, error } = await supabase
+            .from('blocked_users')
+            .upsert({
+                user_email: normalizedUserEmail,
+                blocked_user_email: normalizedBlockedEmail
+            }, {
+                onConflict: 'user_email,blocked_user_email',
+                ignoreDuplicates: true
+            })
+            .select();
+
+        if (error) throw error;
+
+        console.log(`🔨 Пользователь ${normalizedUserEmail} заблокировал ${normalizedBlockedEmail}`);
+
+        res.json({
+            success: true,
+            message: 'Пользователь заблокирован'
+        });
+
+    } catch (error) {
+        console.error('❌ Ошибка блокировки пользователя:', error);
+        res.status(500).json({
+            success: false,
+            error: error.message
+        });
+    }
+});
+
+// ===== Разблокировать пользователя =====
+app.delete('/api/privacy/blocked/remove', async (req, res) => {
+    try {
+        const { userEmail, blockedUserEmail } = req.body;
+
+        if (!userEmail || !blockedUserEmail) {
+            return res.status(400).json({
+                success: false,
+                error: 'Email пользователя и блокируемого пользователя обязательны'
+            });
+        }
+
+        const normalizedUserEmail = userEmail.toLowerCase();
+        const normalizedBlockedEmail = blockedUserEmail.toLowerCase();
+
+        await updateUserActivity(normalizedUserEmail);
+
+        const { error } = await supabase
+            .from('blocked_users')
+            .delete()
+            .eq('user_email', normalizedUserEmail)
+            .eq('blocked_user_email', normalizedBlockedEmail);
+
+        if (error) throw error;
+
+        console.log(`✅ Пользователь ${normalizedUserEmail} разблокировал ${normalizedBlockedEmail}`);
+
+        res.json({
+            success: true,
+            message: 'Пользователь разблокирован'
+        });
+
+    } catch (error) {
+        console.error('❌ Ошибка разблокировки пользователя:', error);
+        res.status(500).json({
+            success: false,
+            error: error.message
+        });
+    }
+});
+
+// ===== Запрос на экспорт данных =====
+app.post('/api/privacy/export/request', async (req, res) => {
+    try {
+        const { userEmail } = req.body;
+
+        if (!userEmail) {
+            return res.status(400).json({
+                success: false,
+                error: 'Email обязателен'
+            });
+        }
+
+        const normalizedEmail = userEmail.toLowerCase();
+
+        await updateUserActivity(normalizedEmail);
+
+        const { data, error } = await supabase
+            .from('data_export_requests')
+            .insert([{
+                user_email: normalizedEmail,
+                status: 'pending'
+            }])
+            .select()
+            .single();
+
+        if (error) throw error;
+
+        console.log(`📦 Запрос на экспорт данных от ${normalizedEmail}`);
+
+        prepareDataExport(normalizedEmail, data.id);
+
+        res.json({
+            success: true,
+            message: 'Запрос на экспорт данных принят',
+            requestId: data.id,
+            estimatedTime: '48 часов'
+        });
+
+    } catch (error) {
+        console.error('❌ Ошибка создания запроса на экспорт:', error);
+        res.status(500).json({
+            success: false,
+            error: error.message
+        });
+    }
+});
+
+// ===== Запрос на удаление данных =====
+app.post('/api/privacy/delete/request', async (req, res) => {
+    try {
+        const { userEmail } = req.body;
+
+        if (!userEmail) {
+            return res.status(400).json({
+                success: false,
+                error: 'Email обязателен'
+            });
+        }
+
+        const normalizedEmail = userEmail.toLowerCase();
+
+        await updateUserActivity(normalizedEmail);
+
+        const { data, error } = await supabase
+            .from('data_deletion_requests')
+            .insert([{
+                user_email: normalizedEmail,
+                status: 'pending'
+            }])
+            .select()
+            .single();
+
+        if (error) throw error;
+
+        console.log(`🗑️ Запрос на удаление данных от ${normalizedEmail}`);
+
+        res.json({
+            success: true,
+            message: 'Запрос на удаление данных принят',
+            requestId: data.id
+        });
+
+    } catch (error) {
+        console.error('❌ Ошибка создания запроса на удаление:', error);
+        res.status(500).json({
+            success: false,
+            error: error.message
+        });
+    }
+});
+
+// ===== Вспомогательная функция для подготовки экспорта данных =====
+async function prepareDataExport(userEmail, requestId) {
+    try {
+        console.log(`🔄 Начало подготовки экспорта данных для ${userEmail}`);
+
+        await supabase
+            .from('data_export_requests')
+            .update({ status: 'processing' })
+            .eq('id', requestId);
+
+        const userData = await getUserInfo(userEmail);
+        
+        const { data: messages } = await supabase
+            .from('messages')
+            .select('*')
+            .or(`sender_email.eq.${userEmail},receiver_email.eq.${userEmail}`)
+            .order('timestamp');
+
+        const { data: groupMessages } = await supabase
+            .from('group_messages')
+            .select('*')
+            .eq('sender_email', userEmail)
+            .order('timestamp');
+
+        const { data: files } = await supabase
+            .from('files')
+            .select('*')
+            .eq('sender_email', userEmail);
+
+        const exportData = {
+            user: userData,
+            messages: messages || [],
+            groupMessages: groupMessages || [],
+            files: files || [],
+            exportedAt: new Date().toISOString()
+        };
+
+        const fileName = `export_${userEmail}_${Date.now()}.json`;
+        const filePath = `exports/${fileName}`;
+        
+        await supabase
+            .from('data_export_requests')
+            .update({
+                status: 'completed',
+                completed_at: new Date().toISOString(),
+                file_url: `https://${supabaseUrl}/storage/v1/object/public/${supabaseBucketName}/exports/${fileName}`
+            })
+            .eq('id', requestId);
+
+        console.log(`✅ Экспорт данных для ${userEmail} завершен`);
+
+    } catch (error) {
+        console.error('❌ Ошибка подготовки экспорта данных:', error);
+        
+        await supabase
+            .from('data_export_requests')
+            .update({
+                status: 'failed',
+                completed_at: new Date().toISOString()
+            })
+            .eq('id', requestId);
+    }
+}
 
 // ===== FCM ЭНДПОИНТЫ =====
 
@@ -4052,6 +4086,24 @@ app.get('/api/debug/mappings', (req, res) => {
     });
 });
 
+app.get('/api/debug/timeouts', (req, res) => {
+    const timeouts = [];
+    for (const [roomId, data] of callTimeouts.entries()) {
+        timeouts.push({
+            roomId,
+            createdAt: data.createdAt,
+            caller: data.caller,
+            receiver: data.receiver,
+            age: Date.now() - new Date(data.createdAt).getTime()
+        });
+    }
+    res.json({
+        success: true,
+        total: timeouts.length,
+        timeouts
+    });
+});
+
 app.get('/api/debug/firebase', (req, res) => {
     res.json({
         success: true,
@@ -4149,6 +4201,10 @@ app.get('/', (req, res) => {
                 <div class="stat-value">${userLastActivity.size}</div>
                 <div class="stat-label">Отслеживаемых пользователей</div>
             </div>
+            <div class="stat-card">
+                <div class="stat-value">${callTimeouts.size}</div>
+                <div class="stat-label">Активных таймаутов</div>
+            </div>
         </div>
         
         <div class="features">
@@ -4165,12 +4221,29 @@ app.get('/', (req, res) => {
                 <li><strong>GET /messages/:userEmail/:friendEmail</strong> - История переписки</li>
             </ul>
             
+            <h3>📞 Эндпоинты для звонков:</h3>
+            <ul>
+                <li><strong>POST /api/calls/initiate</strong> - Инициировать звонок</li>
+                <li><strong>POST /api/calls/accept</strong> - Принять звонок</li>
+                <li><strong>POST /api/calls/reject</strong> - Отклонить звонок</li>
+                <li><strong>POST /api/calls/end</strong> - Завершить звонок</li>
+                <li><strong>GET /api/calls/:roomId</strong> - Информация о звонке</li>
+                <li><strong>GET /api/calls/user/:email</strong> - Звонки пользователя</li>
+            </ul>
+            
             <h3>👤 Эндпоинты для статусов:</h3>
             <ul>
                 <li><strong>GET /api/status/:email</strong> - Статус пользователя</li>
                 <li><strong>POST /api/status/batch</strong> - Статусы нескольких пользователей</li>
                 <li><strong>GET /api/status/online/all</strong> - Все онлайн пользователи</li>
                 <li><strong>POST /api/activity/ping</strong> - Обновить активность</li>
+            </ul>
+            
+            <h3>🔧 Дебаг эндпоинты:</h3>
+            <ul>
+                <li><strong>GET /api/debug/timeouts</strong> - Информация о таймаутах</li>
+                <li><strong>GET /api/debug/mappings</strong> - Маппинги socket-email</li>
+                <li><strong>GET /api/debug/activity</strong> - Активность пользователей</li>
             </ul>
         </div>
     </body>
@@ -4195,6 +4268,7 @@ server.listen(PORT, '0.0.0.0', async () => {
     console.log(`🔥 Firebase: ${firebaseInitialized ? 'активен' : 'не настроен'}`);
     console.log(`🧹 Автоочистка файлов: каждые 24 часа (файлы старше 10 дней)`);
     console.log(`👤 Отслеживание активности: включено (таймаут ${ACTIVITY_TIMEOUT/1000/60} минут)`);
+    console.log(`⏱️ Таймаут звонков: 30 секунд`);
     console.log('='.repeat(60) + '\n');
     
     await ensureBucketExists();
@@ -4224,6 +4298,13 @@ server.listen(PORT, '0.0.0.0', async () => {
 process.on('SIGINT', async () => {
     console.log('\n🛑 Остановка сервера...');
     
+    // Очищаем все активные таймауты
+    for (const [roomId, timeoutData] of callTimeouts.entries()) {
+        clearTimeout(timeoutData.timeoutId);
+        console.log(`⏱️ Таймаут для комнаты ${roomId} очищен при остановке`);
+    }
+    callTimeouts.clear();
+    
     try {
         await supabase
             .from('user_presence')
@@ -4249,6 +4330,12 @@ process.on('SIGINT', async () => {
 
 process.on('SIGTERM', async () => {
     console.log('\n🛑 Остановка сервера (SIGTERM)...');
+    
+    // Очищаем все активные таймауты
+    for (const [roomId, timeoutData] of callTimeouts.entries()) {
+        clearTimeout(timeoutData.timeoutId);
+    }
+    callTimeouts.clear();
     
     try {
         await supabase
