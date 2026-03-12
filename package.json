@@ -6,6 +6,7 @@
   "type": "commonjs",
   "scripts": {
     "start": "node server.js",
+    "ping": "curl -f https://your-app-name.onrender.com/health || exit 1",
     "dev": "nodemon server.js",
     "setup": "node -e \"console.log('Running initial setup...'); require('./server.js');\"",
     "backup": "node -e \"require('./fileStorage.js').createBackup()\"",
@@ -34,11 +35,13 @@
     "cors": "^2.8.5",
     "body-parser": "^1.20.2",
     "sqlite3": "^5.1.6",
-    "multer": "^2.0.0",
+    "multer": "^1.4.5-lts.1",
     "mime-types": "^2.1.35",
     "uuid": "^9.0.1",
-    "fluent-ffmpeg": "^2.2.0",
-    "agora-token": "^1.0.0",
+    "fluent-ffmpeg": "^2.1.2",
+    "ffmpeg-static": "^5.2.0",
+    "ffprobe-static": "^3.1.0",
+    "agora-access-token": "^2.0.4",
     "socket.io": "^4.7.4",
     "firebase-admin": "^11.11.1",
     "@supabase/supabase-js": "^2.39.0",
@@ -49,7 +52,7 @@
     "nodemon": "^3.0.1"
   },
   "engines": {
-    "node": ">=18.0.0",
+    "node": ">=16.0.0",
     "npm": ">=8.0.0"
   },
   "repository": {
@@ -59,5 +62,10 @@
   "bugs": {
     "url": "https://github.com/beresta-team/beresta-server/issues"
   },
-  "homepage": "https://github.com/beresta-team/beresta-server#readme"
+  "homepage": "https://github.com/beresta-team/beresta-server#readme",
+  "optionalDependencies": {
+    "ffmpeg-static": "^5.2.0",
+    "ffprobe-static": "^3.1.0"
+  }
 }
+
