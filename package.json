@@ -6,11 +6,11 @@
   "type": "commonjs",
   "scripts": {
     "start": "node server.js",
-    "ping": "curl -f https://your-app-name.onrender.com/health || exit 1",
     "dev": "nodemon server.js",
     "setup": "node -e \"console.log('Running initial setup...'); require('./server.js');\"",
     "backup": "node -e \"require('./fileStorage.js').createBackup()\"",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "postinstall": "npm run setup"
   },
   "keywords": [
     "messaging",
@@ -39,8 +39,6 @@
     "mime-types": "^2.1.35",
     "uuid": "^9.0.1",
     "fluent-ffmpeg": "^2.1.2",
-    "ffmpeg-static": "^5.2.0",
-    "ffprobe-static": "^3.1.0",
     "agora-access-token": "^2.0.4",
     "socket.io": "^4.7.4",
     "firebase-admin": "^11.11.1",
@@ -52,7 +50,7 @@
     "nodemon": "^3.0.1"
   },
   "engines": {
-    "node": ">=16.0.0",
+    "node": ">=18.0.0",
     "npm": ">=8.0.0"
   },
   "repository": {
@@ -62,9 +60,6 @@
   "bugs": {
     "url": "https://github.com/beresta-team/beresta-server/issues"
   },
-  "homepage": "https://github.com/beresta-team/beresta-server#readme",
-  "optionalDependencies": {
-    "ffmpeg-static": "^5.2.0",
-    "ffprobe-static": "^3.1.0"
-  }
+  "homepage": "https://github.com/beresta-team/beresta-server#readme"
 }
+
