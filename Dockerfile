@@ -2,14 +2,21 @@ FROM node:22-alpine
 
 WORKDIR /app
 
-# Копируем package.json и package-lock.json
+# Сначала копируем ВСЕ файлы проекта
+COPY . .
+
+# Затем копируем package*.json отдельно (важно для кэширования слоёв)
 COPY package*.json ./
 
-# Устанавливаем зависимости — используем npm install вместо npm ci
-RUN npm install --only=production
+# Устанавливаем системные зависимости для нативной компиляции
+RUN apk add --no-cache \
+    python3 \
+    make \
+    g++ \
+    build-base
 
-# Копируем остальной код
-COPY . .
+# Устанавливаем зависимости
+RUN npm install --only=production
 
 # Экспонируем порт (укажите нужный порт)
 EXPOSE 3000
