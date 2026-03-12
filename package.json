@@ -10,7 +10,6 @@
     "setup": "node -e \"console.log('Running initial setup...'); require('./server.js');\"",
     "backup": "node -e \"require('./fileStorage.js').createBackup()\"",
     "test": "echo \"Error: no test specified\" && exit 1",
-    "postinstall": "npm run setup"
   },
   "keywords": [
     "messaging",
@@ -62,4 +61,5 @@
   },
   "homepage": "https://github.com/beresta-team/beresta-server#readme"
 }
+
 
