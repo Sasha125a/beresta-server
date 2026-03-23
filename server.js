@@ -94,7 +94,6 @@ app.use(bodyParser.urlencoded({ extended: true, limit: '50mb' }));
 
 // ==================== ОТСЛЕЖИВАНИЕ АКТИВНОСТИ ПОЛЬЗОВАТЕЛЕЙ ====================
 const userLastActivity = new Map(); // email -> timestamp последней активности
-const userRegistrationTimes = new Map(); // email -> timestamp регистрации
 const ACTIVITY_TIMEOUT = 5 * 60 * 1000; // 5 минут без активности = оффлайн
 const ACTIVITY_CHECK_INTERVAL = 60000; // Проверка каждую минуту
 
@@ -490,10 +489,6 @@ async function getUserInfo(email) {
         .maybeSingle();
 
     if (regularUser) {
-        // Сохраняем время регистрации в кэш
-        if (regularUser.created_at) {
-            userRegistrationTimes.set(normalizedEmail, regularUser.created_at);
-        }
         return { ...regularUser, userType: 'regular' };
     }
 
@@ -504,62 +499,10 @@ async function getUserInfo(email) {
         .maybeSingle();
 
     if (berestaUser) {
-        // Сохраняем время регистрации в кэш
-        if (berestaUser.created_at) {
-            userRegistrationTimes.set(normalizedEmail, berestaUser.created_at);
-        }
         return { ...berestaUser, userType: 'beresta' };
     }
 
     return null;
-}
-
-async function getUserRegistrationTime(email) {
-    const normalizedEmail = email.toLowerCase();
-    
-    // Проверяем в кэше
-    if (userRegistrationTimes.has(normalizedEmail)) {
-        return userRegistrationTimes.get(normalizedEmail);
-    }
-    
-    // Получаем из базы данных
-    const user = await getUserInfo(normalizedEmail);
-    if (user) {
-        const registrationTime = user.created_at || user.registered_at || new Date().toISOString();
-        userRegistrationTimes.set(normalizedEmail, registrationTime);
-        return registrationTime;
-    }
-    
-    return null;
-}
-
-async function getAllUsersWithRegistrationTime() {
-    const users = [];
-    
-    // Получаем обычных пользователей
-    const { data: regularUsers, error: regularError } = await supabase
-        .from('regular_users')
-        .select('email, first_name, last_name, created_at')
-        .order('created_at', { ascending: false });
-    
-    if (!regularError && regularUsers) {
-        users.push(...regularUsers.map(u => ({ ...u, userType: 'regular' })));
-    }
-    
-    // Получаем пользователей Beresta
-    const { data: berestaUsers, error: berestaError } = await supabase
-        .from('beresta_users')
-        .select('email, first_name, last_name, created_at')
-        .order('created_at', { ascending: false });
-    
-    if (!berestaError && berestaUsers) {
-        users.push(...berestaUsers.map(u => ({ ...u, userType: 'beresta' })));
-    }
-    
-    // Сортируем по дате регистрации
-    users.sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
-    
-    return users;
 }
 
 async function userExists(email) {
@@ -3662,23 +3605,18 @@ app.post('/register', async (req, res) => {
             .insert([{
                 email: email.toLowerCase(),
                 first_name: firstName,
-                last_name: lastName,
-                created_at: new Date().toISOString()
+                last_name: lastName
             }])
             .select();
 
         if (error) throw error;
-
-        // Сохраняем время регистрации в кэш
-        userRegistrationTimes.set(email.toLowerCase(), data[0].created_at);
 
         await updateUserActivity(email);
 
         res.json({
             success: true,
             message: 'Пользователь успешно зарегистрирован',
-            userId: data[0].id,
-            registeredAt: data[0].created_at
+            userId: data[0].id
         });
     } catch (error) {
         console.error('❌ Ошибка регистрации:', error);
@@ -3703,17 +3641,9 @@ app.get('/user/:email', async (req, res) => {
             });
         }
 
-        // Добавляем информацию о регистрации
-        const registrationTime = await getUserRegistrationTime(email);
-        
         res.json({
             success: true,
-            user: {
-                ...user,
-                registeredAt: registrationTime,
-                registrationDate: registrationTime ? new Date(registrationTime).toLocaleDateString('ru-RU') : null,
-                daysSinceRegistration: registrationTime ? Math.floor((Date.now() - new Date(registrationTime)) / (1000 * 60 * 60 * 24)) : null
-            }
+            user
         });
     } catch (error) {
         console.error('❌ Ошибка получения пользователя:', error);
@@ -3729,475 +3659,25 @@ app.get('/user/:email', async (req, res) => {
 app.get('/users', async (req, res) => {
     try {
         const [regularResult, berestaResult] = await Promise.all([
-            supabase.from('regular_users').select('email, first_name, last_name, created_at').order('first_name'),
-            supabase.from('beresta_users').select('email, first_name, last_name, beresta_id, created_at').order('first_name')
+            supabase.from('regular_users').select('email, first_name, last_name').order('first_name'),
+            supabase.from('beresta_users').select('email, first_name, last_name, beresta_id').order('first_name')
         ]);
 
         const regularUsers = regularResult.data || [];
         const berestaUsers = berestaResult.data || [];
 
         const allUsers = [
-            ...regularUsers.map(u => ({ 
-                ...u, 
-                userType: 'regular',
-                registeredAt: u.created_at,
-                registrationDate: u.created_at ? new Date(u.created_at).toLocaleDateString('ru-RU') : null,
-                registrationTime: u.created_at
-            })),
-            ...berestaUsers.map(u => ({ 
-                ...u, 
-                userType: 'beresta',
-                registeredAt: u.created_at,
-                registrationDate: u.created_at ? new Date(u.created_at).toLocaleDateString('ru-RU') : null,
-                registrationTime: u.created_at
-            }))
+            ...regularUsers.map(u => ({ ...u, userType: 'regular' })),
+            ...berestaUsers.map(u => ({ ...u, userType: 'beresta' }))
         ];
-
-        // Группировка пользователей по дате регистрации
-        const registrationByDate = {};
-        allUsers.forEach(user => {
-            const date = user.created_at?.split('T')[0] || 'unknown';
-            if (!registrationByDate[date]) {
-                registrationByDate[date] = [];
-            }
-            registrationByDate[date].push({
-                email: user.email,
-                name: `${user.first_name || ''} ${user.last_name || ''}`.trim(),
-                userType: user.userType
-            });
-        });
-
-        // Сортируем по дате регистрации
-        allUsers.sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
-
-        // Статистика по датам
-        const registrationStats = {};
-        allUsers.forEach(user => {
-            const date = user.created_at?.split('T')[0];
-            if (date) {
-                registrationStats[date] = (registrationStats[date] || 0) + 1;
-            }
-        });
 
         res.json({
             success: true,
-            totalUsers: allUsers.length,
-            users: allUsers,
-            registrationByDate: registrationByDate,
-            registrationStats: {
-                total: allUsers.length,
-                byType: {
-                    regular: regularUsers.length,
-                    beresta: berestaUsers.length
-                },
-                byDate: registrationStats,
-                oldestUser: allUsers.length > 0 ? {
-                    email: allUsers[allUsers.length - 1].email,
-                    name: `${allUsers[allUsers.length - 1].first_name || ''} ${allUsers[allUsers.length - 1].last_name || ''}`.trim(),
-                    registeredAt: allUsers[allUsers.length - 1].created_at
-                } : null,
-                newestUser: allUsers.length > 0 ? {
-                    email: allUsers[0].email,
-                    name: `${allUsers[0].first_name || ''} ${allUsers[0].last_name || ''}`.trim(),
-                    registeredAt: allUsers[0].created_at
-                } : null
-            }
+            users: allUsers
         });
     } catch (error) {
         console.error('❌ Ошибка получения пользователей:', error);
         res.status(500).json({ success: false, error: 'Internal server error' });
-    }
-});
-
-// ===== ГРАФИК ПОСЕЩАЕМОСТИ ПОЛЬЗОВАТЕЛЕЙ =====
-app.get('/api/users/graphics', async (req, res) => {
-    try {
-        const { period = 'week', userEmail } = req.query; // period: day, week, month, year
-        
-        console.log(`📊 Запрос графика посещаемости: период=${period}, пользователь=${userEmail || 'все'}`);
-        
-        // Определяем дату начала в зависимости от периода
-        const now = new Date();
-        let startDate;
-        
-        switch(period) {
-            case 'day':
-                startDate = new Date(now);
-                startDate.setHours(0, 0, 0, 0);
-                break;
-            case 'week':
-                startDate = new Date(now);
-                startDate.setDate(now.getDate() - 7);
-                startDate.setHours(0, 0, 0, 0);
-                break;
-            case 'month':
-                startDate = new Date(now);
-                startDate.setMonth(now.getMonth() - 1);
-                startDate.setHours(0, 0, 0, 0);
-                break;
-            case 'year':
-                startDate = new Date(now);
-                startDate.setFullYear(now.getFullYear() - 1);
-                startDate.setHours(0, 0, 0, 0);
-                break;
-            default:
-                startDate = new Date(now);
-                startDate.setDate(now.getDate() - 7);
-                startDate.setHours(0, 0, 0, 0);
-        }
-        
-        const startDateStr = startDate.toISOString();
-        
-        // Получаем данные о посещаемости из user_presence
-        let query = supabase
-            .from('user_presence')
-            .select('user_email, last_seen, status')
-            .gte('last_seen', startDateStr)
-            .order('last_seen', { ascending: true });
-        
-        // Если указан конкретный пользователь
-        if (userEmail) {
-            query = query.eq('user_email', userEmail.toLowerCase());
-        }
-        
-        const { data: presenceData, error: presenceError } = await query;
-        
-        if (presenceError) {
-            console.error('❌ Ошибка получения данных о присутствии:', presenceError);
-            throw presenceError;
-        }
-        
-        // Получаем данные о регистрациях пользователей
-        const { data: registrations, error: regError } = await supabase
-            .from('regular_users')
-            .select('email, created_at')
-            .gte('created_at', startDateStr);
-        
-        if (regError) {
-            console.error('❌ Ошибка получения данных о регистрациях:', regError);
-        }
-        
-        // Получаем данные о звонках для активности
-        const { data: calls, error: callsError } = await supabase
-            .from('missed_calls')
-            .select('caller_email, receiver_email, started_at')
-            .gte('started_at', startDateStr);
-        
-        if (callsError) {
-            console.error('❌ Ошибка получения данных о звонках:', callsError);
-        }
-        
-        // Группируем данные по дням
-        const groupedData = new Map();
-        const dateLabels = [];
-        
-        // Генерируем все даты в периоде
-        let currentDate = new Date(startDate);
-        const endDate = new Date();
-        
-        while (currentDate <= endDate) {
-            const label = currentDate.toISOString().split('T')[0];
-            dateLabels.push(label);
-            
-            groupedData.set(label, {
-                date: label,
-                activeUsers: new Set(),
-                totalVisits: 0,
-                newRegistrations: 0,
-                totalCalls: 0,
-                uniqueUsers: new Set()
-            });
-            
-            currentDate.setDate(currentDate.getDate() + 1);
-        }
-        
-        // Обрабатываем данные о присутствии
-        if (presenceData) {
-            for (const record of presenceData) {
-                const recordDate = new Date(record.last_seen);
-                const dateKey = recordDate.toISOString().split('T')[0];
-                
-                if (groupedData.has(dateKey)) {
-                    const data = groupedData.get(dateKey);
-                    data.activeUsers.add(record.user_email);
-                    data.totalVisits++;
-                    data.uniqueUsers.add(record.user_email);
-                }
-            }
-        }
-        
-        // Обрабатываем данные о регистрациях
-        if (registrations) {
-            for (const reg of registrations) {
-                const regDate = new Date(reg.created_at);
-                const dateKey = regDate.toISOString().split('T')[0];
-                
-                if (groupedData.has(dateKey)) {
-                    groupedData.get(dateKey).newRegistrations++;
-                }
-            }
-        }
-        
-        // Обрабатываем данные о звонках
-        if (calls) {
-            for (const call of calls) {
-                const callDate = new Date(call.started_at);
-                const dateKey = callDate.toISOString().split('T')[0];
-                
-                if (groupedData.has(dateKey)) {
-                    groupedData.get(dateKey).totalCalls++;
-                }
-            }
-        }
-        
-        // Форматируем данные для графика
-        const chartData = dateLabels.map(label => {
-            const data = groupedData.get(label) || {
-                activeUsers: new Set(),
-                totalVisits: 0,
-                newRegistrations: 0,
-                totalCalls: 0,
-                uniqueUsers: new Set()
-            };
-            return {
-                date: label,
-                activeUsers: data.activeUsers.size,
-                totalVisits: data.totalVisits,
-                newRegistrations: data.newRegistrations,
-                totalCalls: data.totalCalls,
-                uniqueUsers: data.uniqueUsers.size
-            };
-        });
-        
-        // Получаем статистику по пользователям с временем регистрации
-        const usersList = await getAllUsersWithRegistrationTime();
-        
-        // Расчет общей статистики
-        const totalUsers = usersList.length;
-        const newUsersThisPeriod = chartData.reduce((sum, item) => sum + item.newRegistrations, 0);
-        const totalActiveUsers = new Set();
-        presenceData?.forEach(record => totalActiveUsers.add(record.user_email));
-        
-        // Пиковые часы активности
-        const hourlyActivity = new Map();
-        presenceData?.forEach(record => {
-            const hour = new Date(record.last_seen).getHours();
-            hourlyActivity.set(hour, (hourlyActivity.get(hour) || 0) + 1);
-        });
-        
-        const peakHours = Array.from(hourlyActivity.entries())
-            .sort((a, b) => b[1] - a[1])
-            .slice(0, 5)
-            .map(([hour, count]) => ({ hour, count }));
-        
-        // Дни недели с наибольшей активностью
-        const weekdayActivity = new Map();
-        const weekdays = ['Воскресенье', 'Понедельник', 'Вторник', 'Среда', 'Четверг', 'Пятница', 'Суббота'];
-        
-        presenceData?.forEach(record => {
-            const weekday = new Date(record.last_seen).getDay();
-            weekdayActivity.set(weekday, (weekdayActivity.get(weekday) || 0) + 1);
-        });
-        
-        const peakWeekdays = Array.from(weekdayActivity.entries())
-            .sort((a, b) => b[1] - a[1])
-            .map(([day, count]) => ({ day: weekdays[day], count }));
-        
-        res.json({
-            success: true,
-            period: period,
-            startDate: startDateStr,
-            endDate: new Date().toISOString(),
-            chartData: chartData,
-            statistics: {
-                totalUsers: totalUsers,
-                newUsersThisPeriod: newUsersThisPeriod,
-                totalActiveUsers: totalActiveUsers.size,
-                totalVisits: chartData.reduce((sum, item) => sum + item.totalVisits, 0),
-                totalCalls: chartData.reduce((sum, item) => sum + item.totalCalls, 0),
-                averageDailyActive: Math.round(chartData.reduce((sum, item) => sum + item.activeUsers, 0) / chartData.length) || 0
-            },
-            insights: {
-                peakHours: peakHours,
-                peakWeekdays: peakWeekdays,
-                mostActiveDay: peakWeekdays[0] || null,
-                mostActiveHour: peakHours[0] || null
-            },
-            usersWithRegistration: usersList.map(user => ({
-                email: user.email,
-                firstName: user.first_name,
-                lastName: user.last_name,
-                registeredAt: user.created_at,
-                registrationDate: new Date(user.created_at).toLocaleDateString('ru-RU'),
-                userType: user.userType
-            }))
-        });
-        
-    } catch (error) {
-        console.error('❌ Ошибка получения графика посещаемости:', error);
-        res.status(500).json({
-            success: false,
-            error: error.message
-        });
-    }
-});
-
-// ===== ДЕТАЛЬНАЯ СТАТИСТИКА ПОЛЬЗОВАТЕЛЯ =====
-app.get('/api/users/:email/statistics', async (req, res) => {
-    try {
-        const email = req.params.email.toLowerCase();
-        
-        console.log(`📊 Запрос статистики для пользователя: ${email}`);
-        
-        await updateUserActivity(email);
-        
-        // Получаем информацию о пользователе
-        const userInfo = await getUserInfo(email);
-        if (!userInfo) {
-            return res.status(404).json({
-                success: false,
-                error: 'Пользователь не найден'
-            });
-        }
-        
-        // Получаем статистику сообщений
-        const { data: sentMessages, error: sentError } = await supabase
-            .from('messages')
-            .select('id, timestamp')
-            .eq('sender_email', email);
-        
-        const { data: receivedMessages, error: receivedError } = await supabase
-            .from('messages')
-            .select('id, timestamp')
-            .eq('receiver_email', email);
-        
-        // Получаем статистику групповых сообщений
-        const { data: groupMessages, error: groupError } = await supabase
-            .from('group_messages')
-            .select('id, timestamp')
-            .eq('sender_email', email);
-        
-        // Получаем статистику звонков
-        const { data: outgoingCalls, error: outgoingError } = await supabase
-            .from('missed_calls')
-            .select('id, started_at, call_type')
-            .eq('caller_email', email);
-        
-        const { data: incomingCalls, error: incomingError } = await supabase
-            .from('missed_calls')
-            .select('id, started_at, call_type')
-            .eq('receiver_email', email);
-        
-        // Получаем статистику файлов
-        const { data: files, error: filesError } = await supabase
-            .from('files')
-            .select('id, uploaded_at, file_type, file_size')
-            .eq('sender_email', email);
-        
-        // Получаем активность по дням
-        const activityByDay = new Map();
-        
-        // Собираем все активности
-        const allActivities = [
-            ...(sentMessages || []).map(m => ({ type: 'message_sent', date: m.timestamp })),
-            ...(receivedMessages || []).map(m => ({ type: 'message_received', date: m.timestamp })),
-            ...(groupMessages || []).map(m => ({ type: 'group_message', date: m.timestamp })),
-            ...(outgoingCalls || []).map(c => ({ type: 'call_outgoing', date: c.started_at })),
-            ...(incomingCalls || []).map(c => ({ type: 'call_incoming', date: c.started_at })),
-            ...(files || []).map(f => ({ type: 'file_upload', date: f.uploaded_at }))
-        ];
-        
-        allActivities.forEach(activity => {
-            const date = activity.date?.split('T')[0];
-            if (date) {
-                if (!activityByDay.has(date)) {
-                    activityByDay.set(date, {
-                        date,
-                        messages: 0,
-                        calls: 0,
-                        files: 0,
-                        total: 0
-                    });
-                }
-                const dayData = activityByDay.get(date);
-                if (activity.type.includes('message') || activity.type.includes('group')) {
-                    dayData.messages++;
-                } else if (activity.type.includes('call')) {
-                    dayData.calls++;
-                } else if (activity.type.includes('file')) {
-                    dayData.files++;
-                }
-                dayData.total++;
-            }
-        });
-        
-        // Преобразуем в массив и сортируем по дате
-        const activityTimeline = Array.from(activityByDay.values())
-            .sort((a, b) => a.date.localeCompare(b.date));
-        
-        // Расчет общей статистики
-        const totalMessages = (sentMessages?.length || 0) + (receivedMessages?.length || 0) + (groupMessages?.length || 0);
-        const totalCalls = (outgoingCalls?.length || 0) + (incomingCalls?.length || 0);
-        const totalFiles = files?.length || 0;
-        const totalFileSize = files?.reduce((sum, f) => sum + (f.file_size || 0), 0) || 0;
-        
-        // Расчет частоты использования
-        const registrationDate = new Date(userInfo.created_at);
-        const daysSinceRegistration = Math.max(1, Math.floor((Date.now() - registrationDate) / (1000 * 60 * 60 * 24)));
-        
-        const avgMessagesPerDay = (totalMessages / daysSinceRegistration).toFixed(1);
-        const avgCallsPerDay = (totalCalls / daysSinceRegistration).toFixed(1);
-        
-        res.json({
-            success: true,
-            user: {
-                email: userInfo.email,
-                firstName: userInfo.first_name,
-                lastName: userInfo.last_name,
-                registeredAt: userInfo.created_at,
-                registrationDate: new Date(userInfo.created_at).toLocaleDateString('ru-RU'),
-                daysSinceRegistration: daysSinceRegistration,
-                userType: userInfo.userType
-            },
-            statistics: {
-                messages: {
-                    total: totalMessages,
-                    sent: sentMessages?.length || 0,
-                    received: receivedMessages?.length || 0,
-                    group: groupMessages?.length || 0,
-                    avgPerDay: parseFloat(avgMessagesPerDay)
-                },
-                calls: {
-                    total: totalCalls,
-                    outgoing: outgoingCalls?.length || 0,
-                    incoming: incomingCalls?.length || 0,
-                    avgPerDay: parseFloat(avgCallsPerDay)
-                },
-                files: {
-                    total: totalFiles,
-                    totalSize: totalFileSize,
-                    totalSizeMB: (totalFileSize / (1024 * 1024)).toFixed(2),
-                    byType: files?.reduce((acc, f) => {
-                        acc[f.file_type] = (acc[f.file_type] || 0) + 1;
-                        return acc;
-                    }, {}) || {}
-                },
-                activity: {
-                    totalActivities: allActivities.length,
-                    avgPerDay: (allActivities.length / daysSinceRegistration).toFixed(1),
-                    mostActiveDay: activityTimeline.length > 0 ? 
-                        activityTimeline.reduce((max, day) => day.total > max.total ? day : max, activityTimeline[0]) : null,
-                    activityTimeline: activityTimeline.slice(-30) // последние 30 дней
-                }
-            }
-        });
-        
-    } catch (error) {
-        console.error('❌ Ошибка получения статистики пользователя:', error);
-        res.status(500).json({
-            success: false,
-            error: error.message
-        });
     }
 });
 
@@ -4683,123 +4163,88 @@ app.get('/', (req, res) => {
     <head>
         <title>Beresta Server</title>
         <style>
-            body { font-family: Arial, sans-serif; margin: 40px; line-height: 1.6; background: #f5f5f5; }
+            body { font-family: Arial, sans-serif; margin: 40px; line-height: 1.6; }
             h1 { color: #333; }
-            h2 { color: #555; margin-top: 20px; }
-            h3 { color: #666; margin-top: 15px; }
-            .status { padding: 20px; background: #f0f0f0; border-radius: 5px; margin-bottom: 20px; }
-            .online { color: green; font-weight: bold; }
+            .status { padding: 20px; background: #f0f0f0; border-radius: 5px; }
+            .online { color: green; }
             .storage { color: blue; }
-            .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 10px; margin-top: 20px; margin-bottom: 20px; }
+            .feature { margin-left: 20px; }
+            .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 10px; margin-top: 20px; }
             .stat-card { background: white; padding: 15px; border-radius: 5px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); }
             .stat-value { font-size: 24px; font-weight: bold; color: #333; }
             .stat-label { font-size: 14px; color: #666; }
-            .button { display: inline-block; padding: 10px 20px; margin: 10px 10px 10px 0; background: #4CAF50; color: white; text-decoration: none; border-radius: 5px; }
-            .button:hover { background: #45a049; }
-            .features { background: white; padding: 20px; border-radius: 5px; margin-top: 20px; }
-            ul { margin: 10px 0; }
-            li { margin: 5px 0; }
-            .container { max-width: 1200px; margin: 0 auto; }
-            .footer { margin-top: 30px; padding: 20px; background: #e0e0e0; border-radius: 5px; text-align: center; font-size: 12px; color: #666; }
         </style>
     </head>
     <body>
-        <div class="container">
-            <h1>🚀 Beresta Server</h1>
-            <div class="status">
-                <p><strong>Status:</strong> <span class="online">🟢 Online</span></p>
-                <p><strong>Server ID:</strong> ${SERVER_ID}</p>
-                <p><strong>Firebase:</strong> ${firebaseInitialized ? '✅ Активен' : '❌ Не настроен'}</p>
-                <p><strong>Supabase Storage:</strong> <span class="storage">✅ Активен (bucket: ${supabaseBucketName})</span></p>
+        <h1>🚀 Beresta Server</h1>
+        <div class="status">
+            <p><strong>Status:</strong> <span class="online">🟢 Online</span></p>
+            <p><strong>Server ID:</strong> ${SERVER_ID}</p>
+            <p><strong>Firebase:</strong> ${firebaseInitialized ? '✅ Активен' : '❌ Не настроен'}</p>
+            <p><strong>Supabase Storage:</strong> <span class="storage">✅ Активен (bucket: ${supabaseBucketName})</span></p>
+        </div>
+        
+        <div class="stats">
+            <div class="stat-card">
+                <div class="stat-value">${onlineUsers}</div>
+                <div class="stat-label">Онлайн пользователей</div>
             </div>
+            <div class="stat-card">
+                <div class="stat-value">${rooms.size}</div>
+                <div class="stat-label">Активных комнат</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-value">${activeCalls.size}</div>
+                <div class="stat-label">Активных звонков</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-value">${userLastActivity.size}</div>
+                <div class="stat-label">Отслеживаемых пользователей</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-value">${callTimeouts.size}</div>
+                <div class="stat-label">Активных таймаутов</div>
+            </div>
+        </div>
+        
+        <div class="features">
+            <h2>📋 Доступные эндпоинты:</h2>
+            <ul>
+                <li><strong>POST /upload</strong> - Загрузка файла (multipart/form-data)</li>
+                <li><strong>GET /files/:fileId</strong> - Информация о файле</li>
+                <li><strong>GET /messages/:messageId/files</strong> - Файлы сообщения</li>
+                <li><strong>GET /users/:email/files</strong> - Файлы пользователя</li>
+                <li><strong>DELETE /files/:fileId</strong> - Удаление файла</li>
+                <li><strong>POST /send-message</strong> - Отправка сообщения</li>
+                <li><strong>POST /send-group-message</strong> - Отправка группового сообщения</li>
+                <li><strong>GET /chats/:userEmail</strong> - Чаты пользователя</li>
+                <li><strong>GET /messages/:userEmail/:friendEmail</strong> - История переписки</li>
+            </ul>
             
-            <div>
-                <a href="/api/users/graphics" class="button" target="_blank">📊 График посещаемости</a>
-                <a href="/users" class="button" target="_blank">👥 Список пользователей</a>
-                <a href="/api/status/online/all" class="button" target="_blank">🟢 Онлайн пользователи</a>
-                <a href="/api/status" class="button" target="_blank">📈 Статус сервера</a>
-                <a href="/api/rooms" class="button" target="_blank">🏠 Активные комнаты</a>
-                <a href="/api/calls/active" class="button" target="_blank">📞 Активные звонки</a>
-            </div>
+            <h3>📞 Эндпоинты для звонков:</h3>
+            <ul>
+                <li><strong>POST /api/calls/initiate</strong> - Инициировать звонок</li>
+                <li><strong>POST /api/calls/accept</strong> - Принять звонок</li>
+                <li><strong>POST /api/calls/reject</strong> - Отклонить звонок</li>
+                <li><strong>POST /api/calls/end</strong> - Завершить звонок</li>
+                <li><strong>GET /api/calls/:roomId</strong> - Информация о звонке</li>
+                <li><strong>GET /api/calls/user/:email</strong> - Звонки пользователя</li>
+            </ul>
             
-            <div class="stats">
-                <div class="stat-card">
-                    <div class="stat-value">${onlineUsers}</div>
-                    <div class="stat-label">Онлайн пользователей</div>
-                </div>
-                <div class="stat-card">
-                    <div class="stat-value">${rooms.size}</div>
-                    <div class="stat-label">Активных комнат</div>
-                </div>
-                <div class="stat-card">
-                    <div class="stat-value">${activeCalls.size}</div>
-                    <div class="stat-label">Активных звонков</div>
-                </div>
-                <div class="stat-card">
-                    <div class="stat-value">${userLastActivity.size}</div>
-                    <div class="stat-label">Отслеживаемых пользователей</div>
-                </div>
-                <div class="stat-card">
-                    <div class="stat-value">${callTimeouts.size}</div>
-                    <div class="stat-label">Активных таймаутов</div>
-                </div>
-                <div class="stat-card">
-                    <div class="stat-value">${userRegistrationTimes.size}</div>
-                    <div class="stat-label">Зарегистрированных пользователей</div>
-                </div>
-            </div>
+            <h3>👤 Эндпоинты для статусов:</h3>
+            <ul>
+                <li><strong>GET /api/status/:email</strong> - Статус пользователя</li>
+                <li><strong>POST /api/status/batch</strong> - Статусы нескольких пользователей</li>
+                <li><strong>GET /api/status/online/all</strong> - Все онлайн пользователи</li>
+                <li><strong>POST /api/activity/ping</strong> - Обновить активность</li>
+            </ul>
             
-            <div class="features">
-                <h2>📋 Доступные эндпоинты:</h2>
-                <ul>
-                    <li><strong>GET /users</strong> - Все пользователи (с временем регистрации)</li>
-                    <li><strong>GET /user/:email</strong> - Информация о пользователе</li>
-                    <li><strong>GET /api/users/graphics</strong> - График посещаемости</li>
-                    <li><strong>GET /api/users/:email/statistics</strong> - Детальная статистика пользователя</li>
-                    <li><strong>POST /upload</strong> - Загрузка файла (multipart/form-data)</li>
-                    <li><strong>GET /files/:fileId</strong> - Информация о файле</li>
-                    <li><strong>GET /messages/:messageId/files</strong> - Файлы сообщения</li>
-                    <li><strong>GET /users/:email/files</strong> - Файлы пользователя</li>
-                    <li><strong>DELETE /files/:fileId</strong> - Удаление файла</li>
-                    <li><strong>POST /send-message</strong> - Отправка сообщения</li>
-                    <li><strong>POST /send-group-message</strong> - Отправка группового сообщения</li>
-                    <li><strong>GET /chats/:userEmail</strong> - Чаты пользователя</li>
-                    <li><strong>GET /messages/:userEmail/:friendEmail</strong> - История переписки</li>
-                </ul>
-                
-                <h3>📞 Эндпоинты для звонков:</h3>
-                <ul>
-                    <li><strong>POST /api/calls/initiate</strong> - Инициировать звонок</li>
-                    <li><strong>POST /api/calls/accept</strong> - Принять звонок</li>
-                    <li><strong>POST /api/calls/reject</strong> - Отклонить звонок</li>
-                    <li><strong>POST /api/calls/end</strong> - Завершить звонок</li>
-                    <li><strong>GET /api/calls/:roomId</strong> - Информация о звонке</li>
-                    <li><strong>GET /api/calls/user/:email</strong> - Звонки пользователя</li>
-                    <li><strong>GET /api/calls/missed/:email</strong> - Пропущенные звонки</li>
-                </ul>
-                
-                <h3>👤 Эндпоинты для статусов:</h3>
-                <ul>
-                    <li><strong>GET /api/status/:email</strong> - Статус пользователя</li>
-                    <li><strong>POST /api/status/batch</strong> - Статусы нескольких пользователей</li>
-                    <li><strong>GET /api/status/online/all</strong> - Все онлайн пользователи</li>
-                    <li><strong>POST /api/activity/ping</strong> - Обновить активность</li>
-                </ul>
-                
-                <h3>🔧 Дебаг эндпоинты:</h3>
-                <ul>
-                    <li><strong>GET /api/debug/timeouts</strong> - Информация о таймаутах</li>
-                    <li><strong>GET /api/debug/mappings</strong> - Маппинги socket-email</li>
-                    <li><strong>GET /api/debug/activity</strong> - Активность пользователей</li>
-                    <li><strong>GET /api/debug/firebase</strong> - Статус Firebase</li>
-                    <li><strong>GET /api/debug/storage</strong> - Статус хранилища</li>
-                </ul>
-            </div>
-            
-            <div class="footer">
-                <p>Beresta Server v1.0 | Server ID: ${SERVER_ID} | Активность отслеживается каждые ${ACTIVITY_TIMEOUT/1000/60} минут</p>
-                <p>Файлы автоматически удаляются через 10 дней | Таймаут звонков: 30 секунд</p>
-            </div>
+            <h3>🔧 Дебаг эндпоинты:</h3>
+            <ul>
+                <li><strong>GET /api/debug/timeouts</strong> - Информация о таймаутах</li>
+                <li><strong>GET /api/debug/mappings</strong> - Маппинги socket-email</li>
+                <li><strong>GET /api/debug/activity</strong> - Активность пользователей</li>
+            </ul>
         </div>
     </body>
     </html>
@@ -4824,8 +4269,6 @@ server.listen(PORT, '0.0.0.0', async () => {
     console.log(`🧹 Автоочистка файлов: каждые 24 часа (файлы старше 10 дней)`);
     console.log(`👤 Отслеживание активности: включено (таймаут ${ACTIVITY_TIMEOUT/1000/60} минут)`);
     console.log(`⏱️ Таймаут звонков: 30 секунд`);
-    console.log(`📊 График посещаемости: доступен по /api/users/graphics`);
-    console.log(`👥 Статистика пользователей: доступна по /api/users/:email/statistics`);
     console.log('='.repeat(60) + '\n');
     
     await ensureBucketExists();
@@ -4846,16 +4289,6 @@ server.listen(PORT, '0.0.0.0', async () => {
             }
             console.log(`👥 Восстановлена активность для ${activeUsers.length} пользователей`);
         }
-        
-        // Загружаем времена регистрации в кэш
-        const usersList = await getAllUsersWithRegistrationTime();
-        for (const user of usersList) {
-            if (user.created_at) {
-                userRegistrationTimes.set(user.email, user.created_at);
-            }
-        }
-        console.log(`👥 Загружены времена регистрации для ${usersList.length} пользователей`);
-        
     } catch (error) {
         console.error('❌ Ошибка загрузки активных пользователей:', error);
     }
