@@ -4148,577 +4148,203 @@ app.get('/api/debug/activity', (req, res) => {
     });
 });
 
-// ==================== АДМИНИСТРАТИВНАЯ ПАНЕЛЬ ДЛЯ MASS FCM ====================
+// ==================== АДМИНИСТРАТИВНАЯ ПАНЕЛЬ ====================
 
-// Middleware для проверки администратора
+// Конфигурация администраторов
 const ADMIN_EMAILS = process.env.ADMIN_EMAILS ? 
     process.env.ADMIN_EMAILS.split(',') : 
     ['admin@beresta.ru'];
 
 function isAdmin(req, res, next) {
-    const userEmail = req.query.adminEmail || req.body.adminEmail || req.headers['x-admin-email'];
+    const userEmail = req.headers['x-admin-email'] || req.body.adminEmail || req.query.adminEmail;
     
     if (!userEmail) {
-        return res.status(401).json({
-            success: false,
-            error: 'Требуется авторизация администратора'
-        });
+        return res.status(401).json({ success: false, error: 'Требуется авторизация администратора' });
     }
     
     if (!ADMIN_EMAILS.includes(userEmail.toLowerCase())) {
-        return res.status(403).json({
-            success: false,
-            error: 'Нет прав администратора'
-        });
+        return res.status(403).json({ success: false, error: 'Нет прав администратора' });
     }
     
     req.adminEmail = userEmail.toLowerCase();
     next();
 }
 
-// ===== Административная панель =====
-app.get('/admin', (req, res) => {
-    const html = `
-    <!DOCTYPE html>
-    <html lang="ru">
-    <head>
-        <meta charset="UTF-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>Beresta Admin Panel - Mass FCM Notifications</title>
-        <style>
-            * { margin: 0; padding: 0; box-sizing: border-box; }
-            body {
-                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-                min-height: 100vh;
-                padding: 20px;
-            }
-            .container { max-width: 800px; margin: 0 auto; }
-            .header { text-align: center; color: white; margin-bottom: 30px; }
-            .header h1 { font-size: 2.5rem; margin-bottom: 10px; }
-            .header p { opacity: 0.9; }
-            .card { background: white; border-radius: 16px; box-shadow: 0 20px 60px rgba(0,0,0,0.3); overflow: hidden; margin-bottom: 20px; }
-            .card-header { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; padding: 20px 25px; }
-            .card-header h2 { font-size: 1.5rem; margin-bottom: 5px; }
-            .card-header p { opacity: 0.9; font-size: 0.9rem; }
-            .card-body { padding: 25px; }
-            .form-group { margin-bottom: 20px; }
-            label { display: block; margin-bottom: 8px; font-weight: 600; color: #333; }
-            input, select, textarea {
-                width: 100%; padding: 12px 15px;
-                border: 2px solid #e0e0e0; border-radius: 10px;
-                font-size: 1rem; transition: all 0.3s; font-family: inherit;
-            }
-            input:focus, select:focus, textarea:focus {
-                outline: none; border-color: #667eea; box-shadow: 0 0 0 3px rgba(102,126,234,0.1);
-            }
-            textarea { resize: vertical; min-height: 100px; }
-            .radio-group { display: flex; gap: 20px; align-items: center; flex-wrap: wrap; }
-            .radio-group label { display: flex; align-items: center; gap: 8px; font-weight: normal; cursor: pointer; margin-bottom: 0; }
-            .radio-group input { width: auto; margin: 0; }
-            button {
-                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-                color: white; border: none; padding: 14px 30px; border-radius: 10px;
-                font-size: 1rem; font-weight: 600; cursor: pointer; transition: all 0.3s; width: 100%;
-            }
-            button:hover { transform: translateY(-2px); box-shadow: 0 10px 25px rgba(102,126,234,0.4); }
-            button:disabled { opacity: 0.6; transform: none; cursor: not-allowed; }
-            .alert { padding: 15px 20px; border-radius: 10px; margin-bottom: 20px; display: none; }
-            .alert.success { background: #d4edda; color: #155724; border: 1px solid #c3e6cb; display: block; }
-            .alert.error { background: #f8d7da; color: #721c24; border: 1px solid #f5c6cb; display: block; }
-            .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 15px; margin-bottom: 20px; }
-            .stat-item { background: #f8f9fa; padding: 15px; border-radius: 10px; text-align: center; }
-            .stat-number { font-size: 2rem; font-weight: bold; color: #667eea; }
-            .stat-label { font-size: 0.85rem; color: #666; margin-top: 5px; }
-            .user-list { max-height: 300px; overflow-y: auto; border: 1px solid #e0e0e0; border-radius: 10px; padding: 10px; }
-            .user-item { display: flex; align-items: center; padding: 8px; border-bottom: 1px solid #f0f0f0; cursor: pointer; }
-            .user-item:hover { background: #f8f9fa; }
-            .user-item input { width: auto; margin-right: 10px; }
-            .user-item label { margin-bottom: 0; flex: 1; cursor: pointer; }
-            .badge { display: inline-block; padding: 4px 8px; border-radius: 20px; font-size: 0.75rem; font-weight: 600; margin-left: 10px; }
-            .badge.online { background: #d4edda; color: #155724; }
-            .badge.offline { background: #f8d7da; color: #721c24; }
-            .progress { background: #e0e0e0; border-radius: 10px; overflow: hidden; margin-top: 15px; display: none; }
-            .progress-bar { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); width: 0%; height: 30px; display: flex; align-items: center; justify-content: center; color: white; font-size: 0.85rem; font-weight: 600; transition: width 0.3s; }
-            .scheduled-list { margin-top: 15px; }
-            .scheduled-item { background: #f8f9fa; padding: 10px; border-radius: 8px; margin-bottom: 10px; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px; }
-            .scheduled-info { flex: 1; }
-            .scheduled-title { font-weight: 600; margin-bottom: 5px; }
-            .scheduled-time { font-size: 0.8rem; color: #666; }
-            .scheduled-actions button { width: auto; padding: 5px 10px; font-size: 0.8rem; background: #dc3545; }
-            .btn-small { width: auto; padding: 8px 15px; font-size: 0.9rem; margin-top: 10px; }
-            .template-buttons { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 10px; }
-            .template-buttons button { width: auto; background: #6c757d; padding: 10px 15px; font-size: 0.9rem; }
-        </style>
-    </head>
-    <body>
-        <div class="container">
-            <div class="header">
-                <h1>🔔 Beresta Admin Panel</h1>
-                <p>Управление массовыми уведомлениями FCM</p>
-            </div>
-            
-            <div class="card">
-                <div class="card-header">
-                    <h2>📊 Статистика сервера</h2>
-                    <p>Текущее состояние системы</p>
-                </div>
-                <div class="card-body">
-                    <div class="stats" id="stats">
-                        <div class="stat-item"><div class="stat-number" id="totalUsers">-</div><div class="stat-label">Всего пользователей</div></div>
-                        <div class="stat-item"><div class="stat-number" id="onlineUsers">-</div><div class="stat-label">Онлайн</div></div>
-                        <div class="stat-item"><div class="stat-number" id="fcmTokens">-</div><div class="stat-label">FCM токенов</div></div>
-                        <div class="stat-item"><div class="stat-number" id="activeRooms">-</div><div class="stat-label">Активных комнат</div></div>
-                    </div>
-                    <button onclick="refreshStats()" class="btn-small" style="background: #6c757d;">🔄 Обновить статистику</button>
-                </div>
-            </div>
-            
-            <div class="card">
-                <div class="card-header">
-                    <h2>✉️ Отправить массовое уведомление</h2>
-                    <p>Создайте и отправьте уведомление всем пользователям или выбранным</p>
-                </div>
-                <div class="card-body">
-                    <div id="alert" class="alert"></div>
-                    
-                    <div class="form-group">
-                        <label>🔐 Администратор (email)</label>
-                        <input type="email" id="adminEmail" placeholder="your-email@example.com" required>
-                    </div>
-                    
-                    <div class="form-group">
-                        <label>📝 Заголовок уведомления</label>
-                        <input type="text" id="notificationTitle" placeholder="Например: ⚠️ Технические работы" maxlength="100">
-                    </div>
-                    
-                    <div class="form-group">
-                        <label>💬 Текст сообщения</label>
-                        <textarea id="notificationBody" placeholder="Введите текст уведомления..."></textarea>
-                    </div>
-                    
-                    <div class="form-group">
-                        <label>👥 Получатели</label>
-                        <div class="radio-group">
-                            <label><input type="radio" name="recipientType" value="all" checked> Все пользователи</label>
-                            <label><input type="radio" name="recipientType" value="online"> Только онлайн</label>
-                            <label><input type="radio" name="recipientType" value="selected"> Выбранные</label>
-                        </div>
-                    </div>
-                    
-                    <div class="form-group" id="userSelectGroup" style="display: none;">
-                        <label>👤 Выберите пользователей</label>
-                        <div class="user-list" id="userList"><div style="text-align: center; padding: 20px;">Загрузка списка пользователей...</div></div>
-                        <div style="margin-top: 10px;">
-                            <button type="button" onclick="selectAllUsers()" style="width: auto; padding: 5px 10px; background: #6c757d; margin-right: 10px;">Выбрать всех</button>
-                            <button type="button" onclick="deselectAllUsers()" style="width: auto; padding: 5px 10px; background: #6c757d;">Снять всех</button>
-                        </div>
-                    </div>
-                    
-                    <div class="form-group">
-                        <label>⏰ Отложенная отправка (опционально)</label>
-                        <input type="datetime-local" id="scheduleTime">
-                    </div>
-                    
-                    <div class="form-group">
-                        <label>🔔 Дополнительные параметры</label>
-                        <div class="radio-group">
-                            <label><input type="checkbox" id="highPriority"> Высокий приоритет</label>
-                            <label><input type="checkbox" id="requireInteraction"> Требовать взаимодействия</label>
-                        </div>
-                    </div>
-                    
-                    <div id="progress" class="progress"><div class="progress-bar" id="progressBar">0%</div></div>
-                    
-                    <button id="sendBtn" onclick="sendNotification()">🚀 Отправить уведомление</button>
-                </div>
-            </div>
-            
-            <div class="card">
-                <div class="card-header">
-                    <h2>📅 Запланированные уведомления</h2>
-                    <p>Ожидающие отправки уведомления</p>
-                </div>
-                <div class="card-body">
-                    <div id="scheduledList" class="scheduled-list"><div style="text-align: center; padding: 20px;">Нет запланированных уведомлений</div></div>
-                </div>
-            </div>
-            
-            <div class="card">
-                <div class="card-header">
-                    <h2>📜 Шаблоны уведомлений</h2>
-                    <p>Быстрые шаблоны для частых уведомлений</p>
-                </div>
-                <div class="card-body">
-                    <div class="template-buttons">
-                        <button onclick="loadTemplate('maintenance')">🔧 Технические работы</button>
-                        <button onclick="loadTemplate('update')">🔄 Обновление сервера</button>
-                        <button onclick="loadTemplate('announcement')">📢 Важное объявление</button>
-                        <button onclick="loadTemplate('maintenance_end')">✅ Работы завершены</button>
-                    </div>
-                </div>
-            </div>
-        </div>
-        
-        <script>
-            // Глобальные переменные
-            var allUsers = [];
-            var scheduledNotifications = [];
-            
-            // Шаблоны уведомлений
-            var templates = {
-                maintenance: {
-                    title: '🔧 Технические работы',
-                    body: 'Ведутся технические работы. Сервер может быть недоступен с {startTime} по {endTime}. Приносим извинения за неудобства.'
-                },
-                update: {
-                    title: '🔄 Обновление сервера',
-                    body: 'Плановое обновление сервера запланировано на {datetime}. Пожалуйста, сохраните важные данные.'
-                },
-                announcement: {
-                    title: '📢 Важное объявление',
-                    body: 'Уважаемые пользователи! {message}'
-                },
-                maintenance_end: {
-                    title: '✅ Технические работы завершены',
-                    body: 'Все сервисы работают в штатном режиме. Спасибо за понимание!'
-                }
-            };
-            
-            // Функция для отображения уведомлений
-            function showAlert(type, message) {
-                var alertDiv = document.getElementById('alert');
-                if (!alertDiv) return;
-                alertDiv.className = 'alert ' + type;
-                alertDiv.innerHTML = message;
-                setTimeout(function() {
-                    alertDiv.className = 'alert';
-                }, 5000);
-            }
-            
-            // Функция для экранирования HTML
-            function escapeHtml(text) {
-                if (!text) return '';
-                var div = document.createElement('div');
-                div.textContent = text;
-                return div.innerHTML;
-            }
-            
-            // Загрузка шаблона
-            window.loadTemplate = function(templateName) {
-                var template = templates[templateName];
-                if (!template) return;
-                
-                document.getElementById('notificationTitle').value = template.title;
-                document.getElementById('notificationBody').value = template.body;
-                
-                if (templateName === 'maintenance') {
-                    var startTime = prompt('Введите время начала работ (например: 02:00 15.12.2024)');
-                    var endTime = prompt('Введите время окончания работ');
-                    if (startTime && endTime) {
-                        document.getElementById('notificationBody').value = template.body
-                            .replace('{startTime}', startTime)
-                            .replace('{endTime}', endTime);
-                    }
-                } else if (templateName === 'update') {
-                    var datetime = prompt('Введите дату и время обновления (например: 15.12.2024 в 03:00)');
-                    if (datetime) {
-                        document.getElementById('notificationBody').value = template.body.replace('{datetime}', datetime);
-                    }
-                } else if (templateName === 'announcement') {
-                    var message = prompt('Введите текст объявления');
-                    if (message) {
-                        document.getElementById('notificationBody').value = template.body.replace('{message}', message);
-                    }
-                }
-            };
-            
-            // Обновление статистики
-            window.refreshStats = async function() {
-                try {
-                    var response = await fetch('/admin/api/stats');
-                    var data = await response.json();
-                    if (data.success) {
-                        document.getElementById('totalUsers').textContent = data.totalUsers || 0;
-                        document.getElementById('onlineUsers').textContent = data.onlineUsers || 0;
-                        document.getElementById('fcmTokens').textContent = data.fcmTokens || 0;
-                        document.getElementById('activeRooms').textContent = data.activeRooms || 0;
-                    }
-                } catch (error) {
-                    console.error('Error loading stats:', error);
-                }
-            };
-            
-            // Загрузка списка пользователей
-            window.loadUsers = async function() {
-                try {
-                    var response = await fetch('/admin/api/users');
-                    var data = await response.json();
-                    if (data.success) {
-                        allUsers = data.users;
-                        renderUserList();
-                    }
-                } catch (error) {
-                    console.error('Error loading users:', error);
-                    document.getElementById('userList').innerHTML = '<div style="text-align: center; padding: 20px; color: red;">Ошибка загрузки пользователей</div>';
-                }
-            };
-            
-            // Отображение списка пользователей
-            function renderUserList() {
-                var container = document.getElementById('userList');
-                if (!container) return;
-                
-                if (!allUsers.length) {
-                    container.innerHTML = '<div style="text-align: center; padding: 20px;">Нет пользователей</div>';
-                    return;
-                }
-                
-                var html = '';
-                for (var i = 0; i < allUsers.length; i++) {
-                    var user = allUsers[i];
-                    var id = 'user_' + user.email.replace(/[^a-z0-9]/gi, '_');
-                    html += '<div class="user-item">' +
-                        '<input type="checkbox" class="user-checkbox" value="' + user.email + '" id="' + id + '">' +
-                        '<label for="' + id + '">' +
-                        '<strong>' + escapeHtml(user.name || user.email) + '</strong>' +
-                        '<span class="badge ' + (user.isOnline ? 'online' : 'offline') + '">' + (user.isOnline ? 'online' : 'offline') + '</span>' +
-                        '<br><small style="color: #666;">' + escapeHtml(user.email) + '</small>' +
-                        '</label>' +
-                        '</div>';
-                }
-                container.innerHTML = html;
-            }
-            
-            // Выбрать всех пользователей
-            window.selectAllUsers = function() {
-                var checkboxes = document.querySelectorAll('.user-checkbox');
-                for (var i = 0; i < checkboxes.length; i++) {
-                    checkboxes[i].checked = true;
-                }
-            };
-            
-            // Снять всех пользователей
-            window.deselectAllUsers = function() {
-                var checkboxes = document.querySelectorAll('.user-checkbox');
-                for (var i = 0; i < checkboxes.length; i++) {
-                    checkboxes[i].checked = false;
-                }
-            };
-            
-            // Отправка уведомления
-            window.sendNotification = async function() {
-                var adminEmail = document.getElementById('adminEmail').value;
-                var title = document.getElementById('notificationTitle').value;
-                var body = document.getElementById('notificationBody').value;
-                var recipientType = document.querySelector('input[name="recipientType"]:checked').value;
-                var scheduleTime = document.getElementById('scheduleTime').value;
-                var highPriority = document.getElementById('highPriority').checked;
-                var requireInteraction = document.getElementById('requireInteraction').checked;
-                
-                if (!adminEmail) {
-                    showAlert('error', 'Введите email администратора');
-                    return;
-                }
-                
-                if (!title && !body) {
-                    showAlert('error', 'Заполните заголовок или текст уведомления');
-                    return;
-                }
-                
-                var recipients = [];
-                if (recipientType === 'selected') {
-                    var checkboxes = document.querySelectorAll('.user-checkbox:checked');
-                    for (var i = 0; i < checkboxes.length; i++) {
-                        recipients.push(checkboxes[i].value);
-                    }
-                    if (recipients.length === 0) {
-                        showAlert('error', 'Выберите хотя бы одного получателя');
-                        return;
-                    }
-                }
-                
-                var sendBtn = document.getElementById('sendBtn');
-                var progress = document.getElementById('progress');
-                var progressBar = document.getElementById('progressBar');
-                
-                sendBtn.disabled = true;
-                progress.style.display = 'block';
-                progressBar.style.width = '50%';
-                progressBar.textContent = 'Отправка...';
-                
-                try {
-                    var response = await fetch('/admin/api/send-mass-notification', {
-                        method: 'POST',
-                        headers: {
-                            'Content-Type': 'application/json',
-                            'X-Admin-Email': adminEmail
-                        },
-                        body: JSON.stringify({
-                            title: title,
-                            body: body,
-                            recipientType: recipientType,
-                            recipients: recipients,
-                            scheduleTime: scheduleTime || null,
-                            highPriority: highPriority,
-                            requireInteraction: requireInteraction
-                        })
-                    });
-                    
-                    var data = await response.json();
-                    
-                    if (data.success) {
-                        if (data.scheduled) {
-                            showAlert('success', '✅ Уведомление запланировано! ID: ' + data.scheduledId);
-                            loadScheduled();
-                        } else {
-                            showAlert('success', '✅ Уведомление отправлено! Получено: ' + data.sent + '/' + data.total);
-                        }
-                        if (!scheduleTime) {
-                            document.getElementById('notificationTitle').value = '';
-                            document.getElementById('notificationBody').value = '';
-                        }
-                    } else {
-                        showAlert('error', '❌ Ошибка: ' + (data.error || 'Неизвестная ошибка'));
-                    }
-                } catch (error) {
-                    console.error('Send error:', error);
-                    showAlert('error', '❌ Ошибка отправки: ' + error.message);
-                } finally {
-                    sendBtn.disabled = false;
-                    progress.style.display = 'none';
-                    progressBar.style.width = '0%';
-                    progressBar.textContent = '0%';
-                }
-            };
-            
-            // Загрузка запланированных уведомлений
-            window.loadScheduled = async function() {
-                var adminEmail = document.getElementById('adminEmail').value;
-                if (!adminEmail) return;
-                
-                try {
-                    var response = await fetch('/admin/api/scheduled?adminEmail=' + encodeURIComponent(adminEmail));
-                    var data = await response.json();
-                    if (data.success) {
-                        scheduledNotifications = data.notifications;
-                        renderScheduledList();
-                    }
-                } catch (error) {
-                    console.error('Error loading scheduled:', error);
-                }
-            };
-            
-            // Отображение запланированных уведомлений
-            function renderScheduledList() {
-                var container = document.getElementById('scheduledList');
-                if (!container) return;
-                
-                if (!scheduledNotifications.length) {
-                    container.innerHTML = '<div style="text-align: center; padding: 20px;">Нет запланированных уведомлений</div>';
-                    return;
-                }
-                
-                var html = '';
-                for (var i = 0; i < scheduledNotifications.length; i++) {
-                    var n = scheduledNotifications[i];
-                    html += '<div class="scheduled-item">' +
-                        '<div class="scheduled-info">' +
-                        '<div class="scheduled-title">' + escapeHtml(n.title) + '</div>' +
-                        '<div class="scheduled-time">📅 ' + new Date(n.scheduledTime).toLocaleString() + ' | 👥 ' + 
-                        (n.recipientType === 'all' ? 'Все' : n.recipientType === 'online' ? 'Онлайн' : n.recipients.length + ' пользователей') + '</div>' +
-                        '<div><small>' + escapeHtml(n.body.substring(0, 100)) + (n.body.length > 100 ? '...' : '') + '</small></div>' +
-                        '</div>' +
-                        '<div class="scheduled-actions"><button onclick="cancelScheduled(\'' + n.id + '\')">❌ Отменить</button></div>' +
-                        '</div>';
-                }
-                container.innerHTML = html;
-            }
-            
-            // Отмена запланированного уведомления
-            window.cancelScheduled = async function(id) {
-                var adminEmail = document.getElementById('adminEmail').value;
-                if (!adminEmail) {
-                    showAlert('error', 'Введите email администратора');
-                    return;
-                }
-                
-                if (!confirm('Отменить запланированное уведомление?')) return;
-                
-                try {
-                    var response = await fetch('/admin/api/scheduled/cancel', {
-                        method: 'POST',
-                        headers: {
-                            'Content-Type': 'application/json',
-                            'X-Admin-Email': adminEmail
-                        },
-                        body: JSON.stringify({ id: id })
-                    });
-                    
-                    var data = await response.json();
-                    if (data.success) {
-                        showAlert('success', '✅ Уведомление отменено');
-                        loadScheduled();
-                    } else {
-                        showAlert('error', 'Ошибка: ' + data.error);
-                    }
-                } catch (error) {
-                    showAlert('error', 'Ошибка: ' + error.message);
-                }
-            };
-            
-            // Настройка обработчиков событий после загрузки страницы
-            document.addEventListener('DOMContentLoaded', function() {
-                // Обновление статистики
-                refreshStats();
-                
-                // Загрузка пользователей
-                loadUsers();
-                
-                // Загрузка запланированных уведомлений
-                var adminEmailInput = document.getElementById('adminEmail');
-                if (adminEmailInput) {
-                    adminEmailInput.addEventListener('change', function() {
-                        if (this.value) loadScheduled();
-                    });
-                }
-                
-                // Обработчик изменения типа получателей
-                var radios = document.querySelectorAll('input[name="recipientType"]');
-                for (var i = 0; i < radios.length; i++) {
-                    radios[i].addEventListener('change', function() {
-                        var userSelectGroup = document.getElementById('userSelectGroup');
-                        if (this.value === 'selected') {
-                            userSelectGroup.style.display = 'block';
-                            if (allUsers.length === 0) loadUsers();
-                        } else {
-                            userSelectGroup.style.display = 'none';
-                        }
-                    });
-                }
-                
-                // Автоматическое обновление статистики каждые 30 секунд
-                setInterval(refreshStats, 30000);
-                
-                // Автоматическое обновление запланированных уведомлений каждые 10 секунд
-                setInterval(function() {
-                    var adminEmail = document.getElementById('adminEmail');
-                    if (adminEmail && adminEmail.value) {
-                        loadScheduled();
-                    }
-                }, 10000);
-            });
-        </script>
-    </body>
-    </html>
-    `;
-    res.send(html);
-});
+// Хранилище для запланированных уведомлений
+const scheduledNotifications = new Map();
 
-// ===== API для административной панели =====
+// Функция выполнения массовой отправки
+async function executeMassNotification(notification) {
+    const { title, body, recipientType, recipients } = notification;
+    
+    console.log(`📢 Начало массовой рассылки: "${title}"`);
+    
+    try {
+        let targetEmails = [];
+        
+        if (recipientType === 'all') {
+            const { data: users } = await supabase.from('regular_users').select('email');
+            targetEmails = (users || []).map(u => u.email);
+        } else if (recipientType === 'online') {
+            const now = Date.now();
+            for (const [email, lastActivity] of userLastActivity.entries()) {
+                if (now - lastActivity < ACTIVITY_TIMEOUT) {
+                    targetEmails.push(email);
+                }
+            }
+        } else if (recipientType === 'selected') {
+            targetEmails = recipients;
+        }
+        
+        console.log(`📊 Найдено получателей: ${targetEmails.length}`);
+        
+        let sent = 0;
+        let failed = 0;
+        
+        for (const email of targetEmails) {
+            try {
+                const { data: tokenData } = await supabase
+                    .from('user_fcm_tokens')
+                    .select('fcm_token')
+                    .eq('user_email', email.toLowerCase())
+                    .order('created_at', { ascending: false })
+                    .limit(1);
+                
+                if (!tokenData || tokenData.length === 0) {
+                    failed++;
+                    continue;
+                }
+                
+                const message = {
+                    notification: { title, body },
+                    data: {
+                        type: 'admin_notification',
+                        title: title,
+                        body: body,
+                        timestamp: new Date().toISOString()
+                    },
+                    token: tokenData[0].fcm_token,
+                    android: { priority: 'high' }
+                };
+                
+                await admin.messaging().send(message);
+                sent++;
+                await new Promise(resolve => setTimeout(resolve, 100));
+                
+            } catch (error) {
+                failed++;
+                console.error(`❌ Ошибка отправки для ${email}:`, error.message);
+            }
+        }
+        
+        console.log(`✅ Массовая рассылка завершена: отправлено ${sent}, ошибок ${failed}`);
+        return { sent, failed, total: targetEmails.length };
+        
+    } catch (error) {
+        console.error('❌ Ошибка выполнения массовой рассылки:', error);
+        return { sent: 0, failed: 0, total: 0, error: error.message };
+    }
+}
+
+// ==================== АДМИНИСТРАТИВНАЯ ПАНЕЛЬ ====================
+
+// Конфигурация администраторов
+const ADMIN_EMAILS = process.env.ADMIN_EMAILS ? 
+    process.env.ADMIN_EMAILS.split(',') : 
+    ['admin@beresta.ru'];
+
+function isAdmin(req, res, next) {
+    const userEmail = req.headers['x-admin-email'] || req.body.adminEmail || req.query.adminEmail;
+    
+    if (!userEmail) {
+        return res.status(401).json({ success: false, error: 'Требуется авторизация администратора' });
+    }
+    
+    if (!ADMIN_EMAILS.includes(userEmail.toLowerCase())) {
+        return res.status(403).json({ success: false, error: 'Нет прав администратора' });
+    }
+    
+    req.adminEmail = userEmail.toLowerCase();
+    next();
+}
 
 // Хранилище для запланированных уведомлений
 const scheduledNotifications = new Map();
+
+// Функция выполнения массовой отправки
+async function executeMassNotification(notification) {
+    const { title, body, recipientType, recipients } = notification;
+    
+    console.log(`📢 Начало массовой рассылки: "${title}"`);
+    
+    try {
+        let targetEmails = [];
+        
+        if (recipientType === 'all') {
+            const { data: users } = await supabase.from('regular_users').select('email');
+            targetEmails = (users || []).map(u => u.email);
+        } else if (recipientType === 'online') {
+            const now = Date.now();
+            for (const [email, lastActivity] of userLastActivity.entries()) {
+                if (now - lastActivity < ACTIVITY_TIMEOUT) {
+                    targetEmails.push(email);
+                }
+            }
+        } else if (recipientType === 'selected') {
+            targetEmails = recipients;
+        }
+        
+        console.log(`📊 Найдено получателей: ${targetEmails.length}`);
+        
+        let sent = 0;
+        let failed = 0;
+        
+        for (const email of targetEmails) {
+            try {
+                const { data: tokenData } = await supabase
+                    .from('user_fcm_tokens')
+                    .select('fcm_token')
+                    .eq('user_email', email.toLowerCase())
+                    .order('created_at', { ascending: false })
+                    .limit(1);
+                
+                if (!tokenData || tokenData.length === 0) {
+                    failed++;
+                    continue;
+                }
+                
+                const message = {
+                    notification: { title, body },
+                    data: {
+                        type: 'admin_notification',
+                        title: title,
+                        body: body,
+                        timestamp: new Date().toISOString()
+                    },
+                    token: tokenData[0].fcm_token,
+                    android: { priority: 'high' }
+                };
+                
+                await admin.messaging().send(message);
+                sent++;
+                await new Promise(resolve => setTimeout(resolve, 100));
+                
+            } catch (error) {
+                failed++;
+                console.error(`❌ Ошибка отправки для ${email}:`, error.message);
+            }
+        }
+        
+        console.log(`✅ Массовая рассылка завершена: отправлено ${sent}, ошибок ${failed}`);
+        return { sent, failed, total: targetEmails.length };
+        
+    } catch (error) {
+        console.error('❌ Ошибка выполнения массовой рассылки:', error);
+        return { sent: 0, failed: 0, total: 0, error: error.message };
+    }
+}
+
+// ===== API для административной панели =====
 
 // Получение статистики
 app.get('/admin/api/stats', async (req, res) => {
@@ -4768,10 +4394,7 @@ app.get('/admin/api/users', async (req, res) => {
             isOnline: onlineSet.has(user.email.toLowerCase())
         }));
         
-        res.json({
-            success: true,
-            users: formattedUsers
-        });
+        res.json({ success: true, users: formattedUsers });
     } catch (error) {
         res.status(500).json({ success: false, error: error.message });
     }
@@ -4780,17 +4403,14 @@ app.get('/admin/api/users', async (req, res) => {
 // Отправка массового уведомления
 app.post('/admin/api/send-mass-notification', isAdmin, async (req, res) => {
     try {
-        const { title, body, recipientType, recipients, scheduleTime, highPriority, requireInteraction } = req.body;
+        const { title, body, recipientType, recipients, scheduleTime } = req.body;
         
         if (scheduleTime) {
             const scheduledId = uuidv4();
             const scheduledTime = new Date(scheduleTime);
             
             if (scheduledTime <= new Date()) {
-                return res.status(400).json({
-                    success: false,
-                    error: 'Время отправки должно быть в будущем'
-                });
+                return res.status(400).json({ success: false, error: 'Время отправки должно быть в будущем' });
             }
             
             scheduledNotifications.set(scheduledId, {
@@ -4799,11 +4419,8 @@ app.post('/admin/api/send-mass-notification', isAdmin, async (req, res) => {
                 body: body || '',
                 recipientType,
                 recipients: recipients || [],
-                highPriority: highPriority || false,
-                requireInteraction: requireInteraction || false,
                 scheduledTime: scheduledTime.toISOString(),
-                createdAt: new Date().toISOString(),
-                adminEmail: req.adminEmail
+                createdAt: new Date().toISOString()
             });
             
             const delay = scheduledTime.getTime() - Date.now();
@@ -4815,37 +4432,20 @@ app.post('/admin/api/send-mass-notification', isAdmin, async (req, res) => {
                 }
             }, delay);
             
-            console.log(`📅 Запланировано уведомление ${scheduledId} на ${scheduledTime}`);
-            
-            res.json({
-                success: true,
-                scheduled: true,
-                scheduledId: scheduledId,
-                scheduledTime: scheduledTime.toISOString()
-            });
+            res.json({ success: true, scheduled: true, scheduledId });
         } else {
             const result = await executeMassNotification({
                 title: title || 'Уведомление',
                 body: body || '',
                 recipientType,
-                recipients: recipients || [],
-                highPriority: highPriority || false,
-                requireInteraction: requireInteraction || false
+                recipients: recipients || []
             });
             
-            res.json({
-                success: true,
-                sent: result.sent,
-                failed: result.failed,
-                total: result.total
-            });
+            res.json({ success: true, sent: result.sent, failed: result.failed, total: result.total });
         }
     } catch (error) {
-        console.error('❌ Ошибка отправки массового уведомления:', error);
-        res.status(500).json({
-            success: false,
-            error: error.message
-        });
+        console.error('❌ Ошибка отправки:', error);
+        res.status(500).json({ success: false, error: error.message });
     }
 });
 
@@ -4856,10 +4456,7 @@ app.get('/admin/api/scheduled', async (req, res) => {
             .filter(n => new Date(n.scheduledTime) > new Date())
             .sort((a, b) => new Date(a.scheduledTime) - new Date(b.scheduledTime));
         
-        res.json({
-            success: true,
-            notifications: notifications
-        });
+        res.json({ success: true, notifications });
     } catch (error) {
         res.status(500).json({ success: false, error: error.message });
     }
@@ -4871,127 +4468,504 @@ app.post('/admin/api/scheduled/cancel', isAdmin, async (req, res) => {
         const { id } = req.body;
         
         if (!scheduledNotifications.has(id)) {
-            return res.status(404).json({
-                success: false,
-                error: 'Уведомление не найдено'
-            });
+            return res.status(404).json({ success: false, error: 'Уведомление не найдено' });
         }
         
         scheduledNotifications.delete(id);
-        console.log(`❌ Отменено запланированное уведомление ${id}`);
-        
-        res.json({
-            success: true,
-            message: 'Уведомление отменено'
-        });
+        res.json({ success: true, message: 'Уведомление отменено' });
     } catch (error) {
         res.status(500).json({ success: false, error: error.message });
     }
 });
 
-// Функция выполнения массовой отправки
-async function executeMassNotification(notification) {
-    const { title, body, recipientType, recipients, highPriority, requireInteraction } = notification;
-    
-    console.log(`📢 Начало массовой рассылки: "${title}"`);
-    
-    try {
-        let targetEmails = [];
-        
-        if (recipientType === 'all') {
-            const { data: users } = await supabase
-                .from('regular_users')
-                .select('email');
-            targetEmails = (users || []).map(u => u.email);
-        } else if (recipientType === 'online') {
-            const now = Date.now();
-            for (const [email, lastActivity] of userLastActivity.entries()) {
-                if (now - lastActivity < ACTIVITY_TIMEOUT) {
-                    targetEmails.push(email);
-                }
+// ===== АДМИНИСТРАТИВНАЯ ПАНЕЛЬ (HTML) =====
+app.get('/admin', (req, res) => {
+    res.send(`
+    <!DOCTYPE html>
+    <html lang="ru">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>Beresta Admin Panel</title>
+        <style>
+            * { margin: 0; padding: 0; box-sizing: border-box; }
+            body {
+                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                min-height: 100vh;
+                padding: 20px;
             }
-        } else if (recipientType === 'selected') {
-            targetEmails = recipients;
-        }
+            .container { max-width: 900px; margin: 0 auto; }
+            .header { text-align: center; color: white; margin-bottom: 30px; }
+            .header h1 { font-size: 2.5rem; margin-bottom: 10px; }
+            .card {
+                background: white;
+                border-radius: 16px;
+                box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+                margin-bottom: 20px;
+                overflow: hidden;
+            }
+            .card-header {
+                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                color: white;
+                padding: 20px 25px;
+            }
+            .card-header h2 { font-size: 1.5rem; margin-bottom: 5px; }
+            .card-header p { opacity: 0.9; font-size: 0.9rem; }
+            .card-body { padding: 25px; }
+            .form-group { margin-bottom: 20px; }
+            label { display: block; margin-bottom: 8px; font-weight: 600; color: #333; }
+            input, select, textarea {
+                width: 100%;
+                padding: 12px 15px;
+                border: 2px solid #e0e0e0;
+                border-radius: 10px;
+                font-size: 1rem;
+                transition: all 0.3s;
+                font-family: inherit;
+            }
+            input:focus, select:focus, textarea:focus {
+                outline: none;
+                border-color: #667eea;
+                box-shadow: 0 0 0 3px rgba(102,126,234,0.1);
+            }
+            textarea { resize: vertical; min-height: 100px; }
+            .radio-group {
+                display: flex;
+                gap: 20px;
+                flex-wrap: wrap;
+            }
+            .radio-group label {
+                display: flex;
+                align-items: center;
+                gap: 8px;
+                font-weight: normal;
+                cursor: pointer;
+                margin-bottom: 0;
+            }
+            .radio-group input { width: auto; margin: 0; }
+            button {
+                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                color: white;
+                border: none;
+                padding: 14px 30px;
+                border-radius: 10px;
+                font-size: 1rem;
+                font-weight: 600;
+                cursor: pointer;
+                transition: all 0.3s;
+                width: 100%;
+            }
+            button:hover { transform: translateY(-2px); box-shadow: 0 10px 25px rgba(102,126,234,0.4); }
+            button:disabled { opacity: 0.6; transform: none; cursor: not-allowed; }
+            .btn-small { width: auto; padding: 8px 15px; font-size: 0.9rem; margin-top: 10px; }
+            .btn-secondary { background: #6c757d; }
+            .alert {
+                padding: 15px 20px;
+                border-radius: 10px;
+                margin-bottom: 20px;
+                display: none;
+            }
+            .alert.success { background: #d4edda; color: #155724; border: 1px solid #c3e6cb; display: block; }
+            .alert.error { background: #f8d7da; color: #721c24; border: 1px solid #f5c6cb; display: block; }
+            .stats {
+                display: grid;
+                grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+                gap: 15px;
+                margin-bottom: 20px;
+            }
+            .stat-item {
+                background: #f8f9fa;
+                padding: 15px;
+                border-radius: 10px;
+                text-align: center;
+            }
+            .stat-number { font-size: 2rem; font-weight: bold; color: #667eea; }
+            .stat-label { font-size: 0.85rem; color: #666; margin-top: 5px; }
+            .user-list {
+                max-height: 300px;
+                overflow-y: auto;
+                border: 1px solid #e0e0e0;
+                border-radius: 10px;
+                padding: 10px;
+            }
+            .user-item {
+                display: flex;
+                align-items: center;
+                padding: 8px;
+                border-bottom: 1px solid #f0f0f0;
+            }
+            .user-item:hover { background: #f8f9fa; }
+            .user-item input { width: auto; margin-right: 10px; }
+            .user-item label { margin-bottom: 0; flex: 1; cursor: pointer; }
+            .badge {
+                display: inline-block;
+                padding: 4px 8px;
+                border-radius: 20px;
+                font-size: 0.75rem;
+                font-weight: 600;
+                margin-left: 10px;
+            }
+            .badge.online { background: #d4edda; color: #155724; }
+            .badge.offline { background: #f8d7da; color: #721c24; }
+            .progress {
+                background: #e0e0e0;
+                border-radius: 10px;
+                overflow: hidden;
+                margin-top: 15px;
+                display: none;
+            }
+            .progress-bar {
+                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                width: 0%;
+                height: 30px;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                color: white;
+                font-size: 0.85rem;
+                font-weight: 600;
+                transition: width 0.3s;
+            }
+            .scheduled-list { margin-top: 15px; }
+            .scheduled-item {
+                background: #f8f9fa;
+                padding: 10px;
+                border-radius: 8px;
+                margin-bottom: 10px;
+                display: flex;
+                justify-content: space-between;
+                align-items: center;
+                flex-wrap: wrap;
+                gap: 10px;
+            }
+            .scheduled-info { flex: 1; }
+            .scheduled-title { font-weight: 600; margin-bottom: 5px; }
+            .scheduled-time { font-size: 0.8rem; color: #666; }
+            .scheduled-actions button {
+                width: auto;
+                padding: 5px 10px;
+                font-size: 0.8rem;
+                background: #dc3545;
+            }
+            .template-buttons {
+                display: flex;
+                gap: 10px;
+                flex-wrap: wrap;
+            }
+            .template-buttons button {
+                width: auto;
+                background: #6c757d;
+                padding: 10px 15px;
+                font-size: 0.9rem;
+            }
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <div class="header">
+                <h1>🔔 Beresta Admin Panel</h1>
+                <p>Управление массовыми уведомлениями FCM</p>
+            </div>
+            
+            <div class="card">
+                <div class="card-header">
+                    <h2>📊 Статистика сервера</h2>
+                </div>
+                <div class="card-body">
+                    <div class="stats">
+                        <div class="stat-item"><div class="stat-number" id="totalUsers">-</div><div class="stat-label">Всего пользователей</div></div>
+                        <div class="stat-item"><div class="stat-number" id="onlineUsers">-</div><div class="stat-label">Онлайн</div></div>
+                        <div class="stat-item"><div class="stat-number" id="fcmTokens">-</div><div class="stat-label">FCM токенов</div></div>
+                        <div class="stat-item"><div class="stat-number" id="activeRooms">-</div><div class="stat-label">Активных комнат</div></div>
+                    </div>
+                    <button onclick="refreshStats()" class="btn-small btn-secondary">🔄 Обновить</button>
+                </div>
+            </div>
+            
+            <div class="card">
+                <div class="card-header">
+                    <h2>✉️ Отправить уведомление</h2>
+                </div>
+                <div class="card-body">
+                    <div id="alert" class="alert"></div>
+                    
+                    <div class="form-group">
+                        <label>🔐 Ваш email (администратор)</label>
+                        <input type="email" id="adminEmail" placeholder="admin@beresta.ru" required>
+                    </div>
+                    
+                    <div class="form-group">
+                        <label>📝 Заголовок</label>
+                        <input type="text" id="title" placeholder="Например: ⚠️ Технические работы">
+                    </div>
+                    
+                    <div class="form-group">
+                        <label>💬 Текст сообщения</label>
+                        <textarea id="body" placeholder="Введите текст уведомления..."></textarea>
+                    </div>
+                    
+                    <div class="form-group">
+                        <label>👥 Получатели</label>
+                        <div class="radio-group">
+                            <label><input type="radio" name="recipientType" value="all" checked> Все пользователи</label>
+                            <label><input type="radio" name="recipientType" value="online"> Только онлайн</label>
+                            <label><input type="radio" name="recipientType" value="selected"> Выбранные</label>
+                        </div>
+                    </div>
+                    
+                    <div id="userSelectGroup" class="form-group" style="display: none;">
+                        <label>👤 Выберите пользователей</label>
+                        <div class="user-list" id="userList">Загрузка...</div>
+                        <div style="margin-top: 10px;">
+                            <button type="button" onclick="selectAllUsers()" class="btn-small btn-secondary">Выбрать всех</button>
+                            <button type="button" onclick="deselectAllUsers()" class="btn-small btn-secondary">Снять всех</button>
+                        </div>
+                    </div>
+                    
+                    <div class="form-group">
+                        <label>⏰ Отложенная отправка (опционально)</label>
+                        <input type="datetime-local" id="scheduleTime">
+                    </div>
+                    
+                    <div id="progress" class="progress">
+                        <div class="progress-bar" id="progressBar">0%</div>
+                    </div>
+                    
+                    <button id="sendBtn" onclick="sendNotification()">🚀 Отправить</button>
+                </div>
+            </div>
+            
+            <div class="card">
+                <div class="card-header">
+                    <h2>📅 Запланированные</h2>
+                </div>
+                <div class="card-body">
+                    <div id="scheduledList">Нет запланированных</div>
+                </div>
+            </div>
+            
+            <div class="card">
+                <div class="card-header">
+                    <h2>📜 Шаблоны</h2>
+                </div>
+                <div class="card-body">
+                    <div class="template-buttons">
+                        <button onclick="loadTemplate('maintenance')">🔧 Техработы</button>
+                        <button onclick="loadTemplate('update')">🔄 Обновление</button>
+                        <button onclick="loadTemplate('announcement')">📢 Объявление</button>
+                        <button onclick="loadTemplate('maintenance_end')">✅ Работы завершены</button>
+                    </div>
+                </div>
+            </div>
+        </div>
         
-        console.log(`📊 Найдено получателей: ${targetEmails.length}`);
-        
-        let sent = 0;
-        let failed = 0;
-        
-        for (const email of targetEmails) {
-            try {
-                const { data: tokenData } = await supabase
-                    .from('user_fcm_tokens')
-                    .select('fcm_token')
-                    .eq('user_email', email.toLowerCase())
-                    .order('created_at', { ascending: false })
-                    .limit(1);
+        <script>
+            let allUsers = [];
+            
+            const templates = {
+                maintenance: { title: '🔧 Технические работы', body: 'Ведутся технические работы. Сервер может быть недоступен с {startTime} по {endTime}.' },
+                update: { title: '🔄 Обновление сервера', body: 'Обновление запланировано на {datetime}. Сохраните важные данные.' },
+                announcement: { title: '📢 Важное объявление', body: 'Уважаемые пользователи! {message}' },
+                maintenance_end: { title: '✅ Работы завершены', body: 'Все сервисы работают в штатном режиме.' }
+            };
+            
+            function showAlert(type, message) {
+                const alertDiv = document.getElementById('alert');
+                alertDiv.className = 'alert ' + type;
+                alertDiv.innerHTML = message;
+                setTimeout(() => { alertDiv.className = 'alert'; }, 5000);
+            }
+            
+            window.loadTemplate = function(name) {
+                const t = templates[name];
+                if (!t) return;
+                document.getElementById('title').value = t.title;
+                document.getElementById('body').value = t.body;
                 
-                if (!tokenData || tokenData.length === 0) {
-                    failed++;
-                    continue;
-                }
-                
-                const message = {
-                    notification: {
-                        title: title,
-                        body: body
-                    },
-                    data: {
-                        type: 'admin_notification',
-                        title: title,
-                        body: body,
-                        timestamp: new Date().toISOString(),
-                        requireInteraction: requireInteraction ? 'true' : 'false'
-                    },
-                    token: tokenData[0].fcm_token,
-                    android: {
-                        priority: highPriority ? 'high' : 'normal',
-                        notification: {
-                            channelId: 'admin_notifications',
-                            priority: highPriority ? 'high' : 'default'
-                        }
-                    },
-                    apns: {
-                        payload: {
-                            aps: {
-                                alert: {
-                                    title: title,
-                                    body: body
-                                },
-                                sound: 'default',
-                                badge: 1
-                            }
-                        }
+                if (name === 'maintenance') {
+                    const start = prompt('Время начала');
+                    const end = prompt('Время окончания');
+                    if (start && end) {
+                        document.getElementById('body').value = t.body.replace('{startTime}', start).replace('{endTime}', end);
                     }
-                };
+                } else if (name === 'update') {
+                    const dt = prompt('Дата и время');
+                    if (dt) document.getElementById('body').value = t.body.replace('{datetime}', dt);
+                } else if (name === 'announcement') {
+                    const msg = prompt('Текст объявления');
+                    if (msg) document.getElementById('body').value = t.body.replace('{message}', msg);
+                }
+            };
+            
+            window.refreshStats = async function() {
+                try {
+                    const res = await fetch('/admin/api/stats');
+                    const data = await res.json();
+                    if (data.success) {
+                        document.getElementById('totalUsers').textContent = data.totalUsers;
+                        document.getElementById('onlineUsers').textContent = data.onlineUsers;
+                        document.getElementById('fcmTokens').textContent = data.fcmTokens;
+                        document.getElementById('activeRooms').textContent = data.activeRooms;
+                    }
+                } catch(e) { console.error(e); }
+            };
+            
+            window.loadUsers = async function() {
+                try {
+                    const res = await fetch('/admin/api/users');
+                    const data = await res.json();
+                    if (data.success) {
+                        allUsers = data.users;
+                        const container = document.getElementById('userList');
+                        if (allUsers.length === 0) {
+                            container.innerHTML = 'Нет пользователей';
+                            return;
+                        }
+                        container.innerHTML = allUsers.map(u => 
+                            '<div class="user-item">' +
+                                '<input type="checkbox" class="user-checkbox" value="' + u.email + '" id="u_' + u.email.replace(/[^a-z0-9]/gi, '_') + '">' +
+                                '<label for="u_' + u.email.replace(/[^a-z0-9]/gi, '_') + '">' +
+                                    '<strong>' + (u.name || u.email) + '</strong>' +
+                                    '<span class="badge ' + (u.isOnline ? 'online' : 'offline') + '">' + (u.isOnline ? 'online' : 'offline') + '</span>' +
+                                    '<br><small>' + u.email + '</small>' +
+                                '</label>' +
+                            '</div>'
+                        ).join('');
+                    }
+                } catch(e) { console.error(e); }
+            };
+            
+            window.selectAllUsers = function() {
+                document.querySelectorAll('.user-checkbox').forEach(cb => cb.checked = true);
+            };
+            
+            window.deselectAllUsers = function() {
+                document.querySelectorAll('.user-checkbox').forEach(cb => cb.checked = false);
+            };
+            
+            window.loadScheduled = async function() {
+                const adminEmail = document.getElementById('adminEmail').value;
+                if (!adminEmail) return;
+                try {
+                    const res = await fetch('/admin/api/scheduled?adminEmail=' + encodeURIComponent(adminEmail));
+                    const data = await res.json();
+                    if (data.success && data.notifications.length) {
+                        const container = document.getElementById('scheduledList');
+                        container.innerHTML = data.notifications.map(n => 
+                            '<div class="scheduled-item">' +
+                                '<div class="scheduled-info">' +
+                                    '<div class="scheduled-title">' + escapeHtml(n.title) + '</div>' +
+                                    '<div class="scheduled-time">📅 ' + new Date(n.scheduledTime).toLocaleString() + '</div>' +
+                                    '<div><small>' + escapeHtml(n.body.substring(0, 100)) + '</small></div>' +
+                                '</div>' +
+                                '<div class="scheduled-actions"><button onclick="cancelScheduled(\'' + n.id + '\')">❌ Отменить</button></div>' +
+                            '</div>'
+                        ).join('');
+                    } else {
+                        document.getElementById('scheduledList').innerHTML = 'Нет запланированных';
+                    }
+                } catch(e) { console.error(e); }
+            };
+            
+            window.cancelScheduled = async function(id) {
+                const adminEmail = document.getElementById('adminEmail').value;
+                if (!adminEmail) { showAlert('error', 'Введите email'); return; }
+                if (!confirm('Отменить?')) return;
+                try {
+                    const res = await fetch('/admin/api/scheduled/cancel', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json', 'X-Admin-Email': adminEmail },
+                        body: JSON.stringify({ id })
+                    });
+                    const data = await res.json();
+                    if (data.success) {
+                        showAlert('success', 'Уведомление отменено');
+                        loadScheduled();
+                    }
+                } catch(e) { showAlert('error', e.message); }
+            };
+            
+            window.sendNotification = async function() {
+                const adminEmail = document.getElementById('adminEmail').value;
+                const title = document.getElementById('title').value;
+                const body = document.getElementById('body').value;
+                const recipientType = document.querySelector('input[name="recipientType"]:checked').value;
+                const scheduleTime = document.getElementById('scheduleTime').value;
                 
-                if (requireInteraction) {
-                    message.android.notification.sticky = true;
-                    message.android.notification.notificationPriority = 2;
+                if (!adminEmail) { showAlert('error', 'Введите email'); return; }
+                if (!title && !body) { showAlert('error', 'Заполните заголовок или текст'); return; }
+                
+                let recipients = [];
+                if (recipientType === 'selected') {
+                    recipients = Array.from(document.querySelectorAll('.user-checkbox:checked')).map(cb => cb.value);
+                    if (recipients.length === 0) { showAlert('error', 'Выберите получателей'); return; }
                 }
                 
-                await admin.messaging().send(message);
-                sent++;
+                const btn = document.getElementById('sendBtn');
+                const progress = document.getElementById('progress');
+                const progressBar = document.getElementById('progressBar');
                 
-                await new Promise(resolve => setTimeout(resolve, 100));
+                btn.disabled = true;
+                progress.style.display = 'block';
+                progressBar.style.width = '50%';
+                progressBar.textContent = 'Отправка...';
                 
-            } catch (error) {
-                failed++;
-                console.error(`❌ Ошибка отправки для ${email}:`, error.message);
+                try {
+                    const res = await fetch('/admin/api/send-mass-notification', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json', 'X-Admin-Email': adminEmail },
+                        body: JSON.stringify({ title, body, recipientType, recipients, scheduleTime: scheduleTime || null })
+                    });
+                    const data = await res.json();
+                    if (data.success) {
+                        if (data.scheduled) {
+                            showAlert('success', '✅ Уведомление запланировано');
+                            loadScheduled();
+                        } else {
+                            showAlert('success', '✅ Отправлено: ' + data.sent + '/' + data.total);
+                        }
+                        if (!scheduleTime) {
+                            document.getElementById('title').value = '';
+                            document.getElementById('body').value = '';
+                        }
+                    } else {
+                        showAlert('error', 'Ошибка: ' + data.error);
+                    }
+                } catch(e) {
+                    showAlert('error', 'Ошибка: ' + e.message);
+                } finally {
+                    btn.disabled = false;
+                    progress.style.display = 'none';
+                    progressBar.style.width = '0%';
+                }
+            };
+            
+            function escapeHtml(text) {
+                const div = document.createElement('div');
+                div.textContent = text;
+                return div.innerHTML;
             }
-        }
-        
-        console.log(`✅ Массовая рассылка завершена: отправлено ${sent}, ошибок ${failed}, всего ${targetEmails.length}`);
-        
-        return { sent, failed, total: targetEmails.length };
-        
-    } catch (error) {
-        console.error('❌ Ошибка выполнения массовой рассылки:', error);
-        return { sent: 0, failed: 0, total: 0, error: error.message };
-    }
-}
+            
+            document.querySelectorAll('input[name="recipientType"]').forEach(radio => {
+                radio.addEventListener('change', function() {
+                    const group = document.getElementById('userSelectGroup');
+                    group.style.display = this.value === 'selected' ? 'block' : 'none';
+                    if (this.value === 'selected' && allUsers.length === 0) loadUsers();
+                });
+            });
+            
+            document.getElementById('adminEmail').addEventListener('change', function() {
+                if (this.value) loadScheduled();
+            });
+            
+            refreshStats();
+            setInterval(refreshStats, 30000);
+        </script>
+    </body>
+    </html>
+    `);
+});
 
 // ===== СТАТИЧЕСКИЕ ФАЙЛЫ =====
 app.use('/uploads', express.static(uploadDir));
