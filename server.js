@@ -4561,6 +4561,11 @@ app.get('/admin', (req, res) => {
                 padding: 10px 15px;
                 font-size: 0.9rem;
             }
+            .loading {
+                text-align: center;
+                padding: 20px;
+                color: #666;
+            }
         </style>
     </head>
     <body>
@@ -4581,7 +4586,7 @@ app.get('/admin', (req, res) => {
                         <div class="stat-item"><div class="stat-number" id="fcmTokens">-</div><div class="stat-label">FCM токенов</div></div>
                         <div class="stat-item"><div class="stat-number" id="activeRooms">-</div><div class="stat-label">Активных комнат</div></div>
                     </div>
-                    <button onclick="refreshStats()" class="btn-small btn-secondary">🔄 Обновить</button>
+                    <button onclick="AdminApp.refreshStats()" class="btn-small btn-secondary">🔄 Обновить</button>
                 </div>
             </div>
             
@@ -4620,8 +4625,8 @@ app.get('/admin', (req, res) => {
                         <label>👤 Выберите пользователей</label>
                         <div class="user-list" id="userList">Загрузка...</div>
                         <div style="margin-top: 10px;">
-                            <button type="button" onclick="selectAllUsers()" class="btn-small btn-secondary">Выбрать всех</button>
-                            <button type="button" onclick="deselectAllUsers()" class="btn-small btn-secondary">Снять всех</button>
+                            <button type="button" onclick="AdminApp.selectAllUsers()" class="btn-small btn-secondary">Выбрать всех</button>
+                            <button type="button" onclick="AdminApp.deselectAllUsers()" class="btn-small btn-secondary">Снять всех</button>
                         </div>
                     </div>
                     
@@ -4634,7 +4639,7 @@ app.get('/admin', (req, res) => {
                         <div class="progress-bar" id="progressBar">0%</div>
                     </div>
                     
-                    <button id="sendBtn" onclick="sendNotification()">🚀 Отправить</button>
+                    <button id="sendBtn" onclick="AdminApp.sendNotification()">🚀 Отправить</button>
                 </div>
             </div>
             
@@ -4653,216 +4658,258 @@ app.get('/admin', (req, res) => {
                 </div>
                 <div class="card-body">
                     <div class="template-buttons">
-                        <button onclick="loadTemplate('maintenance')">🔧 Техработы</button>
-                        <button onclick="loadTemplate('update')">🔄 Обновление</button>
-                        <button onclick="loadTemplate('announcement')">📢 Объявление</button>
-                        <button onclick="loadTemplate('maintenance_end')">✅ Работы завершены</button>
+                        <button onclick="AdminApp.loadTemplate('maintenance')">🔧 Техработы</button>
+                        <button onclick="AdminApp.loadTemplate('update')">🔄 Обновление</button>
+                        <button onclick="AdminApp.loadTemplate('announcement')">📢 Объявление</button>
+                        <button onclick="AdminApp.loadTemplate('maintenance_end')">✅ Работы завершены</button>
                     </div>
                 </div>
             </div>
         </div>
         
         <script>
-            let allUsers = [];
-            
-            const templates = {
-                maintenance: { title: '🔧 Технические работы', body: 'Ведутся технические работы. Сервер может быть недоступен с {startTime} по {endTime}.' },
-                update: { title: '🔄 Обновление сервера', body: 'Обновление запланировано на {datetime}. Сохраните важные данные.' },
-                announcement: { title: '📢 Важное объявление', body: 'Уважаемые пользователи! {message}' },
-                maintenance_end: { title: '✅ Работы завершены', body: 'Все сервисы работают в штатном режиме.' }
-            };
-            
-            function showAlert(type, message) {
-                const alertDiv = document.getElementById('alert');
-                alertDiv.className = 'alert ' + type;
-                alertDiv.innerHTML = message;
-                setTimeout(() => { alertDiv.className = 'alert'; }, 5000);
-            }
-            
-            window.loadTemplate = function(name) {
-                const t = templates[name];
-                if (!t) return;
-                document.getElementById('title').value = t.title;
-                document.getElementById('body').value = t.body;
+            // Создаем глобальный объект для админ-панели
+            window.AdminApp = {
+                allUsers: [],
                 
-                if (name === 'maintenance') {
-                    const start = prompt('Время начала');
-                    const end = prompt('Время окончания');
-                    if (start && end) {
-                        document.getElementById('body').value = t.body.replace('{startTime}', start).replace('{endTime}', end);
+                showAlert: function(type, message) {
+                    const alertDiv = document.getElementById('alert');
+                    alertDiv.className = 'alert ' + type;
+                    alertDiv.innerHTML = message;
+                    setTimeout(() => { alertDiv.className = 'alert'; }, 5000);
+                },
+                
+                loadTemplate: function(name) {
+                    const templates = {
+                        maintenance: { title: '🔧 Технические работы', body: 'Ведутся технические работы. Сервер может быть недоступен.' },
+                        update: { title: '🔄 Обновление сервера', body: 'Плановое обновление сервера. Пожалуйста, сохраните важные данные.' },
+                        announcement: { title: '📢 Важное объявление', body: 'Уважаемые пользователи! Важное объявление от администрации.' },
+                        maintenance_end: { title: '✅ Работы завершены', body: 'Все сервисы работают в штатном режиме. Спасибо за ожидание.' }
+                    };
+                    
+                    const t = templates[name];
+                    if (t) {
+                        document.getElementById('title').value = t.title;
+                        document.getElementById('body').value = t.body;
+                        this.showAlert('success', 'Шаблон загружен');
                     }
-                } else if (name === 'update') {
-                    const dt = prompt('Дата и время');
-                    if (dt) document.getElementById('body').value = t.body.replace('{datetime}', dt);
-                } else if (name === 'announcement') {
-                    const msg = prompt('Текст объявления');
-                    if (msg) document.getElementById('body').value = t.body.replace('{message}', msg);
-                }
-            };
-            
-            window.refreshStats = async function() {
-                try {
-                    const res = await fetch('/admin/api/stats');
-                    const data = await res.json();
-                    if (data.success) {
-                        document.getElementById('totalUsers').textContent = data.totalUsers;
-                        document.getElementById('onlineUsers').textContent = data.onlineUsers;
-                        document.getElementById('fcmTokens').textContent = data.fcmTokens;
-                        document.getElementById('activeRooms').textContent = data.activeRooms;
+                },
+                
+                refreshStats: async function() {
+                    try {
+                        const res = await fetch('/admin/api/stats');
+                        const data = await res.json();
+                        if (data.success) {
+                            document.getElementById('totalUsers').textContent = data.totalUsers;
+                            document.getElementById('onlineUsers').textContent = data.onlineUsers;
+                            document.getElementById('fcmTokens').textContent = data.fcmTokens;
+                            document.getElementById('activeRooms').textContent = data.activeRooms;
+                        }
+                    } catch(e) {
+                        console.error('Refresh stats error:', e);
+                        this.showAlert('error', 'Ошибка загрузки статистики');
                     }
-                } catch(e) { console.error(e); }
-            };
-            
-            window.loadUsers = async function() {
-                try {
-                    const res = await fetch('/admin/api/users');
-                    const data = await res.json();
-                    if (data.success) {
-                        allUsers = data.users;
-                        const container = document.getElementById('userList');
-                        if (allUsers.length === 0) {
-                            container.innerHTML = 'Нет пользователей';
+                },
+                
+                loadUsers: async function() {
+                    try {
+                        const res = await fetch('/admin/api/users');
+                        const data = await res.json();
+                        if (data.success) {
+                            this.allUsers = data.users;
+                            const container = document.getElementById('userList');
+                            if (this.allUsers.length === 0) {
+                                container.innerHTML = 'Нет пользователей';
+                                return;
+                            }
+                            container.innerHTML = this.allUsers.map(u => 
+                                '<div class="user-item">' +
+                                    '<input type="checkbox" class="user-checkbox" value="' + this.escapeHtml(u.email) + '" id="u_' + this.escapeHtml(u.email.replace(/[^a-z0-9]/gi, '_')) + '">' +
+                                    '<label for="u_' + this.escapeHtml(u.email.replace(/[^a-z0-9]/gi, '_')) + '">' +
+                                        '<strong>' + this.escapeHtml(u.name || u.email) + '</strong>' +
+                                        '<span class="badge ' + (u.isOnline ? 'online' : 'offline') + '">' + (u.isOnline ? 'online' : 'offline') + '</span>' +
+                                        '<br><small>' + this.escapeHtml(u.email) + '</small>' +
+                                    '</label>' +
+                                '</div>'
+                            ).join('');
+                        }
+                    } catch(e) {
+                        console.error('Load users error:', e);
+                        document.getElementById('userList').innerHTML = 'Ошибка загрузки пользователей';
+                    }
+                },
+                
+                selectAllUsers: function() {
+                    document.querySelectorAll('.user-checkbox').forEach(cb => cb.checked = true);
+                },
+                
+                deselectAllUsers: function() {
+                    document.querySelectorAll('.user-checkbox').forEach(cb => cb.checked = false);
+                },
+                
+                loadScheduled: async function() {
+                    const adminEmail = document.getElementById('adminEmail').value;
+                    if (!adminEmail) return;
+                    try {
+                        const res = await fetch('/admin/api/scheduled?adminEmail=' + encodeURIComponent(adminEmail));
+                        const data = await res.json();
+                        if (data.success && data.notifications && data.notifications.length) {
+                            const container = document.getElementById('scheduledList');
+                            container.innerHTML = data.notifications.map(n => 
+                                '<div class="scheduled-item">' +
+                                    '<div class="scheduled-info">' +
+                                        '<div class="scheduled-title">' + this.escapeHtml(n.title) + '</div>' +
+                                        '<div class="scheduled-time">📅 ' + new Date(n.scheduledTime).toLocaleString() + '</div>' +
+                                        '<div><small>' + this.escapeHtml((n.body || '').substring(0, 100)) + '</small></div>' +
+                                    '</div>' +
+                                    '<div class="scheduled-actions"><button onclick="AdminApp.cancelScheduled(\'' + n.id + '\')">❌ Отменить</button></div>' +
+                                '</div>'
+                            ).join('');
+                        } else {
+                            document.getElementById('scheduledList').innerHTML = 'Нет запланированных уведомлений';
+                        }
+                    } catch(e) {
+                        console.error('Load scheduled error:', e);
+                        document.getElementById('scheduledList').innerHTML = 'Ошибка загрузки';
+                    }
+                },
+                
+                cancelScheduled: async function(id) {
+                    const adminEmail = document.getElementById('adminEmail').value;
+                    if (!adminEmail) {
+                        this.showAlert('error', 'Введите email администратора');
+                        return;
+                    }
+                    if (!confirm('Отменить запланированное уведомление?')) return;
+                    try {
+                        const res = await fetch('/admin/api/scheduled/cancel', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json', 'X-Admin-Email': adminEmail },
+                            body: JSON.stringify({ id })
+                        });
+                        const data = await res.json();
+                        if (data.success) {
+                            this.showAlert('success', 'Уведомление отменено');
+                            this.loadScheduled();
+                        } else {
+                            this.showAlert('error', data.error || 'Ошибка отмены');
+                        }
+                    } catch(e) {
+                        this.showAlert('error', e.message);
+                    }
+                },
+                
+                sendNotification: async function() {
+                    const adminEmail = document.getElementById('adminEmail').value;
+                    const title = document.getElementById('title').value;
+                    const body = document.getElementById('body').value;
+                    const recipientType = document.querySelector('input[name="recipientType"]:checked').value;
+                    const scheduleTime = document.getElementById('scheduleTime').value;
+                    
+                    if (!adminEmail) {
+                        this.showAlert('error', 'Введите email администратора');
+                        return;
+                    }
+                    if (!title && !body) {
+                        this.showAlert('error', 'Заполните заголовок или текст уведомления');
+                        return;
+                    }
+                    
+                    let recipients = [];
+                    if (recipientType === 'selected') {
+                        recipients = Array.from(document.querySelectorAll('.user-checkbox:checked')).map(cb => cb.value);
+                        if (recipients.length === 0) {
+                            this.showAlert('error', 'Выберите хотя бы одного получателя');
                             return;
                         }
-                        container.innerHTML = allUsers.map(u => 
-                            '<div class="user-item">' +
-                                '<input type="checkbox" class="user-checkbox" value="' + u.email + '" id="u_' + u.email.replace(/[^a-z0-9]/gi, '_') + '">' +
-                                '<label for="u_' + u.email.replace(/[^a-z0-9]/gi, '_') + '">' +
-                                    '<strong>' + (u.name || u.email) + '</strong>' +
-                                    '<span class="badge ' + (u.isOnline ? 'online' : 'offline') + '">' + (u.isOnline ? 'online' : 'offline') + '</span>' +
-                                    '<br><small>' + u.email + '</small>' +
-                                '</label>' +
-                            '</div>'
-                        ).join('');
                     }
-                } catch(e) { console.error(e); }
-            };
-            
-            window.selectAllUsers = function() {
-                document.querySelectorAll('.user-checkbox').forEach(cb => cb.checked = true);
-            };
-            
-            window.deselectAllUsers = function() {
-                document.querySelectorAll('.user-checkbox').forEach(cb => cb.checked = false);
-            };
-            
-            window.loadScheduled = async function() {
-                const adminEmail = document.getElementById('adminEmail').value;
-                if (!adminEmail) return;
-                try {
-                    const res = await fetch('/admin/api/scheduled?adminEmail=' + encodeURIComponent(adminEmail));
-                    const data = await res.json();
-                    if (data.success && data.notifications.length) {
-                        const container = document.getElementById('scheduledList');
-                        container.innerHTML = data.notifications.map(n => 
-                            '<div class="scheduled-item">' +
-                                '<div class="scheduled-info">' +
-                                    '<div class="scheduled-title">' + escapeHtml(n.title) + '</div>' +
-                                    '<div class="scheduled-time">📅 ' + new Date(n.scheduledTime).toLocaleString() + '</div>' +
-                                    '<div><small>' + escapeHtml(n.body.substring(0, 100)) + '</small></div>' +
-                                '</div>' +
-                                '<div class="scheduled-actions"><button onclick="cancelScheduled(\'' + n.id + '\')">❌ Отменить</button></div>' +
-                            '</div>'
-                        ).join('');
-                    } else {
-                        document.getElementById('scheduledList').innerHTML = 'Нет запланированных';
-                    }
-                } catch(e) { console.error(e); }
-            };
-            
-            window.cancelScheduled = async function(id) {
-                const adminEmail = document.getElementById('adminEmail').value;
-                if (!adminEmail) { showAlert('error', 'Введите email'); return; }
-                if (!confirm('Отменить?')) return;
-                try {
-                    const res = await fetch('/admin/api/scheduled/cancel', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json', 'X-Admin-Email': adminEmail },
-                        body: JSON.stringify({ id })
-                    });
-                    const data = await res.json();
-                    if (data.success) {
-                        showAlert('success', 'Уведомление отменено');
-                        loadScheduled();
-                    }
-                } catch(e) { showAlert('error', e.message); }
-            };
-            
-            window.sendNotification = async function() {
-                const adminEmail = document.getElementById('adminEmail').value;
-                const title = document.getElementById('title').value;
-                const body = document.getElementById('body').value;
-                const recipientType = document.querySelector('input[name="recipientType"]:checked').value;
-                const scheduleTime = document.getElementById('scheduleTime').value;
-                
-                if (!adminEmail) { showAlert('error', 'Введите email'); return; }
-                if (!title && !body) { showAlert('error', 'Заполните заголовок или текст'); return; }
-                
-                let recipients = [];
-                if (recipientType === 'selected') {
-                    recipients = Array.from(document.querySelectorAll('.user-checkbox:checked')).map(cb => cb.value);
-                    if (recipients.length === 0) { showAlert('error', 'Выберите получателей'); return; }
-                }
-                
-                const btn = document.getElementById('sendBtn');
-                const progress = document.getElementById('progress');
-                const progressBar = document.getElementById('progressBar');
-                
-                btn.disabled = true;
-                progress.style.display = 'block';
-                progressBar.style.width = '50%';
-                progressBar.textContent = 'Отправка...';
-                
-                try {
-                    const res = await fetch('/admin/api/send-mass-notification', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json', 'X-Admin-Email': adminEmail },
-                        body: JSON.stringify({ title, body, recipientType, recipients, scheduleTime: scheduleTime || null })
-                    });
-                    const data = await res.json();
-                    if (data.success) {
-                        if (data.scheduled) {
-                            showAlert('success', '✅ Уведомление запланировано');
-                            loadScheduled();
+                    
+                    const btn = document.getElementById('sendBtn');
+                    const progress = document.getElementById('progress');
+                    const progressBar = document.getElementById('progressBar');
+                    
+                    btn.disabled = true;
+                    progress.style.display = 'block';
+                    progressBar.style.width = '50%';
+                    progressBar.textContent = 'Отправка...';
+                    
+                    try {
+                        const res = await fetch('/admin/api/send-mass-notification', {
+                            method: 'POST',
+                            headers: { 
+                                'Content-Type': 'application/json',
+                                'X-Admin-Email': adminEmail
+                            },
+                            body: JSON.stringify({ 
+                                title, 
+                                body, 
+                                recipientType, 
+                                recipients, 
+                                scheduleTime: scheduleTime || null 
+                            })
+                        });
+                        
+                        const data = await res.json();
+                        
+                        if (data.success) {
+                            if (data.scheduled) {
+                                this.showAlert('success', '✅ Уведомление запланировано на ' + new Date(scheduleTime).toLocaleString());
+                                this.loadScheduled();
+                            } else {
+                                this.showAlert('success', '✅ Уведомление отправлено: ' + (data.sent || 0) + ' / ' + (data.total || 0));
+                            }
+                            if (!scheduleTime) {
+                                document.getElementById('title').value = '';
+                                document.getElementById('body').value = '';
+                            }
                         } else {
-                            showAlert('success', '✅ Отправлено: ' + data.sent + '/' + data.total);
+                            this.showAlert('error', 'Ошибка: ' + (data.error || 'Неизвестная ошибка'));
                         }
-                        if (!scheduleTime) {
-                            document.getElementById('title').value = '';
-                            document.getElementById('body').value = '';
-                        }
-                    } else {
-                        showAlert('error', 'Ошибка: ' + data.error);
+                    } catch(e) {
+                        console.error('Send error:', e);
+                        this.showAlert('error', 'Ошибка отправки: ' + e.message);
+                    } finally {
+                        btn.disabled = false;
+                        progress.style.display = 'none';
+                        progressBar.style.width = '0%';
                     }
-                } catch(e) {
-                    showAlert('error', 'Ошибка: ' + e.message);
-                } finally {
-                    btn.disabled = false;
-                    progress.style.display = 'none';
-                    progressBar.style.width = '0%';
+                },
+                
+                escapeHtml: function(text) {
+                    if (!text) return '';
+                    const div = document.createElement('div');
+                    div.textContent = text;
+                    return div.innerHTML;
+                },
+                
+                init: function() {
+                    // Инициализация обработчиков
+                    document.querySelectorAll('input[name="recipientType"]').forEach(radio => {
+                        radio.addEventListener('change', (e) => {
+                            const group = document.getElementById('userSelectGroup');
+                            group.style.display = e.target.value === 'selected' ? 'block' : 'none';
+                            if (e.target.value === 'selected' && this.allUsers.length === 0) {
+                                this.loadUsers();
+                            }
+                        });
+                    });
+                    
+                    document.getElementById('adminEmail').addEventListener('change', () => {
+                        if (document.getElementById('adminEmail').value) {
+                            this.loadScheduled();
+                        }
+                    });
+                    
+                    // Загрузка начальных данных
+                    this.refreshStats();
+                    setInterval(() => this.refreshStats(), 30000);
                 }
             };
             
-            function escapeHtml(text) {
-                const div = document.createElement('div');
-                div.textContent = text;
-                return div.innerHTML;
-            }
-            
-            document.querySelectorAll('input[name="recipientType"]').forEach(radio => {
-                radio.addEventListener('change', function() {
-                    const group = document.getElementById('userSelectGroup');
-                    group.style.display = this.value === 'selected' ? 'block' : 'none';
-                    if (this.value === 'selected' && allUsers.length === 0) loadUsers();
-                });
+            // Запуск приложения после загрузки страницы
+            document.addEventListener('DOMContentLoaded', () => {
+                window.AdminApp.init();
             });
-            
-            document.getElementById('adminEmail').addEventListener('change', function() {
-                if (this.value) loadScheduled();
-            });
-            
-            refreshStats();
-            setInterval(refreshStats, 30000);
         </script>
     </body>
     </html>
