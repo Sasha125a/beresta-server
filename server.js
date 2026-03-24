@@ -4150,10 +4150,10 @@ app.get('/api/debug/activity', (req, res) => {
 
 // ==================== АДМИНИСТРАТИВНАЯ ПАНЕЛЬ ДЛЯ MASS FCM ====================
 
-// Middleware для проверки администратора (можно настроить свой email)
+// Middleware для проверки администратора
 const ADMIN_EMAILS = process.env.ADMIN_EMAILS ? 
     process.env.ADMIN_EMAILS.split(',') : 
-    ['admin@beresta.ru']; // Замените на свой email
+    ['admin@beresta.ru'];
 
 function isAdmin(req, res, next) {
     const userEmail = req.query.adminEmail || req.body.adminEmail || req.headers['x-admin-email'];
@@ -4213,7 +4213,7 @@ app.get('/admin', (req, res) => {
                 outline: none; border-color: #667eea; box-shadow: 0 0 0 3px rgba(102,126,234,0.1);
             }
             textarea { resize: vertical; min-height: 100px; }
-            .radio-group { display: flex; gap: 20px; align-items: center; }
+            .radio-group { display: flex; gap: 20px; align-items: center; flex-wrap: wrap; }
             .radio-group label { display: flex; align-items: center; gap: 8px; font-weight: normal; cursor: pointer; margin-bottom: 0; }
             .radio-group input { width: auto; margin: 0; }
             button {
@@ -4241,11 +4241,14 @@ app.get('/admin', (req, res) => {
             .progress { background: #e0e0e0; border-radius: 10px; overflow: hidden; margin-top: 15px; display: none; }
             .progress-bar { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); width: 0%; height: 30px; display: flex; align-items: center; justify-content: center; color: white; font-size: 0.85rem; font-weight: 600; transition: width 0.3s; }
             .scheduled-list { margin-top: 15px; }
-            .scheduled-item { background: #f8f9fa; padding: 10px; border-radius: 8px; margin-bottom: 10px; display: flex; justify-content: space-between; align-items: center; }
+            .scheduled-item { background: #f8f9fa; padding: 10px; border-radius: 8px; margin-bottom: 10px; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px; }
             .scheduled-info { flex: 1; }
             .scheduled-title { font-weight: 600; margin-bottom: 5px; }
             .scheduled-time { font-size: 0.8rem; color: #666; }
             .scheduled-actions button { width: auto; padding: 5px 10px; font-size: 0.8rem; background: #dc3545; }
+            .btn-small { width: auto; padding: 8px 15px; font-size: 0.9rem; margin-top: 10px; }
+            .template-buttons { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 10px; }
+            .template-buttons button { width: auto; background: #6c757d; padding: 10px 15px; font-size: 0.9rem; }
         </style>
     </head>
     <body>
@@ -4267,7 +4270,7 @@ app.get('/admin', (req, res) => {
                         <div class="stat-item"><div class="stat-number" id="fcmTokens">-</div><div class="stat-label">FCM токенов</div></div>
                         <div class="stat-item"><div class="stat-number" id="activeRooms">-</div><div class="stat-label">Активных комнат</div></div>
                     </div>
-                    <button onclick="refreshStats()" style="margin-top: 10px; background: #6c757d;">🔄 Обновить статистику</button>
+                    <button onclick="refreshStats()" class="btn-small" style="background: #6c757d;">🔄 Обновить статистику</button>
                 </div>
             </div>
             
@@ -4347,110 +4350,164 @@ app.get('/admin', (req, res) => {
                     <p>Быстрые шаблоны для частых уведомлений</p>
                 </div>
                 <div class="card-body">
-                    <div style="display: flex; gap: 10px; flex-wrap: wrap;">
-                        <button onclick="loadTemplate('maintenance')" style="width: auto; background: #6c757d;">🔧 Технические работы</button>
-                        <button onclick="loadTemplate('update')" style="width: auto; background: #6c757d;">🔄 Обновление сервера</button>
-                        <button onclick="loadTemplate('announcement')" style="width: auto; background: #6c757d;">📢 Важное объявление</button>
-                        <button onclick="loadTemplate('maintenance_end')" style="width: auto; background: #6c757d;">✅ Работы завершены</button>
+                    <div class="template-buttons">
+                        <button onclick="loadTemplate('maintenance')">🔧 Технические работы</button>
+                        <button onclick="loadTemplate('update')">🔄 Обновление сервера</button>
+                        <button onclick="loadTemplate('announcement')">📢 Важное объявление</button>
+                        <button onclick="loadTemplate('maintenance_end')">✅ Работы завершены</button>
                     </div>
                 </div>
             </div>
         </div>
         
         <script>
-            let allUsers = [];
-            let scheduledNotifications = [];
+            // Глобальные переменные
+            var allUsers = [];
+            var scheduledNotifications = [];
             
-            const templates = {
-                maintenance: { title: '🔧 Технические работы', body: 'Ведутся технические работы. Сервер может быть недоступен с {startTime} по {endTime}. Приносим извинения за неудобства.' },
-                update: { title: '🔄 Обновление сервера', body: 'Плановое обновление сервера запланировано на {datetime}. Пожалуйста, сохраните важные данные.' },
-                announcement: { title: '📢 Важное объявление', body: 'Уважаемые пользователи! {message}' },
-                maintenance_end: { title: '✅ Технические работы завершены', body: 'Все сервисы работают в штатном режиме. Спасибо за понимание!' }
+            // Шаблоны уведомлений
+            var templates = {
+                maintenance: {
+                    title: '🔧 Технические работы',
+                    body: 'Ведутся технические работы. Сервер может быть недоступен с {startTime} по {endTime}. Приносим извинения за неудобства.'
+                },
+                update: {
+                    title: '🔄 Обновление сервера',
+                    body: 'Плановое обновление сервера запланировано на {datetime}. Пожалуйста, сохраните важные данные.'
+                },
+                announcement: {
+                    title: '📢 Важное объявление',
+                    body: 'Уважаемые пользователи! {message}'
+                },
+                maintenance_end: {
+                    title: '✅ Технические работы завершены',
+                    body: 'Все сервисы работают в штатном режиме. Спасибо за понимание!'
+                }
             };
             
-            function loadTemplate(templateName) {
-                const template = templates[templateName];
-                if (template) {
-                    document.getElementById('notificationTitle').value = template.title;
-                    document.getElementById('notificationBody').value = template.body;
-                    if (templateName === 'maintenance') {
-                        const startTime = prompt('Введите время начала работ');
-                        const endTime = prompt('Введите время окончания работ');
-                        if (startTime && endTime) {
-                            document.getElementById('notificationBody').value = template.body.replace('{startTime}', startTime).replace('{endTime}', endTime);
-                        }
-                    } else if (templateName === 'update') {
-                        const datetime = prompt('Введите дату и время обновления');
-                        if (datetime) {
-                            document.getElementById('notificationBody').value = template.body.replace('{datetime}', datetime);
-                        }
-                    } else if (templateName === 'announcement') {
-                        const message = prompt('Введите текст объявления');
-                        if (message) {
-                            document.getElementById('notificationBody').value = template.body.replace('{message}', message);
-                        }
-                    }
-                }
+            // Функция для отображения уведомлений
+            function showAlert(type, message) {
+                var alertDiv = document.getElementById('alert');
+                if (!alertDiv) return;
+                alertDiv.className = 'alert ' + type;
+                alertDiv.innerHTML = message;
+                setTimeout(function() {
+                    alertDiv.className = 'alert';
+                }, 5000);
             }
             
-            async function refreshStats() {
+            // Функция для экранирования HTML
+            function escapeHtml(text) {
+                if (!text) return '';
+                var div = document.createElement('div');
+                div.textContent = text;
+                return div.innerHTML;
+            }
+            
+            // Загрузка шаблона
+            window.loadTemplate = function(templateName) {
+                var template = templates[templateName];
+                if (!template) return;
+                
+                document.getElementById('notificationTitle').value = template.title;
+                document.getElementById('notificationBody').value = template.body;
+                
+                if (templateName === 'maintenance') {
+                    var startTime = prompt('Введите время начала работ (например: 02:00 15.12.2024)');
+                    var endTime = prompt('Введите время окончания работ');
+                    if (startTime && endTime) {
+                        document.getElementById('notificationBody').value = template.body
+                            .replace('{startTime}', startTime)
+                            .replace('{endTime}', endTime);
+                    }
+                } else if (templateName === 'update') {
+                    var datetime = prompt('Введите дату и время обновления (например: 15.12.2024 в 03:00)');
+                    if (datetime) {
+                        document.getElementById('notificationBody').value = template.body.replace('{datetime}', datetime);
+                    }
+                } else if (templateName === 'announcement') {
+                    var message = prompt('Введите текст объявления');
+                    if (message) {
+                        document.getElementById('notificationBody').value = template.body.replace('{message}', message);
+                    }
+                }
+            };
+            
+            // Обновление статистики
+            window.refreshStats = async function() {
                 try {
-                    const response = await fetch('/admin/api/stats');
-                    const data = await response.json();
+                    var response = await fetch('/admin/api/stats');
+                    var data = await response.json();
                     if (data.success) {
                         document.getElementById('totalUsers').textContent = data.totalUsers || 0;
                         document.getElementById('onlineUsers').textContent = data.onlineUsers || 0;
                         document.getElementById('fcmTokens').textContent = data.fcmTokens || 0;
                         document.getElementById('activeRooms').textContent = data.activeRooms || 0;
                     }
-                } catch (error) { console.error('Error loading stats:', error); }
-            }
+                } catch (error) {
+                    console.error('Error loading stats:', error);
+                }
+            };
             
-            async function loadUsers() {
+            // Загрузка списка пользователей
+            window.loadUsers = async function() {
                 try {
-                    const response = await fetch('/admin/api/users');
-                    const data = await response.json();
+                    var response = await fetch('/admin/api/users');
+                    var data = await response.json();
                     if (data.success) {
                         allUsers = data.users;
                         renderUserList();
                     }
-                } catch (error) { console.error('Error loading users:', error); }
-            }
+                } catch (error) {
+                    console.error('Error loading users:', error);
+                    document.getElementById('userList').innerHTML = '<div style="text-align: center; padding: 20px; color: red;">Ошибка загрузки пользователей</div>';
+                }
+            };
             
+            // Отображение списка пользователей
             function renderUserList() {
-                const container = document.getElementById('userList');
+                var container = document.getElementById('userList');
+                if (!container) return;
+                
                 if (!allUsers.length) {
                     container.innerHTML = '<div style="text-align: center; padding: 20px;">Нет пользователей</div>';
                     return;
                 }
-                container.innerHTML = allUsers.map(function(user) {
-                    return '<div class="user-item">' +
-                        '<input type="checkbox" class="user-checkbox" value="' + user.email + '" id="user_' + user.email.replace(/[^a-z0-9]/gi, '_') + '">' +
-                        '<label for="user_' + user.email.replace(/[^a-z0-9]/gi, '_') + '">' +
-                        '<strong>' + (user.name || user.email) + '</strong>' +
+                
+                var html = '';
+                for (var i = 0; i < allUsers.length; i++) {
+                    var user = allUsers[i];
+                    var id = 'user_' + user.email.replace(/[^a-z0-9]/gi, '_');
+                    html += '<div class="user-item">' +
+                        '<input type="checkbox" class="user-checkbox" value="' + user.email + '" id="' + id + '">' +
+                        '<label for="' + id + '">' +
+                        '<strong>' + escapeHtml(user.name || user.email) + '</strong>' +
                         '<span class="badge ' + (user.isOnline ? 'online' : 'offline') + '">' + (user.isOnline ? 'online' : 'offline') + '</span>' +
-                        '<br><small style="color: #666;">' + user.email + '</small>' +
+                        '<br><small style="color: #666;">' + escapeHtml(user.email) + '</small>' +
                         '</label>' +
                         '</div>';
-                }).join('');
+                }
+                container.innerHTML = html;
             }
             
-            function selectAllUsers() { document.querySelectorAll('.user-checkbox').forEach(function(cb) { cb.checked = true; }); }
-            function deselectAllUsers() { document.querySelectorAll('.user-checkbox').forEach(function(cb) { cb.checked = false; }); }
+            // Выбрать всех пользователей
+            window.selectAllUsers = function() {
+                var checkboxes = document.querySelectorAll('.user-checkbox');
+                for (var i = 0; i < checkboxes.length; i++) {
+                    checkboxes[i].checked = true;
+                }
+            };
             
-            document.querySelectorAll('input[name="recipientType"]').forEach(function(radio) {
-                radio.addEventListener('change', function() {
-                    var userSelectGroup = document.getElementById('userSelectGroup');
-                    if (this.value === 'selected') {
-                        userSelectGroup.style.display = 'block';
-                        if (allUsers.length === 0) loadUsers();
-                    } else {
-                        userSelectGroup.style.display = 'none';
-                    }
-                });
-            });
+            // Снять всех пользователей
+            window.deselectAllUsers = function() {
+                var checkboxes = document.querySelectorAll('.user-checkbox');
+                for (var i = 0; i < checkboxes.length; i++) {
+                    checkboxes[i].checked = false;
+                }
+            };
             
-            async function sendNotification() {
+            // Отправка уведомления
+            window.sendNotification = async function() {
                 var adminEmail = document.getElementById('adminEmail').value;
                 var title = document.getElementById('notificationTitle').value;
                 var body = document.getElementById('notificationBody').value;
@@ -4459,13 +4516,26 @@ app.get('/admin', (req, res) => {
                 var highPriority = document.getElementById('highPriority').checked;
                 var requireInteraction = document.getElementById('requireInteraction').checked;
                 
-                if (!adminEmail) { showAlert('error', 'Введите email администратора'); return; }
-                if (!title && !body) { showAlert('error', 'Заполните заголовок или текст уведомления'); return; }
+                if (!adminEmail) {
+                    showAlert('error', 'Введите email администратора');
+                    return;
+                }
+                
+                if (!title && !body) {
+                    showAlert('error', 'Заполните заголовок или текст уведомления');
+                    return;
+                }
                 
                 var recipients = [];
                 if (recipientType === 'selected') {
-                    recipients = Array.from(document.querySelectorAll('.user-checkbox:checked')).map(function(cb) { return cb.value; });
-                    if (recipients.length === 0) { showAlert('error', 'Выберите хотя бы одного получателя'); return; }
+                    var checkboxes = document.querySelectorAll('.user-checkbox:checked');
+                    for (var i = 0; i < checkboxes.length; i++) {
+                        recipients.push(checkboxes[i].value);
+                    }
+                    if (recipients.length === 0) {
+                        showAlert('error', 'Выберите хотя бы одного получателя');
+                        return;
+                    }
                 }
                 
                 var sendBtn = document.getElementById('sendBtn');
@@ -4474,14 +4544,29 @@ app.get('/admin', (req, res) => {
                 
                 sendBtn.disabled = true;
                 progress.style.display = 'block';
+                progressBar.style.width = '50%';
+                progressBar.textContent = 'Отправка...';
                 
                 try {
                     var response = await fetch('/admin/api/send-mass-notification', {
                         method: 'POST',
-                        headers: { 'Content-Type': 'application/json', 'X-Admin-Email': adminEmail },
-                        body: JSON.stringify({ title, body, recipientType, recipients, scheduleTime: scheduleTime || null, highPriority, requireInteraction })
+                        headers: {
+                            'Content-Type': 'application/json',
+                            'X-Admin-Email': adminEmail
+                        },
+                        body: JSON.stringify({
+                            title: title,
+                            body: body,
+                            recipientType: recipientType,
+                            recipients: recipients,
+                            scheduleTime: scheduleTime || null,
+                            highPriority: highPriority,
+                            requireInteraction: requireInteraction
+                        })
                     });
+                    
                     var data = await response.json();
+                    
                     if (data.success) {
                         if (data.scheduled) {
                             showAlert('success', '✅ Уведомление запланировано! ID: ' + data.scheduledId);
@@ -4497,17 +4582,21 @@ app.get('/admin', (req, res) => {
                         showAlert('error', '❌ Ошибка: ' + (data.error || 'Неизвестная ошибка'));
                     }
                 } catch (error) {
+                    console.error('Send error:', error);
                     showAlert('error', '❌ Ошибка отправки: ' + error.message);
                 } finally {
                     sendBtn.disabled = false;
                     progress.style.display = 'none';
                     progressBar.style.width = '0%';
+                    progressBar.textContent = '0%';
                 }
-            }
+            };
             
-            async function loadScheduled() {
+            // Загрузка запланированных уведомлений
+            window.loadScheduled = async function() {
                 var adminEmail = document.getElementById('adminEmail').value;
                 if (!adminEmail) return;
+                
                 try {
                     var response = await fetch('/admin/api/scheduled?adminEmail=' + encodeURIComponent(adminEmail));
                     var data = await response.json();
@@ -4515,37 +4604,57 @@ app.get('/admin', (req, res) => {
                         scheduledNotifications = data.notifications;
                         renderScheduledList();
                     }
-                } catch (error) { console.error('Error loading scheduled:', error); }
-            }
+                } catch (error) {
+                    console.error('Error loading scheduled:', error);
+                }
+            };
             
+            // Отображение запланированных уведомлений
             function renderScheduledList() {
                 var container = document.getElementById('scheduledList');
+                if (!container) return;
+                
                 if (!scheduledNotifications.length) {
                     container.innerHTML = '<div style="text-align: center; padding: 20px;">Нет запланированных уведомлений</div>';
                     return;
                 }
-                container.innerHTML = scheduledNotifications.map(function(n) {
-                    return '<div class="scheduled-item">' +
+                
+                var html = '';
+                for (var i = 0; i < scheduledNotifications.length; i++) {
+                    var n = scheduledNotifications[i];
+                    html += '<div class="scheduled-item">' +
                         '<div class="scheduled-info">' +
                         '<div class="scheduled-title">' + escapeHtml(n.title) + '</div>' +
-                        '<div class="scheduled-time">📅 ' + new Date(n.scheduledTime).toLocaleString() + ' | 👥 ' + (n.recipientType === 'all' ? 'Все' : n.recipientType === 'online' ? 'Онлайн' : n.recipients.length + ' пользователей') + '</div>' +
+                        '<div class="scheduled-time">📅 ' + new Date(n.scheduledTime).toLocaleString() + ' | 👥 ' + 
+                        (n.recipientType === 'all' ? 'Все' : n.recipientType === 'online' ? 'Онлайн' : n.recipients.length + ' пользователей') + '</div>' +
                         '<div><small>' + escapeHtml(n.body.substring(0, 100)) + (n.body.length > 100 ? '...' : '') + '</small></div>' +
                         '</div>' +
                         '<div class="scheduled-actions"><button onclick="cancelScheduled(\'' + n.id + '\')">❌ Отменить</button></div>' +
                         '</div>';
-                }).join('');
+                }
+                container.innerHTML = html;
             }
             
-            async function cancelScheduled(id) {
+            // Отмена запланированного уведомления
+            window.cancelScheduled = async function(id) {
                 var adminEmail = document.getElementById('adminEmail').value;
-                if (!adminEmail) { showAlert('error', 'Введите email администратора'); return; }
+                if (!adminEmail) {
+                    showAlert('error', 'Введите email администратора');
+                    return;
+                }
+                
                 if (!confirm('Отменить запланированное уведомление?')) return;
+                
                 try {
                     var response = await fetch('/admin/api/scheduled/cancel', {
                         method: 'POST',
-                        headers: { 'Content-Type': 'application/json', 'X-Admin-Email': adminEmail },
+                        headers: {
+                            'Content-Type': 'application/json',
+                            'X-Admin-Email': adminEmail
+                        },
                         body: JSON.stringify({ id: id })
                     });
+                    
                     var data = await response.json();
                     if (data.success) {
                         showAlert('success', '✅ Уведомление отменено');
@@ -4556,25 +4665,49 @@ app.get('/admin', (req, res) => {
                 } catch (error) {
                     showAlert('error', 'Ошибка: ' + error.message);
                 }
-            }
+            };
             
-            function showAlert(type, message) {
-                var alertDiv = document.getElementById('alert');
-                alertDiv.className = 'alert ' + type;
-                alertDiv.innerHTML = message;
-                setTimeout(function() { alertDiv.className = 'alert'; }, 5000);
-            }
-            
-            function escapeHtml(text) {
-                var div = document.createElement('div');
-                div.textContent = text;
-                return div.innerHTML;
-            }
-            
-            refreshStats();
-            loadUsers();
-            setInterval(refreshStats, 30000);
-            setInterval(loadScheduled, 10000);
+            // Настройка обработчиков событий после загрузки страницы
+            document.addEventListener('DOMContentLoaded', function() {
+                // Обновление статистики
+                refreshStats();
+                
+                // Загрузка пользователей
+                loadUsers();
+                
+                // Загрузка запланированных уведомлений
+                var adminEmailInput = document.getElementById('adminEmail');
+                if (adminEmailInput) {
+                    adminEmailInput.addEventListener('change', function() {
+                        if (this.value) loadScheduled();
+                    });
+                }
+                
+                // Обработчик изменения типа получателей
+                var radios = document.querySelectorAll('input[name="recipientType"]');
+                for (var i = 0; i < radios.length; i++) {
+                    radios[i].addEventListener('change', function() {
+                        var userSelectGroup = document.getElementById('userSelectGroup');
+                        if (this.value === 'selected') {
+                            userSelectGroup.style.display = 'block';
+                            if (allUsers.length === 0) loadUsers();
+                        } else {
+                            userSelectGroup.style.display = 'none';
+                        }
+                    });
+                }
+                
+                // Автоматическое обновление статистики каждые 30 секунд
+                setInterval(refreshStats, 30000);
+                
+                // Автоматическое обновление запланированных уведомлений каждые 10 секунд
+                setInterval(function() {
+                    var adminEmail = document.getElementById('adminEmail');
+                    if (adminEmail && adminEmail.value) {
+                        loadScheduled();
+                    }
+                }, 10000);
+            });
         </script>
     </body>
     </html>
@@ -4585,7 +4718,7 @@ app.get('/admin', (req, res) => {
 // ===== API для административной панели =====
 
 // Хранилище для запланированных уведомлений
-const scheduledNotifications = new Map(); // id -> notification data
+const scheduledNotifications = new Map();
 
 // Получение статистики
 app.get('/admin/api/stats', async (req, res) => {
@@ -4650,7 +4783,6 @@ app.post('/admin/api/send-mass-notification', isAdmin, async (req, res) => {
         const { title, body, recipientType, recipients, scheduleTime, highPriority, requireInteraction } = req.body;
         
         if (scheduleTime) {
-            // Запланированная отправка
             const scheduledId = uuidv4();
             const scheduledTime = new Date(scheduleTime);
             
@@ -4674,7 +4806,6 @@ app.post('/admin/api/send-mass-notification', isAdmin, async (req, res) => {
                 adminEmail: req.adminEmail
             });
             
-            // Устанавливаем таймер
             const delay = scheduledTime.getTime() - Date.now();
             setTimeout(async () => {
                 const notification = scheduledNotifications.get(scheduledId);
@@ -4693,7 +4824,6 @@ app.post('/admin/api/send-mass-notification', isAdmin, async (req, res) => {
                 scheduledTime: scheduledTime.toISOString()
             });
         } else {
-            // Немедленная отправка
             const result = await executeMassNotification({
                 title: title || 'Уведомление',
                 body: body || '',
@@ -4766,7 +4896,6 @@ async function executeMassNotification(notification) {
     console.log(`📢 Начало массовой рассылки: "${title}"`);
     
     try {
-        // Получаем список получателей
         let targetEmails = [];
         
         if (recipientType === 'all') {
@@ -4790,10 +4919,8 @@ async function executeMassNotification(notification) {
         let sent = 0;
         let failed = 0;
         
-        // Отправляем каждому получателю
         for (const email of targetEmails) {
             try {
-                // Получаем токен пользователя
                 const { data: tokenData } = await supabase
                     .from('user_fcm_tokens')
                     .select('fcm_token')
@@ -4848,7 +4975,6 @@ async function executeMassNotification(notification) {
                 await admin.messaging().send(message);
                 sent++;
                 
-                // Небольшая задержка, чтобы не перегружать FCM
                 await new Promise(resolve => setTimeout(resolve, 100));
                 
             } catch (error) {
